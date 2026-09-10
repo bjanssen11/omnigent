@@ -17,7 +17,7 @@ Providers that cannot extend a sandbox (``kubernetes`` today) raise
 :class:`SandboxCapabilityError` and are skipped, leaving their behaviour exactly
 as it is now.
 
-Rate-limited per runner (:data:`_MIN_INTERVAL_S`): stamping ``runner_last_seen``
+Rate-limited per runner (:data:`_min_interval_s`): stamping ``runner_last_seen``
 is a local write, but ``keep_alive`` is a provider API call: on Kubernetes-style
 backends it is an apiserver write that also wakes a controller reconcile, so it
 must not run at the 30s ping cadence.
@@ -32,7 +32,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
-from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
+from omnigent.onboarding.sandboxes.base import (
+    SandboxCapabilityError,
+    resolve_managed_keepalive_interval_s,
+)
 
 if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedSandboxDeployment
@@ -41,10 +44,12 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# How often one runner may trigger a provider keep_alive. Well under any
-# platform inactivity window (the shortest in tree is Islo's 15min idle pause),
-# and 20x cheaper than the 30s ping it rides on.
-_MIN_INTERVAL_S = 600.0
+# How often one runner may trigger a provider keep_alive, resolved from
+# base.resolve_managed_keepalive_interval_s (env-overridable, default 600s) at
+# import and again in configure(). agent_sandbox derives its window floor from
+# the same resolver (2x this), so lowering the interval also lowers the floor and
+# the two cannot drift.
+_min_interval_s: float = resolve_managed_keepalive_interval_s()
 
 # Cap on the per-runner throttle map before stale entries are pruned. Runners
 # are transient, so without this a long-lived server accumulates one dead key
@@ -84,16 +89,17 @@ def configure(
     :param sandbox_config: The deployment's provider set, or ``None`` when
         managed sandboxes are not configured.
     """
-    global _conversation_store, _host_store, _sandbox_config, _executor
+    global _conversation_store, _host_store, _sandbox_config, _executor, _min_interval_s
     _conversation_store = conversation_store
     _host_store = host_store
     _sandbox_config = sandbox_config
+    _min_interval_s = resolve_managed_keepalive_interval_s()
     if sandbox_config is not None and host_store is not None and _executor is None:
         _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="managed-keepalive")
 
 
 def touch(runner_id: str) -> None:
-    """Keep the sandbox behind *runner_id* warm, at most every :data:`_MIN_INTERVAL_S`.
+    """Keep the sandbox behind *runner_id* warm, at most every :data:`_min_interval_s`.
 
     Non-blocking and fail-safe: the provider call runs on a worker thread so a
     slow backend cannot delay the tunnel ping loop that calls this, and every
@@ -116,7 +122,7 @@ def touch(runner_id: str) -> None:
         return
     now = time.monotonic()
     last = _last_kept.get(runner_id)
-    if last is not None and now - last < _MIN_INTERVAL_S:
+    if last is not None and now - last < _min_interval_s:
         return
     with _inflight_lock:
         if runner_id in _inflight:
@@ -134,7 +140,7 @@ def touch(runner_id: str) -> None:
 
 def _prune_throttle(now: float) -> None:
     """Drop throttle entries older than two intervals (their runners are gone)."""
-    cutoff = now - 2 * _MIN_INTERVAL_S
+    cutoff = now - 2 * _min_interval_s
     for runner_id in [rid for rid, seen in _last_kept.items() if seen < cutoff]:
         _last_kept.pop(runner_id, None)
 

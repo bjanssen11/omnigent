@@ -24,7 +24,6 @@ from omnigent.onboarding.sandboxes.agent_sandbox import (
     API_GROUP,
     API_VERSION,
     DEFAULT_SHUTDOWN_WINDOW_S,
-    MIN_SHUTDOWN_WINDOW_S,
     SANDBOX_PLURAL,
     SHUTDOWN_WINDOW_ENV_VAR,
     STORAGE_CLASS_ENV_VAR,
@@ -32,6 +31,7 @@ from omnigent.onboarding.sandboxes.agent_sandbox import (
     WORKSPACE_VOLUME_NAME,
     AgentSandboxLauncher,
     build_sandbox_manifest,
+    min_shutdown_window_s,
     resolve_shutdown_window_s,
     resolve_workspace_volume,
 )
@@ -314,26 +314,51 @@ def test_window_below_the_floor_is_clamped_up(monkeypatch: pytest.MonkeyPatch) -
     anything pushed it forward, suspending every sandbox mid-run. Clamp, don't
     honour it.
     """
+    floor = min_shutdown_window_s()
     monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "60")
-    assert resolve_shutdown_window_s() == MIN_SHUTDOWN_WINDOW_S
-    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, str(MIN_SHUTDOWN_WINDOW_S - 1))
-    assert resolve_shutdown_window_s() == MIN_SHUTDOWN_WINDOW_S
+    assert resolve_shutdown_window_s() == floor
+    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, str(floor - 1))
+    assert resolve_shutdown_window_s() == floor
     # At or above the floor is honoured verbatim.
-    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, str(MIN_SHUTDOWN_WINDOW_S))
-    assert resolve_shutdown_window_s() == MIN_SHUTDOWN_WINDOW_S
+    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, str(floor))
+    assert resolve_shutdown_window_s() == floor
     monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "1800")
     assert resolve_shutdown_window_s() == 1800
 
 
-def test_floor_outlives_two_server_refresh_intervals() -> None:
+def test_floor_is_twice_the_shared_keepalive_interval() -> None:
     """
-    The floor is declared locally to keep the onboarding layer free of a server
-    import; this is what stops the two constants drifting apart.
+    The floor is 2x the interval the server loop actually throttles to, read from
+    the same resolver, so the two cannot drift.
     """
-    from omnigent.server.managed_host_keepalive import _MIN_INTERVAL_S
+    from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
 
-    assert MIN_SHUTDOWN_WINDOW_S >= 2 * _MIN_INTERVAL_S
-    assert DEFAULT_SHUTDOWN_WINDOW_S >= MIN_SHUTDOWN_WINDOW_S
+    assert min_shutdown_window_s() == int(2 * resolve_managed_keepalive_interval_s())
+    assert min_shutdown_window_s() <= DEFAULT_SHUTDOWN_WINDOW_S
+
+
+def test_lowering_the_interval_lowers_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The experimentation path: a low keepalive interval lets a correspondingly low
+    window through, so a sandbox can be watched suspending seconds after it idles.
+    """
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "15")
+    assert min_shutdown_window_s() == 30
+    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "30")
+    assert resolve_shutdown_window_s() == 30
+
+
+def test_keep_alive_logs_the_extend_on_the_lifecycle_logger(
+    fake_clients: tuple[_FakeCore, _FakeCustom], caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    The keepalive-extend is visible at INFO on the dedicated lifecycle logger, so
+    an operator can watch the deadline march forward while a runner is live.
+    """
+    with caplog.at_level(logging.INFO, logger="omnigent.sandbox.lifecycle"):
+        _launcher().keep_alive(_SANDBOX_ID)
+    msgs = [r.getMessage() for r in caplog.records if r.name == "omnigent.sandbox.lifecycle"]
+    assert any("kept alive" in m for m in msgs), msgs
 
 
 # ── keep_alive ─────────────────────────────────────────

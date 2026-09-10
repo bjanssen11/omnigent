@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
 from omnigent.onboarding.sandboxes.kubernetes import (
     _POD_READY_REQUEST_TIMEOUT_S,
     KubernetesSandboxLauncher,
@@ -76,6 +77,13 @@ if TYPE_CHECKING:
 
 
 _logger = logging.getLogger(__name__)
+
+# Dedicated logger for the sandbox lifecycle transitions the server drives
+# (keepalive-extend while busy, wake from an idle suspend), so an operator can
+# watch just these — e.g. `--log-filter omnigent.sandbox.lifecycle`. Wording is
+# kept distinct from the managed-sandbox reaper's so an idle *suspend*
+# (resumable) is never read as a *terminate* (reaped for good).
+_lifecycle_logger = logging.getLogger("omnigent.sandbox.lifecycle")
 
 
 # ── Constants ──────────────────────────────────────────
@@ -97,7 +105,7 @@ DEFAULT_SHUTDOWN_WINDOW_S: int = 3600
 
 This is effectively the sandbox's inactivity timeout: a sandbox with no live
 runner is reclaimed within one window of its last refresh. It MUST stay
-comfortably above :data:`omnigent.server.managed_host_keepalive._MIN_INTERVAL_S`
+comfortably above :func:`~omnigent.onboarding.sandboxes.base.resolve_managed_keepalive_interval_s`
 (the server's per-runner refresh rate) so a couple of missed or slow refreshes
 cannot reclaim a busy sandbox. One hour against a 10-minute refresh leaves five
 misses of headroom, and also covers the gap between a host starting and its
@@ -128,24 +136,20 @@ the workspace, ``~/.omnigent``, and harness caches) survive a suspend.
 """
 
 
-MIN_SHUTDOWN_WINDOW_S: int = 1200
-"""Floor on the resolved window, in seconds.
+def min_shutdown_window_s() -> int:
+    """
+    Floor on the resolved shutdown window, in seconds: twice the server's
+    keepalive refresh interval.
 
-A window shorter than the server's keepalive refresh interval is a footgun that
-looks like it works: the deadline lapses before anything ever pushes it forward,
-so every sandbox suspends mid-run. A configured value below this is clamped up
-rather than honoured.
-
-Declared here rather than imported from
-``omnigent.server.managed_host_keepalive._MIN_INTERVAL_S`` on purpose: this
-module is in the onboarding layer and the server imports IT, so reading the
-server's constant here would invert that dependency. The test suite pins this
-floor at >= 2x that interval instead, so the two cannot drift apart silently.
-
-To watch a suspend happen quickly in a lab, patch ``spec.shutdownTime`` into the
-past directly (``kubectl patch sandbox … shutdownTime``) rather than shortening
-the window below this floor.
-"""
+    A window shorter than the refresh interval is a footgun that looks like it
+    works: the deadline lapses before anything pushes it forward, so every
+    sandbox suspends mid-run. Twice the interval leaves a full missed refresh of
+    headroom. Both this floor and the server loop's throttle read the same
+    :func:`~omnigent.onboarding.sandboxes.base.resolve_managed_keepalive_interval_s`,
+    so lowering the interval to experiment lowers this floor with it; they cannot
+    drift. A configured window below the floor is clamped up to it.
+    """
+    return int(2 * resolve_managed_keepalive_interval_s())
 
 
 def resolve_workspace_volume() -> tuple[str, str | None] | None:
@@ -169,10 +173,11 @@ def resolve_shutdown_window_s() -> int:
     A non-positive or unparseable value falls through to the default rather
     than raising: a malformed knob must not make sandboxes unlaunchable, and a
     zero window would expire every sandbox at birth. A positive value below
-    :data:`MIN_SHUTDOWN_WINDOW_S` is clamped up to it.
+    :func:`min_shutdown_window_s` is clamped up to it.
 
-    :returns: The window in seconds, always >= :data:`MIN_SHUTDOWN_WINDOW_S`.
+    :returns: The window in seconds, always >= :func:`min_shutdown_window_s`.
     """
+    floor = min_shutdown_window_s()
     raw = os.environ.get(SHUTDOWN_WINDOW_ENV_VAR, "").strip()
     if raw:
         try:
@@ -185,7 +190,7 @@ def resolve_shutdown_window_s() -> int:
                 DEFAULT_SHUTDOWN_WINDOW_S,
             )
         else:
-            if parsed >= MIN_SHUTDOWN_WINDOW_S:
+            if parsed >= floor:
                 return parsed
             if parsed > 0:
                 _logger.warning(
@@ -193,10 +198,10 @@ def resolve_shutdown_window_s() -> int:
                     "deadline that short in time); using %ss",
                     SHUTDOWN_WINDOW_ENV_VAR,
                     raw,
-                    MIN_SHUTDOWN_WINDOW_S,
-                    MIN_SHUTDOWN_WINDOW_S,
+                    floor,
+                    floor,
                 )
-                return MIN_SHUTDOWN_WINDOW_S
+                return floor
             _logger.warning(
                 "ignoring %s=%r (must be positive); using %ss",
                 SHUTDOWN_WINDOW_ENV_VAR,
@@ -368,6 +373,10 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
         spec = dict(body["spec"])  # type: ignore[arg-type]
         spec.pop("volumeClaimTemplates", None)
         click.echo(f"  → waking suspended agent-sandbox '{body['metadata']['name']}'")  # type: ignore[index]
+        _lifecycle_logger.info(
+            "sandbox %s was reclaimed while idle (suspended); waking it in place",
+            body["metadata"]["name"],  # type: ignore[index]
+        )
         custom.patch_namespaced_custom_object(
             API_GROUP,
             API_VERSION,
@@ -465,7 +474,9 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
                 _api_reason(exc),
             )
         else:
-            _logger.debug("extended agent-sandbox '%s' to %s", sandbox_id, shutdown_time)
+            _lifecycle_logger.info(
+                "sandbox %s kept alive: shutdownTime -> %s", sandbox_id, shutdown_time
+            )
         finally:
             self._close_clients()
 

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import os
 import secrets
 import shlex
 from abc import ABC, abstractmethod
@@ -48,6 +50,52 @@ pins a commit). It bakes the full omnigent install plus git / tmux /
 curl and the coding-harness CLIs, so sandbox creation skips the
 in-sandbox dependency install. Providers layer their own override
 mechanisms (env var / server config) on top of this default."""
+
+_logger = logging.getLogger(__name__)
+
+MANAGED_KEEPALIVE_INTERVAL_ENV_VAR: str = "OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S"
+"""Environment variable overriding the managed-sandbox keepalive cadence (seconds)."""
+
+_DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 600.0
+_MIN_MANAGED_KEEPALIVE_INTERVAL_S: float = 5.0
+
+
+def resolve_managed_keepalive_interval_s() -> float:
+    """
+    How often the server refreshes a live managed sandbox's liveness, in seconds.
+
+    Read from :data:`MANAGED_KEEPALIVE_INTERVAL_ENV_VAR` (default 600s), floored
+    at a small minimum so a typo cannot spin the refresh loop. Single source of
+    truth: the server keepalive loop throttles to this
+    (:mod:`omnigent.server.managed_host_keepalive`), and the ``agent_sandbox``
+    provider sets its shutdown-window floor to twice this, so the window can
+    never fall below what the loop can actually refresh in time. Lower it (with a
+    correspondingly low window) to watch a sandbox suspend soon after it idles.
+    """
+    raw = os.environ.get(MANAGED_KEEPALIVE_INTERVAL_ENV_VAR, "").strip()
+    if not raw:
+        return _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
+    try:
+        parsed = float(raw)
+    except ValueError:
+        _logger.warning(
+            "ignoring %s=%r (not a number); using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S,
+        )
+        return _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
+    if parsed < _MIN_MANAGED_KEEPALIVE_INTERVAL_S:
+        _logger.warning(
+            "%s=%r is below the %ss minimum; using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            _MIN_MANAGED_KEEPALIVE_INTERVAL_S,
+            _MIN_MANAGED_KEEPALIVE_INTERVAL_S,
+        )
+        return _MIN_MANAGED_KEEPALIVE_INTERVAL_S
+    return parsed
+
 
 # Ceiling for the in-sandbox host restart backoff, so a host that crashes on
 # every attempt settles into a slow retry instead of a hot loop.

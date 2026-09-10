@@ -264,6 +264,49 @@ deployment-wide reaper handles sandboxes abandoned long-term. `kubectl get
 sandbox -n omnigent-sandboxes` shows suspended ones with `Ready=False`,
 `Reason=SandboxExpired`.
 
+### Watching and tuning the lifecycle
+
+**See it happen.** The transitions the server drives log at `INFO` under the
+`omnigent.sandbox.lifecycle` logger: each keepalive-extend while a runner is live
+(`sandbox <id> kept alive: shutdownTime -> <ts>`) and the wake from an idle
+suspend (`sandbox <id> was reclaimed while idle (suspended); waking it in
+place`). Watch the `shutdownTime` march forward while the agent works, then stop
+once the runner goes idle. The Pod teardown itself is the agent-sandbox
+controller's doing, so confirm the suspend with `kubectl get sandbox -n
+omnigent-sandboxes -w` (it flips to `Ready=False` / `SandboxExpired`, keeping its
+PVC). This is a *suspend* (resumable) — distinct from the deployment-wide reaper,
+which logs its own `reaper terminated N generation(s)` when it deletes a
+long-abandoned sandbox for good.
+
+**Tune how fast idle sandboxes suspend.** Two server-env knobs plus one injected
+into the sandbox:
+
+| Knob | What | Default |
+|---|---|---|
+| `OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S` | how often the server refreshes a live sandbox's deadline | `600` |
+| `OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S` | the inactivity window, floored at 2× the interval | `3600` |
+| `runner.idle_timeout_s` (via `host_config`) | how long the runner lives after its last turn | `3600` |
+
+The window floor is `2×` the interval so a busy sandbox always outlasts a missed
+refresh; lowering the interval lowers the floor with it. To watch a sandbox
+suspend seconds after it idles (a demo, or experimentation), set all three low —
+`host_config` in the server config, the other two in the server's environment:
+
+```yaml
+sandbox:
+  provider: agent_sandbox
+  host_config:
+    runner:
+      idle_timeout_s: 30      # runner exits 30s after the last turn
+# server env: OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S=15
+#             OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S=30
+```
+
+Then: finish a turn → the runner exits ~30s later → nothing refreshes the
+deadline → the controller suspends the sandbox ~30s after that, and the
+`omnigent.sandbox.lifecycle` log goes quiet as it does. Leave these at their
+defaults in production.
+
 ### Durable workspace (`OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE`)
 
 By default `$HOME` is an `emptyDir` and dies with the Pod, so a woken sandbox
