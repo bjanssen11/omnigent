@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import secrets
 import shlex
@@ -80,6 +81,16 @@ def resolve_managed_keepalive_interval_s() -> float:
     except ValueError:
         _logger.warning(
             "ignoring %s=%r (not a number); using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S,
+        )
+        return _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S
+    if not math.isfinite(parsed):
+        # "nan"/"inf" parse cleanly but blow up downstream in int/ceil(2 * x);
+        # a non-finite typo must fail safe like any other bad value.
+        _logger.warning(
+            "ignoring %s=%r (not a finite number); using %ss",
             MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
             raw,
             _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S,

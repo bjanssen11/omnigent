@@ -56,6 +56,7 @@ from the same ``sandbox.kubernetes`` block as the Job provider, so switching
 from __future__ import annotations
 
 import logging
+import math
 import os
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, ClassVar
@@ -146,10 +147,11 @@ def min_shutdown_window_s() -> int:
     sandbox suspends mid-run. Twice the interval leaves a full missed refresh of
     headroom. Both this floor and the server loop's throttle read the same
     :func:`~omnigent.onboarding.sandboxes.base.resolve_managed_keepalive_interval_s`,
-    so lowering the interval to experiment lowers this floor with it; they cannot
-    drift. A configured window below the floor is clamped up to it.
+    so lowering the interval to experiment lowers this floor with it. They read the
+    same value for a fixed, uniform environment (the realistic case). A configured
+    window below the floor is clamped up to it.
     """
-    return int(2 * resolve_managed_keepalive_interval_s())
+    return math.ceil(2 * resolve_managed_keepalive_interval_s())
 
 
 def resolve_workspace_volume() -> tuple[str, str | None] | None:
@@ -178,6 +180,9 @@ def resolve_shutdown_window_s() -> int:
     :returns: The window in seconds, always >= :func:`min_shutdown_window_s`.
     """
     floor = min_shutdown_window_s()
+    # Fallbacks (empty/malformed/non-positive) must also respect the floor: with a
+    # configurable interval, DEFAULT is no longer guaranteed >= floor.
+    fallback = max(DEFAULT_SHUTDOWN_WINDOW_S, floor)
     raw = os.environ.get(SHUTDOWN_WINDOW_ENV_VAR, "").strip()
     if raw:
         try:
@@ -187,7 +192,7 @@ def resolve_shutdown_window_s() -> int:
                 "ignoring %s=%r (not an integer); using %ss",
                 SHUTDOWN_WINDOW_ENV_VAR,
                 raw,
-                DEFAULT_SHUTDOWN_WINDOW_S,
+                fallback,
             )
         else:
             if parsed >= floor:
@@ -206,9 +211,9 @@ def resolve_shutdown_window_s() -> int:
                 "ignoring %s=%r (must be positive); using %ss",
                 SHUTDOWN_WINDOW_ENV_VAR,
                 raw,
-                DEFAULT_SHUTDOWN_WINDOW_S,
+                fallback,
             )
-    return DEFAULT_SHUTDOWN_WINDOW_S
+    return fallback
 
 
 def _shutdown_time(window_s: int, *, now: datetime | None = None) -> str:
@@ -373,10 +378,6 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
         spec = dict(body["spec"])  # type: ignore[arg-type]
         spec.pop("volumeClaimTemplates", None)
         click.echo(f"  → waking suspended agent-sandbox '{body['metadata']['name']}'")  # type: ignore[index]
-        _lifecycle_logger.info(
-            "sandbox %s was reclaimed while idle (suspended); waking it in place",
-            body["metadata"]["name"],  # type: ignore[index]
-        )
         custom.patch_namespaced_custom_object(
             API_GROUP,
             API_VERSION,
@@ -385,6 +386,12 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
             body["metadata"]["name"],  # type: ignore[index]
             {"spec": spec},
             _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+        )
+        # Logged only after the patch lands, so a failed wake never reads as a
+        # successful transition.
+        _lifecycle_logger.info(
+            "sandbox %s was reclaimed while idle (suspended); waking it in place",
+            body["metadata"]["name"],  # type: ignore[index]
         )
 
     def _find_job_pod(self, namespace: str, job_name: str) -> str | None:

@@ -326,15 +326,36 @@ def test_window_below_the_floor_is_clamped_up(monkeypatch: pytest.MonkeyPatch) -
     assert resolve_shutdown_window_s() == 1800
 
 
-def test_floor_is_twice_the_shared_keepalive_interval() -> None:
+def test_default_window_is_floored_when_interval_is_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
-    The floor is 2x the interval the server loop actually throttles to, read from
-    the same resolver, so the two cannot drift.
+    Regression: with a configurable interval, DEFAULT is no longer guaranteed
+    >= floor. Every window path (empty-env, malformed, non-positive) must still
+    be floored, or a busy sandbox suspends between refreshes.
+    """
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "4000")
+    monkeypatch.delenv(SHUTDOWN_WINDOW_ENV_VAR, raising=False)  # default path
+    assert min_shutdown_window_s() == 8000
+    assert resolve_shutdown_window_s() == 8000
+    for bad in ("soon", "0", "-5"):
+        monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, bad)
+        assert resolve_shutdown_window_s() >= min_shutdown_window_s()
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+def test_non_finite_interval_falls_back_instead_of_crashing(
+    bad: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    "nan"/"inf" parse as floats but blow up in ceil(2 * x); they must fail safe
+    to the default, not crash launch/keepalive.
     """
     from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
 
-    assert min_shutdown_window_s() == int(2 * resolve_managed_keepalive_interval_s())
-    assert min_shutdown_window_s() <= DEFAULT_SHUTDOWN_WINDOW_S
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", bad)
+    assert resolve_managed_keepalive_interval_s() == 600.0
+    assert min_shutdown_window_s() == 1200  # no OverflowError / ValueError
 
 
 def test_lowering_the_interval_lowers_the_floor(monkeypatch: pytest.MonkeyPatch) -> None:

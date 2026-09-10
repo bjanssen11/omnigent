@@ -230,3 +230,20 @@ def test_inflight_is_released_even_when_the_provider_raises(
     monkeypatch.setattr(managed_host_keepalive, "_inflight", {"r1"})
     managed_host_keepalive._keep_alive_for_runner("r1")
     assert "r1" not in managed_host_keepalive._inflight
+
+
+def test_configure_snapshots_the_shared_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Cross-module invariant: the server throttle reads the SAME resolver the
+    provider floor uses, so for a fixed env they stay in step (this is what the
+    "cannot drift" claim actually rests on).
+    """
+    from omnigent.onboarding.sandboxes.base import resolve_managed_keepalive_interval_s
+
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "45")
+    # capture-and-restore the module snapshot so we do not leak into other tests
+    monkeypatch.setattr(
+        managed_host_keepalive, "_min_interval_s", managed_host_keepalive._min_interval_s
+    )
+    managed_host_keepalive.configure(SimpleNamespace(), None, None)
+    assert managed_host_keepalive._min_interval_s == resolve_managed_keepalive_interval_s() == 45.0
