@@ -395,7 +395,7 @@ def test_keep_alive_pushes_shutdown_time_forward(
     """A single-field merge patch moves the deadline one window out."""
     _, custom = fake_clients
     monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "1800")
-    _launcher().keep_alive(_SANDBOX_ID)
+    assert _launcher().keep_alive(_SANDBOX_ID) is True  # confirmed patch
 
     assert custom.calls == ["patch"]
     name, body = custom.patches[0]
@@ -427,7 +427,9 @@ def test_keep_alive_soft_fails_on_api_error(
     _, custom = fake_clients
     custom.patch_error = _FakeApiException(status=500, reason="ServerTimeout")
     with caplog.at_level(logging.WARNING):
-        _launcher().keep_alive(_SANDBOX_ID)
+        # returns False (attempted, not confirmed) so the server loop skips its
+        # success INFO; must not raise
+        assert _launcher().keep_alive(_SANDBOX_ID) is False
     assert "could not extend agent-sandbox" in caplog.text
 
 
@@ -438,7 +440,8 @@ def test_keep_alive_ignores_a_vanished_sandbox(
     _, custom = fake_clients
     custom.patch_error = _FakeApiException(status=404, reason="NotFound")
     with caplog.at_level(logging.WARNING):
-        _launcher().keep_alive(_SANDBOX_ID)
+        # gone sandbox: nothing extended, so False (no success INFO), but silent
+        assert _launcher().keep_alive(_SANDBOX_ID) is False
     assert caplog.text == ""
 
 

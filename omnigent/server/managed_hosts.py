@@ -1116,16 +1116,18 @@ def _parse_keep_warm_s(raw: dict[str, object]) -> int | None:
     value = raw.get("keep_warm_s")
     if value is None:
         return None
-    # Must be >= 1: it becomes runner.idle_timeout_s, where a value that rounds to
-    # 0 DISABLES the idle watchdog (sandbox never suspends) — the opposite of a
-    # short keep-warm. Reject non-finite too, which would otherwise crash int().
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value < 1
-    ):
-        raise ValueError("sandbox.keep_warm_s must be a finite number of seconds >= 1")
+    # It becomes runner.idle_timeout_s, where a value that rounds to 0 DISABLES
+    # the idle watchdog (sandbox never suspends), the opposite of a short
+    # keep-warm, so require a whole number >= 1. bool is an int subclass (reject
+    # first); a float is rejected unless finite and integral (2.9 would silently
+    # truncate); math.isfinite is called only on floats so a huge int literal
+    # cannot raise OverflowError here.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("sandbox.keep_warm_s must be a whole number of seconds >= 1")
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        raise ValueError("sandbox.keep_warm_s must be a whole number of seconds >= 1")
+    if value < 1:
+        raise ValueError("sandbox.keep_warm_s must be a whole number of seconds >= 1")
     return int(value)
 
 

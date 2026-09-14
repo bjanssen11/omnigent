@@ -554,12 +554,15 @@ class SandboxLifecycle(ABC):
         """
         raise self._capability_error("attach to an existing sandbox")
 
-    def keep_alive(self, sandbox_id: str) -> None:
+    def keep_alive(self, sandbox_id: str) -> bool | None:
         """
         Keep the sandbox from being reclaimed while it is still in use,
         so long agent runs don't lose their host. Soft-fail:
         implementations should warn rather than raise when the provider
-        rejects the setting.
+        rejects the setting. Return ``False`` when an extension was attempted
+        but could not be confirmed (a soft failure the provider already logged),
+        so the managed keepalive loop can skip its success line; ``None`` or
+        ``True`` otherwise.
 
         Called BOTH once after a CLI bootstrap provision AND periodically
         by the managed path for as long as the sandbox has a live runner

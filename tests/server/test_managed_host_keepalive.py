@@ -18,14 +18,16 @@ from omnigent.server import managed_host_keepalive
 
 
 class _Launcher:
-    def __init__(self, raises: BaseException | None = None) -> None:
+    def __init__(self, raises: BaseException | None = None, returns: object = None) -> None:
         self.calls: list[str] = []
         self._raises = raises
+        self._returns = returns
 
-    def keep_alive(self, sandbox_id: str) -> None:
+    def keep_alive(self, sandbox_id: str) -> object:
         self.calls.append(sandbox_id)
         if self._raises is not None:
             raise self._raises
+        return self._returns
 
 
 def _wire(
@@ -266,6 +268,26 @@ def test_successful_keepalive_logs_at_info_on_the_server_logger(
     with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
         managed_host_keepalive._keep_alive_for_runner("r1")
     assert any("kept managed sandbox sbx1 alive" in r.getMessage() for r in caplog.records)
+
+
+def test_soft_failed_keepalive_suppresses_the_success_info(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    When keep_alive returns False (attempted but not confirmed; the provider
+    logged its own warning), the server loop must NOT log a success line, so the
+    observability signal is never self-contradictory.
+    """
+    launcher = _Launcher(returns=False)
+    _wire(
+        monkeypatch,
+        launcher=launcher,
+        host=SimpleNamespace(sandbox_id="sbx1", sandbox_provider="agent_sandbox"),
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.server.managed_host_keepalive"):
+        managed_host_keepalive._keep_alive_for_runner("r1")
+    assert launcher.calls == ["sbx1"]  # attempted
+    assert not any("kept managed sandbox" in r.getMessage() for r in caplog.records)
 
 
 def test_keepalive_interval_caches_the_runners_provider(monkeypatch: pytest.MonkeyPatch) -> None:

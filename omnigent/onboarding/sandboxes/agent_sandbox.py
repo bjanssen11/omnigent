@@ -448,7 +448,7 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
             return None
         return job_name
 
-    def keep_alive(self, sandbox_id: str) -> None:
+    def keep_alive(self, sandbox_id: str) -> bool | None:
         """
         Push ``spec.shutdownTime`` one window into the future.
 
@@ -459,6 +459,9 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
         not an error at all.
 
         :param sandbox_id: The ``Sandbox`` to extend.
+        :returns: ``True`` when the patch landed, ``False`` when it was attempted
+            but not confirmed (soft failure, or a gone 404) so the server loop
+            skips its success log.
         """
         _ensure_sdk()
         from kubernetes.client.rest import ApiException
@@ -485,6 +488,7 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
                     shutdown_time,
                     _api_reason(exc),
                 )
+            return False
         except HTTPError as exc:
             _logger.warning(
                 "could not extend agent-sandbox '%s' to %s: %s",
@@ -492,8 +496,10 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
                 shutdown_time,
                 _api_reason(exc),
             )
+            return False
         else:
             _logger.debug("extended agent-sandbox '%s' to %s", sandbox_id, shutdown_time)
+            return True
         finally:
             self._close_clients()
 

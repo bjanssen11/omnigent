@@ -204,15 +204,19 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                 host.sandbox_provider
             )
             try:
-                config.launcher_factory().keep_alive(host.sandbox_id)
+                extended = config.launcher_factory().keep_alive(host.sandbox_id)
                 # INFO from the server layer so the keepalive is visible in the
                 # server log (onboarding-layer loggers do not surface there); the
-                # provider logs the new deadline at debug.
-                _logger.info(
-                    "kept managed sandbox %s alive (provider %s)",
-                    host.sandbox_id,
-                    host.sandbox_provider,
-                )
+                # provider logs the new deadline at debug. A provider returns
+                # False when it attempted but could not confirm the extension (and
+                # logged its own warning); skip the success line so the log is not
+                # self-contradictory.
+                if extended is not False:
+                    _logger.info(
+                        "kept managed sandbox %s alive (provider %s)",
+                        host.sandbox_id,
+                        host.sandbox_provider,
+                    )
             except SandboxCapabilityError:
                 # Provider cannot extend a sandbox (e.g. kubernetes): today's
                 # behaviour, nothing to log every 10 minutes.

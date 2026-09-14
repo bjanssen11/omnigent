@@ -5059,6 +5059,11 @@ def test_keep_warm_sets_runner_idle_timeout() -> None:
     from omnigent.server.managed_hosts import _apply_keep_warm, _parse_keep_warm_s
 
     assert _parse_keep_warm_s({"keep_warm_s": 30}) == 30
+    assert _parse_keep_warm_s({"keep_warm_s": 30.0}) == 30  # whole float ok
+    assert _parse_keep_warm_s({"keep_warm_s": 10**400}) == 10**400  # huge int, no OverflowError
+    for bad in (0, 0.5, 2.9, -5, True, "x", float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            _parse_keep_warm_s({"keep_warm_s": bad})
     assert _apply_keep_warm(None, 30) == {"runner": {"idle_timeout_s": 30}}
     assert (
         _apply_keep_warm({"runner": {"idle_timeout_s": 999}}, 30)["runner"]["idle_timeout_s"] == 30
