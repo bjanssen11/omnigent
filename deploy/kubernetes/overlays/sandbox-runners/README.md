@@ -270,7 +270,7 @@ sandbox -n omnigent-sandboxes` shows suspended ones with `Ready=False`,
 **Tune it — one knob.** Set `keep_warm_s` on the sandbox config: how long an idle
 sandbox stays warm (its runner alive, so follow-ups are instant) after the last
 turn. Once that elapses the runner exits and the pod suspends a short window
-later (~2 min), so a sandbox is reclaimed roughly `keep_warm_s` after the agent
+later (~5 min), so a sandbox is reclaimed roughly `keep_warm_s` after the agent
 goes quiet:
 
 ```yaml
@@ -283,8 +283,10 @@ It maps directly to the in-sandbox `runner.idle_timeout_s` and is authoritative
 (it wins over an explicit `host_config.runner.idle_timeout_s`). Leave it unset for
 the ~1h default. A short value reclaims aggressively; a follow-up **within**
 `keep_warm_s` is instant, while one sent after it re-wakes the sandbox on the next
-message (the CR + PVC are retained, so the workspace survives). Note the ~2-min
-window tail: a `keep_warm_s` of a few seconds still suspends ~2 min after idle.
+message (the CR + PVC are retained, so the workspace survives). Note the ~5-min
+window tail: a `keep_warm_s` of a few seconds still suspends ~5 min after idle
+(the window trades a longer linger for headroom against reaping a busy sandbox;
+lower it with `OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S` for a faster demo).
 
 **Watch it happen.** The reliable view is the `Sandbox` CR itself:
 
@@ -301,7 +303,7 @@ reaper's hard terminate. The server also logs each keepalive at `INFO` from
 every logging setup — treat `kubectl get sandbox -w` as the source of truth.
 
 **Advanced (rarely needed).** agent_sandbox refreshes its deadline every ~60s
-under a short ~120s pod-linger window; other managed providers keep a cheaper
+under a short ~300s pod-linger window; other managed providers keep a cheaper
 ~600s cadence, so agent_sandbox's fast refresh doesn't multiply their write load.
 `OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S` and `OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S`
 override the window and cadence for experiments (e.g. a faster demo). Keepalive

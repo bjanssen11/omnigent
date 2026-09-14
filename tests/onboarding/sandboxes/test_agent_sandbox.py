@@ -622,12 +622,16 @@ def test_terminate_still_hard_deletes(
 
 
 def test_initial_window_floors_at_boot_grace(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The short steady window still gets a boot-safe initial (create/wake) deadline."""
+    """A steady window shorter than the boot grace still gets a boot-safe initial
+    (create/wake) deadline, so a short window never reaps a still-booting pod."""
     from omnigent.onboarding.sandboxes.agent_sandbox import (
         _BOOT_GRACE_S,
         initial_shutdown_window_s,
     )
 
-    monkeypatch.delenv(SHUTDOWN_WINDOW_ENV_VAR, raising=False)
+    # A short steady window (below the boot grace); interval low so it clears the floor.
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "10")
+    monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, "30")
+    assert resolve_shutdown_window_s() == 30
     assert resolve_shutdown_window_s() < _BOOT_GRACE_S
     assert initial_shutdown_window_s() == _BOOT_GRACE_S

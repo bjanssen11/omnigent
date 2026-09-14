@@ -96,13 +96,16 @@ SHUTDOWN_WINDOW_ENV_VAR: str = "OMNIGENT_AGENT_SANDBOX_SHUTDOWN_WINDOW_S"
 ``keep_warm_s`` (the runner idle timeout); this window is the pod-linger tail
 after the runner exits and is left at its default in normal use."""
 
-DEFAULT_SHUTDOWN_WINDOW_S: int = 120
+DEFAULT_SHUTDOWN_WINDOW_S: int = 300
 """How far ahead of now ``spec.shutdownTime`` is set on each keepalive, in
 seconds: how long the pod lingers after the runner exits before it suspends.
-Small by design so ``keep_warm_s`` (the runner idle timeout) governs the felt
-idle-suspend time. Must stay >= :func:`min_shutdown_window_s` (twice the refresh
-interval) so a couple of missed refreshes cannot reap a busy sandbox; the
-create/wake deadline is floored separately at :data:`_BOOT_GRACE_S` for boot."""
+Kept small (vs the platform default) because ``keep_warm_s`` (the runner idle
+timeout) governs the felt idle-suspend time; the window is only the post-exit
+linger tail. Sized at ~5x the default refresh interval, well above the
+:func:`min_shutdown_window_s` 2x floor, so several delayed or soft-failed
+refreshes cannot reap a busy sandbox mid-run (the 2x floor alone leaves close to
+a single missed refresh of headroom). The create/wake deadline is floored
+separately at :data:`_BOOT_GRACE_S` for boot."""
 
 _BOOT_GRACE_S: int = 300
 """Floor on the shutdownTime set at create/wake, decoupled from the steady
