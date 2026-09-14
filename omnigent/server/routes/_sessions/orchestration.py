@@ -6274,11 +6274,15 @@ async def _relay_runner_stream(
         ready heartbeat; see :func:`_relay_runner_stream_once`.
     """
     loop = asyncio.get_running_loop()
-    deadline: float | None = None
-    # Shape of the current outage, for the give-up log. ``attempts`` counts the
-    # reconnects tried, ``outage_started`` is when the tunnel first dropped —
-    # a tunnel that flapped for the whole grace window and one that dropped
-    # once and never answered are different faults with the same message.
+    # Set on the first loss of every outage, alongside the counters below, and
+    # always before it is read — the loop only compares it inside the except
+    # branch that assigns it.
+    deadline: float = 0.0
+    # Shape of the current outage, for the give-up log: how many reconnects it
+    # took and when the tunnel first dropped. A tunnel that flapped for the
+    # whole grace window and one that dropped once and never answered are
+    # different faults behind the same message. Both reset together when a new
+    # outage begins, so the two never describe different spans.
     attempts = 0
     outage_started: float | None = None
     while True:
@@ -6293,17 +6297,17 @@ async def _relay_runner_stream(
             return
         except _RelayTransportLost as lost:
             now = loop.time()
-            attempts += 1
             streamed_s = now - started
-            # A drop after a long healthy stream begins a new outage; see the
-            # fresh-window rule below.
+            # An attempt that streamed longer than the grace was a live tunnel
+            # dropping anew: a fresh outage, so it gets a fresh window and its
+            # own counts. One condition drives all three — a second spelling of
+            # it would drift from the window it is supposed to match.
             if outage_started is None or streamed_s > RUNNER_DISCONNECT_GRACE_S:
                 outage_started = started
-            outage_s = now - outage_started
-            # An attempt that streamed longer than the grace was a live
-            # tunnel dropping anew — give the new outage a fresh window.
-            if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
+                attempts = 0
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
+            attempts += 1
+            outage_s = now - outage_started
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
                 _logger.info(
                     "Relay: runner transport lost for session=%s; retrying for %.1fs "
