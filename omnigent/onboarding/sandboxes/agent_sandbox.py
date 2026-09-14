@@ -107,16 +107,17 @@ refreshes cannot reap a busy sandbox mid-run (the 2x floor alone leaves close to
 a single missed refresh of headroom). The create/wake deadline is floored
 separately at :data:`_BOOT_GRACE_S` for boot."""
 
-_BOOT_GRACE_S: int = 300
-"""Floor on the shutdownTime set at create/wake, decoupled from the steady
-window. A freshly created or woken Pod cannot get its first keepalive until it
-has booted, its host has started, and a session's runner has connected and
-dialed back (tens of seconds, longer on a cold image pull). If the steady window
-is shorter than that, the initial deadline would lapse before the first refresh
-and the controller would reap the Pod mid-boot. Flooring only the INITIAL
-deadline at this grace lets the steady window (which governs how fast an idle
-sandbox suspends) be short without breaking cold start. A sandbox that boots but
-never gets a runner is genuinely unused and suspends once this grace elapses."""
+_BOOT_GRACE_S: int = 1200
+"""Floor on the shutdownTime set at create/wake, decoupled from and well above
+the steady :data:`DEFAULT_SHUTDOWN_WINDOW_S`. A freshly created or woken Pod
+cannot get its first keepalive until it has pulled its image, booted, started its
+host, and had a session's runner connect and dial back (tens of seconds warm,
+but minutes on a cold image pull on an uncached node). Nothing refreshes the
+initial deadline until that first keepalive, so this grace must cover the
+worst-case cold start on its own; sized generously (20 min) above the steady
+window so a slow pull never reaps a still-booting Pod, while the steady window
+(post-connect) stays short. A sandbox that boots but never gets a runner is
+genuinely unused and suspends once this grace elapses."""
 
 
 WORKSPACE_SIZE_ENV_VAR: str = "OMNIGENT_AGENT_SANDBOX_WORKSPACE_SIZE"

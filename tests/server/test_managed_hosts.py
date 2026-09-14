@@ -5060,8 +5060,11 @@ def test_keep_warm_sets_runner_idle_timeout() -> None:
 
     assert _parse_keep_warm_s({"keep_warm_s": 30}) == 30
     assert _parse_keep_warm_s({"keep_warm_s": 30.0}) == 30  # whole float ok
-    assert _parse_keep_warm_s({"keep_warm_s": 10**400}) == 10**400  # huge int, no OverflowError
-    for bad in (0, 0.5, 2.9, -5, True, "x", float("nan"), float("inf")):
+    assert _parse_keep_warm_s({"keep_warm_s": 2592000}) == 2592000  # 30-day ceiling ok
+    # An oversized value must be rejected at config time: it becomes
+    # runner.idle_timeout_s, and the runner's float() would OverflowError on a
+    # value this large, stopping the runner from starting.
+    for bad in (0, 0.5, 2.9, -5, True, "x", float("nan"), float("inf"), 2592001, 10**400):
         with pytest.raises(ValueError):
             _parse_keep_warm_s({"keep_warm_s": bad})
     assert _apply_keep_warm(None, 30) == {"runner": {"idle_timeout_s": 30}}

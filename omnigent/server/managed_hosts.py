@@ -1107,6 +1107,9 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxHostLaun
     return _reject
 
 
+_MAX_KEEP_WARM_S = 30 * 24 * 3600  # 30 days; a finite, sane ceiling on runner.idle_timeout_s
+
+
 def _parse_keep_warm_s(raw: dict[str, object]) -> int | None:
     """Parse the top-level ``sandbox.keep_warm_s`` knob (positive seconds), or None.
 
@@ -1116,18 +1119,21 @@ def _parse_keep_warm_s(raw: dict[str, object]) -> int | None:
     value = raw.get("keep_warm_s")
     if value is None:
         return None
-    # It becomes runner.idle_timeout_s, where a value that rounds to 0 DISABLES
-    # the idle watchdog (sandbox never suspends), the opposite of a short
-    # keep-warm, so require a whole number >= 1. bool is an int subclass (reject
-    # first); a float is rejected unless finite and integral (2.9 would silently
-    # truncate); math.isfinite is called only on floats so a huge int literal
-    # cannot raise OverflowError here.
+    # It becomes runner.idle_timeout_s, where the runner does float(value): a
+    # value rounding to 0 DISABLES the idle watchdog (never suspends), and an
+    # oversized one (e.g. 10**400) overflows float() and stops the runner
+    # starting. Require a whole number in [1, _MAX_KEEP_WARM_S] (30 days, far more
+    # than any real keep-warm and safely finite). bool is an int subclass (reject
+    # first); a float must be finite and integral (2.9 would silently truncate);
+    # the range check runs on the int/float directly so a huge int never reaches
+    # a float conversion here.
+    _bad = "sandbox.keep_warm_s must be a whole number of seconds, 1 to 2592000 (30 days)"
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("sandbox.keep_warm_s must be a whole number of seconds >= 1")
+        raise ValueError(_bad)
     if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
-        raise ValueError("sandbox.keep_warm_s must be a whole number of seconds >= 1")
-    if value < 1:
-        raise ValueError("sandbox.keep_warm_s must be a whole number of seconds >= 1")
+        raise ValueError(_bad)
+    if not 1 <= value <= _MAX_KEEP_WARM_S:
+        raise ValueError(_bad)
     return int(value)
 
 

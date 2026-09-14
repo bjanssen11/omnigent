@@ -334,10 +334,11 @@ def test_default_window_is_floored_when_interval_is_raised(
     >= floor. Every window path (empty-env, malformed, non-positive) must still
     be floored, or a busy sandbox suspends between refreshes.
     """
-    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "4000")
+    # 1000s interval (under the 3600 cap) -> floor 2000, above the 300 default.
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "1000")
     monkeypatch.delenv(SHUTDOWN_WINDOW_ENV_VAR, raising=False)  # default path
-    assert min_shutdown_window_s() == 8000
-    assert resolve_shutdown_window_s() == 8000
+    assert min_shutdown_window_s() == 2000
+    assert resolve_shutdown_window_s() == 2000
     for bad in ("soon", "0", "-5"):
         monkeypatch.setenv(SHUTDOWN_WINDOW_ENV_VAR, bad)
         assert resolve_shutdown_window_s() >= min_shutdown_window_s()

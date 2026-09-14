@@ -250,6 +250,10 @@ def test_keepalive_interval_is_provider_scoped(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "15")
     assert resolve_managed_keepalive_interval_s("agent_sandbox") == 15.0
     assert resolve_managed_keepalive_interval_s("modal") == 15.0
+    # A finite-but-huge override is clamped to the max, not passed through where
+    # it would overflow the window-floor math (ceil(2 * interval)).
+    monkeypatch.setenv("OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S", "1e308")
+    assert resolve_managed_keepalive_interval_s("agent_sandbox") == 3600.0
 
 
 def test_successful_keepalive_logs_at_info_on_the_server_logger(

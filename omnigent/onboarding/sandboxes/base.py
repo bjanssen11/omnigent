@@ -66,6 +66,9 @@ _DEFAULT_MANAGED_KEEPALIVE_INTERVAL_S: float = 600.0
 # provider so lowering it does not multiply every other provider's write load.
 _AGENT_SANDBOX_KEEPALIVE_INTERVAL_S: float = 60.0
 _MIN_MANAGED_KEEPALIVE_INTERVAL_S: float = 5.0
+# Ceiling so a finite-but-huge override (e.g. 1e308) cannot overflow the
+# window-floor math (ceil(2 * interval)); an hour is already far past useful.
+_MAX_MANAGED_KEEPALIVE_INTERVAL_S: float = 3600.0
 
 
 def resolve_managed_keepalive_interval_s(provider: str | None = None) -> float:
@@ -117,6 +120,15 @@ def resolve_managed_keepalive_interval_s(provider: str | None = None) -> float:
             _MIN_MANAGED_KEEPALIVE_INTERVAL_S,
         )
         return _MIN_MANAGED_KEEPALIVE_INTERVAL_S
+    if parsed > _MAX_MANAGED_KEEPALIVE_INTERVAL_S:
+        _logger.warning(
+            "%s=%r is above the %ss maximum; using %ss",
+            MANAGED_KEEPALIVE_INTERVAL_ENV_VAR,
+            raw,
+            _MAX_MANAGED_KEEPALIVE_INTERVAL_S,
+            _MAX_MANAGED_KEEPALIVE_INTERVAL_S,
+        )
+        return _MAX_MANAGED_KEEPALIVE_INTERVAL_S
     return parsed
 
 
