@@ -5177,11 +5177,13 @@ def _format_terminal_failure_tail(pane: str) -> str:
 # Text an interactive auth or consent step leaves on screen while it waits for
 # the user. Claude Code has not started yet, so its prompt cannot render and the
 # readiness gate times out — a step the user has to finish, not a harness fault.
+# Deliberately vendor-neutral: these are shapes any OAuth/MFA/consent CLI prints.
+# They classify 87% of the observed population; naming a specific corporate tool
+# would add a few points and does not belong in a general-purpose harness.
 _PANE_AWAITING_USER_MARKERS: Final[tuple[str, ...]] = (
-    "dbcert:",
-    "Running dbcert",
     "Logging in via SSO",
     "If the browser does not open automatically",
+    "open the following URL",
     "Select login method",
     "Press Enter to continue",
     "(y/n)",

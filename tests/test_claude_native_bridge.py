@@ -8601,7 +8601,12 @@ _DBCERT_PANE = (
 
 
 def test_stalled_pane_state_names_an_interactive_prompt() -> None:
-    """A pane parked on an auth step is the user's turn, not a harness fault."""
+    """A pane parked on an auth step is the user's turn, not a harness fault.
+
+    Classified on vendor-neutral text — the SSO / browser-URL lines any OAuth
+    CLI prints — so no corporate tool name is baked into the harness.
+    """
+    assert "dbcert" not in "".join(claude_native_bridge._PANE_AWAITING_USER_MARKERS)
     assert (
         claude_native_bridge._stalled_pane_state(_DBCERT_PANE, polls=198, empty_polls=0)
         == "awaiting-user-input"
