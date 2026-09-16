@@ -137,16 +137,16 @@ def _failure_publish_calls(source: str) -> list[ast.Call]:
     return calls
 
 
-def test_failure_detail_is_bounded_to_one_line(
+def test_oversized_failure_detail_is_capped(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A whole assistant reply must not become the log line.
+    """A whole assistant reply must not land in telemetry unbounded.
 
     claude-native's ``StopFailure`` edge posts no detail, so the reason falls
-    back to the turn's persisted assistant text. Left whole, every reply is a
-    distinct signature and the dashboard cannot group the failure mode.
+    back to the turn's persisted assistant text — measured at 17KB in the worst
+    observed case. The cap keeps that out while naming what was dropped.
     """
-    reply = "Direct answer: **no**.\n\n## The crux\n" + "detail " * 600
+    reply = "Direct answer: **no**.\n\n## The crux\n" + "detail " * 2000
     record = _publish_failed(
         caplog,
         error=ErrorDetail(source="execution", code="native_turn_error", message=reply),
@@ -154,12 +154,28 @@ def test_failure_detail_is_bounded_to_one_line(
     )
     message = record.getMessage()
     assert "code=native_turn_error" in message
-    # Bounded, single-line, and says how much was dropped.
     detail = message.split("): ", 1)[1]
-    assert "\n" not in detail
-    assert len(detail) < 2100, detail
-    assert detail.startswith("Direct answer: **no**. ## The crux")
+    assert len(detail) < 4700, detail
+    assert detail.startswith("Direct answer: **no**.")
     assert "chars)" in detail
+
+
+def test_multiline_failure_detail_keeps_its_line_structure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Do not flatten a traceback: its structure is the readable part.
+
+    96% of details in the 600-2200 character band are multi-line tracebacks,
+    log tails and API error bodies. ``message`` is a column, so newlines cost
+    nothing to store and collapsing them only makes a diagnosis harder to read.
+    """
+    trace = 'API Error: 400 {\n  "error": {\n    "code": 400,\n    "message": "bad"\n  }\n}'
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(source="execution", code="native_turn_error", message=trace),
+        origin="external_session_status",
+    )
+    assert record.getMessage().endswith(trace)
 
 
 def test_runner_exit_reason_keeps_its_diagnostics(
@@ -184,6 +200,8 @@ def test_runner_exit_reason_keeps_its_diagnostics(
     assert "runner process exited with code 1" in message
     assert "~/.omnigent/logs/runner/runner-abc123-def456-7-8.log" in message
     assert "traceback line 100" in message, "the log tail was clipped too aggressively"
+    # The tail's own line structure is what makes it readable.
+    assert "traceback line 0\ntraceback line 1" in message
 
 
 def test_short_failure_detail_is_preserved_verbatim(

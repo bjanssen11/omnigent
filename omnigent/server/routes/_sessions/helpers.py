@@ -4587,31 +4587,31 @@ def _require_codex_approval_mode_forward(
 
 # A failure detail can be the harness's whole last message: claude-native's
 # StopFailure edge posts none, so the reason falls back to the turn's persisted
-# assistant text, which may be pages of markdown. Bound it so a whole reply
-# never lands in telemetry, but leave room for the details a diagnosis needs —
-# a runner-exit reason carries an exit code, a host log path and a log tail,
-# and has been measured at ~4KB.
-_FAILURE_LOG_DETAIL_MAX_CHARS: Final[int] = 2000
+# assistant text, which may be pages of markdown — one measured at 17KB. Cap it
+# so a whole reply never lands in telemetry, well above the details a diagnosis
+# needs (a runner-exit reason carries an exit code, a host log path and a log
+# tail, measured at ~4KB). Newlines are left alone: the message is a column, and
+# 96% of details in the 600-2200 char band are multi-line tracebacks, log tails
+# and API error bodies whose structure is the readable part.
+_FAILURE_LOG_DETAIL_MAX_CHARS: Final[int] = 4500
 
 
 def _failure_log_detail(error: ErrorDetail | None) -> str:
-    """Render a turn failure's reason as one bounded log line.
+    """Render a turn failure's reason for the log, bounded in length.
 
     :param error: The failure's typed detail, or ``None`` when the publisher
         attached none.
-    :returns: A single-line reason, truncated with an ellipsis, e.g.
-        ``"Native Codex terminal failed to start"``; ``"no detail"`` when
+    :returns: The reason, truncated with a dropped-character count when it
+        exceeds :data:`_FAILURE_LOG_DETAIL_MAX_CHARS`; ``"no detail"`` when
         ``error`` is ``None`` or carries no message.
     """
-    if error is None or not error.message:
+    if error is None or not error.message.strip():
         return "no detail"
-    collapsed = " ".join(error.message.split())
-    if not collapsed:
-        return "no detail"
-    if len(collapsed) <= _FAILURE_LOG_DETAIL_MAX_CHARS:
-        return collapsed
-    dropped = len(collapsed) - _FAILURE_LOG_DETAIL_MAX_CHARS
-    return f"{collapsed[:_FAILURE_LOG_DETAIL_MAX_CHARS]}… (+{dropped} chars)"
+    message = error.message
+    if len(message) <= _FAILURE_LOG_DETAIL_MAX_CHARS:
+        return message
+    dropped = len(message) - _FAILURE_LOG_DETAIL_MAX_CHARS
+    return f"{message[:_FAILURE_LOG_DETAIL_MAX_CHARS]}… (+{dropped} chars)"
 
 
 def _publish_status(
