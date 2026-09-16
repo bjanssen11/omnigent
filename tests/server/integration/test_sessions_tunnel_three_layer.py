@@ -2048,3 +2048,71 @@ async def test_replacement_init_clears_only_matching_recovery_failure(
             assert error is None
         else:
             assert error is not None and error["code"] == error_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_stop_waits_for_reconnect_initialization_before_delivery(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes.sessions import routes_events
+    from omnigent.server.runner_recovery import RECOVERY_STOPPED_LABEL
+
+    stack = tunnel_three_layer_stack
+    sid = await _bind_failed_session(
+        stack.ap_client, error_code="runner_disconnected", error_message="Previous failure"
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    order: list[str] = []
+
+    async def initialize(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        order.append("initialized")
+        return httpx.Response(201, request=httpx.Request("POST", "http://runner/v1/sessions"))
+
+    async def stop(*args):
+        order.append("stopped")
+        return True
+
+    monkeypatch.setattr(stack.ap_app.state.runner_session_initializer, "initialize", initialize)
+    monkeypatch.setattr(routes_events, "_stop_session_via_runner", stop)
+
+    async def reconnect():
+        async with _reconnect_fires_connect_hook(
+            stack.ap_app, stack.fake_pm, wait_for_recover=sid
+        ):
+            pass
+
+    reconnect_task = asyncio.create_task(reconnect())
+    stop_task = None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        stop_task = asyncio.create_task(
+            stack.ap_client.post(
+                f"/v1/sessions/{sid}/events", json={"type": "stop_session", "data": {}}
+            )
+        )
+        store = get_conversation_store()
+
+        async def wait_for_stop_intent():
+            while True:
+                row = await asyncio.to_thread(store.get_conversation, sid)
+                if row is not None and row.labels.get(RECOVERY_STOPPED_LABEL) == "true":
+                    return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_stop_intent(), 5)
+        assert not order
+        release.set()
+        response = await stop_task
+        assert response.status_code == 202
+        await reconnect_task
+        assert order == ["initialized", "stopped"]
+    finally:
+        release.set()
+        await asyncio.gather(
+            reconnect_task, *([stop_task] if stop_task else []), return_exceptions=True
+        )

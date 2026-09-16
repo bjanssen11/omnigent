@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 from typing import TYPE_CHECKING
 
 import httpx
@@ -12,6 +13,15 @@ from omnigent.runner.session_init_protocol import build_runner_session_init_payl
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+
+
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_lifecycle_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def runner_lifecycle_lock(runner_id: str) -> asyncio.Lock:
+    """Order reconnect initialization and Stop for all sessions sharing a runner."""
+    return _lifecycle_locks.setdefault(runner_id, asyncio.Lock())
 
 
 class RunnerSessionInitializer:

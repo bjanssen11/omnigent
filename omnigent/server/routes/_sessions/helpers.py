@@ -5622,7 +5622,10 @@ async def _launch_runner_on_host_impl(
         if fresh.runner_id and fresh.runner_id != conv.runner_id:
             last = _relaunch_last_attempt.get(conv.id)
             if last is not None and last.runner_id == fresh.runner_id:
-                return last
+                # Only the original recovery observer owns the pending result.
+                return _HostLaunchAttempt(
+                    runner_id=last.runner_id, error_code=last.error_code, error=last.error
+                )
             return _HostLaunchAttempt(runner_id=fresh.runner_id)
         if recovery_sessions is not None and (
             fresh.host_id != conv.host_id

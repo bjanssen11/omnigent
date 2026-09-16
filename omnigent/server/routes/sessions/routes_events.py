@@ -1061,8 +1061,11 @@ def register_events_routes(
             # non-2xx / unreachable runner (503) rather than swallowing
             # it, letting the web UI show the stop didn't land instead
             # of closing the dialog as if it succeeded.
+            from omnigent.server.runner_session_init import runner_lifecycle_lock
+
             try:
-                stop_delivered = await _stop_session_via_runner(session_id, runner_router)
+                async with runner_lifecycle_lock(conv.runner_id or session_id):
+                    stop_delivered = await _stop_session_via_runner(session_id, runner_router)
             except Exception:
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.

@@ -519,9 +519,11 @@ async def test_cancelled_binding_preparation_drains_writes_before_rollback(group
 
     async def prepare(*_):
         store.rows[parent.id].runner_id = "new"
+        store.rows[parent.id].labels[recovery.RECOVERY_MODE_LABEL] = "new:resume"
         entered.set()
         await release.wait()
         store.rows[child.id].runner_id = "new"
+        store.rows[child.id].labels[recovery.RECOVERY_MODE_LABEL] = "new:resume"
         return True
 
     monkeypatch.setattr(recovery, "_prepare_recovery_bindings", prepare)
@@ -623,6 +625,7 @@ async def test_cancelled_rollback_drains_store_writes(group):
     parent, child, store = group
     for row in store.rows.values():
         row.runner_id = "new"
+        row.labels[recovery.RECOVERY_MODE_LABEL] = "new:resume"
     entered, release = asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
     original_replace = store.replace_runner_id
@@ -736,3 +739,44 @@ async def test_recovery_reaps_launch_when_root_moves_during_send(group, monkeypa
     assert store.rows[child.id].runner_id == "old"
     assert len(stop) == 1
     assert stop[0][2] == replacement
+
+
+@pytest.mark.asyncio
+async def test_late_cleanup_preserves_unclaimed_child_and_its_runner(group, monkeypatch):
+    parent, child, store = group
+    assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    newcomer = _conv("new-child", kind="sub_agent", parent_conversation_id=parent.id)
+    newcomer.runner_id = "new"
+    store.rows[newcomer.id] = newcomer
+    store.rows[parent.id].runner_id = "user-selected"
+    stopped = []
+    monkeypatch.setattr(
+        helpers, "_spawn_superseded_runner_stop", lambda *args: stopped.append(args)
+    )
+    assert not await recovery.reconcile_recovery_launch(parent, "new", store, SimpleNamespace())
+    assert store.rows[parent.id].runner_id == "user-selected"
+    assert store.rows[child.id].runner_id == "old"
+    assert store.rows[newcomer.id].runner_id == "new"
+    assert not stopped
+
+
+@pytest.mark.asyncio
+async def test_launch_rider_receives_snapshot_without_pending_result_ownership(group):
+    parent, _, store = group
+    store.rows[parent.id].runner_id = "new"
+    future = asyncio.get_running_loop().create_future()
+    original = helpers._HostLaunchAttempt(runner_id="new", pending_launch=("request", future))
+    helpers._relaunch_last_attempt[parent.id] = original
+    try:
+        rider = await helpers._launch_runner_on_host_impl(
+            parent, store, SimpleNamespace(), SimpleNamespace()
+        )
+        original.error_code = "late_failure"
+        assert rider is not original
+        assert rider.runner_id == "new"
+        assert rider.error_code is None
+        assert rider.pending_launch is None
+        assert not future.done()
+    finally:
+        future.cancel()
+        helpers._relaunch_last_attempt.pop(parent.id, None)

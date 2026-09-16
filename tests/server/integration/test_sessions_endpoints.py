@@ -11935,9 +11935,13 @@ async def test_failed_stop_does_not_overwrite_newer_recovery_intent(
     try:
         await entered.wait()
         if newer_intent == "stop":
-            second = await client.post(
-                f"/v1/sessions/{sid}/events", json={"type": "stop_session", "data": {}}
+            second_task = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{sid}/events", json={"type": "stop_session", "data": {}}
+                )
             )
+            release.set()
+            second = await second_task
             assert second.status_code == 202
         else:
             get_conversation_store().set_labels(sid, {RECOVERY_STOPPED_LABEL: ""})

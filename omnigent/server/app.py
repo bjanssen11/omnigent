@@ -3155,21 +3155,25 @@ def create_app(
                     "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
                     conv.id,
                 )
-            elif await may_initialize_session(conv, conversation_store):
-                try:
-                    response = await runner_session_initializer.initialize(
-                        conv,
-                        routed.client,
-                        timeout=10.0,
-                        suppress_recovery_turn=recovery_suppresses_turn(conv),
-                    )
-                    response.raise_for_status()
-                    initialized = True
-                except Exception:
-                    _logger.exception(
-                        "Failed to re-assign session %s on reconnect",
-                        conv.id,
-                    )
+            else:
+                from omnigent.server.runner_session_init import runner_lifecycle_lock
+
+                async with runner_lifecycle_lock(runner_id):
+                    if await may_initialize_session(conv, conversation_store):
+                        try:
+                            response = await runner_session_initializer.initialize(
+                                conv,
+                                routed.client,
+                                timeout=10.0,
+                                suppress_recovery_turn=recovery_suppresses_turn(conv),
+                            )
+                            response.raise_for_status()
+                            initialized = True
+                        except Exception:
+                            _logger.exception(
+                                "Failed to re-assign session %s on reconnect",
+                                conv.id,
+                            )
             _ensure_runner_relay(
                 conv.id,
                 runner_id,

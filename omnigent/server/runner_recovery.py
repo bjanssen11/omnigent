@@ -113,8 +113,15 @@ async def may_initialize_session(conv: Conversation, store: ConversationStore) -
         _interrupt_fenced_sessions,
     )
 
-    if not _may_initialize_snapshot(conv):
+    fresh = await asyncio.to_thread(store.get_conversation, conv.id)
+    if (
+        fresh is None
+        or fresh.runner_id != conv.runner_id
+        or not _same_recovery_location(fresh, conv)
+        or not _may_initialize_snapshot(fresh)
+    ):
         return False
+    conv = fresh
     target = conv
     seen: set[str] = set()
     check_ancestors = conv.labels.get(RECOVERY_MODE_LABEL, "").startswith(f"{conv.runner_id}:")
@@ -174,6 +181,14 @@ def _rollback_recovery_bindings(
 ) -> None:
     """Undo only this unlaunched attempt; preserve concurrent user rebindings."""
     for row in store.list_conversations_by_runner_id(runner_id):
+        # Only claimed rows carry this attempt's unguessable runner-scoped mode.
+        # New children and independent bindings on a live replacement do not.
+        if row.labels.get(RECOVERY_MODE_LABEL) not in {
+            f"{runner_id}:resume",
+            f"{runner_id}:restore",
+            f"{runner_id}:parent",
+        }:
+            continue
         try:
             rebound = store.replace_runner_id(
                 row.id, previous_runner_id, expected_runner_id=runner_id
@@ -345,7 +360,16 @@ async def reconcile_recovery_launch(
         return True
     assert root.runner_id is not None and root.host_id is not None
     await rollback_recovery_bindings(replacement_runner_id, root.runner_id, store)
-    _spawn_superseded_runner_stop(root.id, root.host_id, replacement_runner_id, hosts)
+    remaining = await asyncio.to_thread(
+        store.list_conversations_by_runner_id, replacement_runner_id
+    )
+    if not remaining:
+        _spawn_superseded_runner_stop(root.id, root.host_id, replacement_runner_id, hosts)
+    else:
+        _logger.warning(
+            "Retaining superseded recovery runner %s: other sessions still use it",
+            replacement_runner_id,
+        )
     return False
 
 
