@@ -4070,6 +4070,7 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            supports_runner_recovery=True,
         )
         try:
             encoded_hello = encode_host_frame(hello)

@@ -77,10 +77,12 @@ async def clear_observed_recovery_stop(conv: Conversation, store: ConversationSt
         conv.labels[RECOVERY_STOPPED_LABEL],
         "",
     ):
-        raise OmnigentError(
-            "Stop intent changed while resuming; retry your input.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
+        fresh = await asyncio.to_thread(store.get_conversation, conv.id)
+        if fresh is None or recovery_is_stopped(fresh):
+            raise OmnigentError(
+                "Stop intent changed while resuming; retry your input.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
     conv.labels.pop(RECOVERY_STOPPED_LABEL, None)
 
 
@@ -466,7 +468,7 @@ class HostRunnerRecovery:
             if root.host_id is None:
                 return
             host = self._hosts.get(root.host_id)
-            if host is None:
+            if host is None or not host.hello.supports_runner_recovery:
                 return
             # Recheck with the original supervisor: a reconnect or explicit
             # stop can overtake the crash report while it is being delivered.

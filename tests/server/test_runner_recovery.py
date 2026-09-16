@@ -66,7 +66,9 @@ def group(monkeypatch: pytest.MonkeyPatch):
 @pytest.mark.parametrize("host_status", ["dead", "alive", "unknown", None])
 async def test_only_confirmed_death_reuses_original_host(group, monkeypatch, host_status):
     parent, child, store = group
-    host = SimpleNamespace(host_id="original-host")
+    host = SimpleNamespace(
+        hello=SimpleNamespace(supports_runner_recovery=True), host_id="original-host"
+    )
     hosts = SimpleNamespace(get=lambda host_id: host if host_id == parent.host_id else None)
     monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value=host_status))
     launch = AsyncMock(return_value=helpers._HostLaunchAttempt(runner_id="new"))
@@ -89,7 +91,7 @@ async def test_only_confirmed_death_reuses_original_host(group, monkeypatch, hos
 @pytest.mark.parametrize("change", ["stopped", "closed", "rebound", "cooldown", "offline"])
 async def test_recovery_rechecks_lifecycle_before_launch(group, monkeypatch, change):
     parent, child, store = group
-    host = object()
+    host = SimpleNamespace(hello=SimpleNamespace(supports_runner_recovery=True))
     hosts = SimpleNamespace(get=lambda _: None if change == "offline" else host)
 
     async def status(*_):
@@ -120,7 +122,12 @@ async def test_does_not_adopt_children_without_original_host(group, monkeypatch)
     parent.host_id = None
     launch = AsyncMock()
     monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
-    coordinator = recovery.HostRunnerRecovery(store, SimpleNamespace(get=lambda _: object()))
+    coordinator = recovery.HostRunnerRecovery(
+        store,
+        SimpleNamespace(
+            get=lambda _: SimpleNamespace(hello=SimpleNamespace(supports_runner_recovery=True))
+        ),
+    )
     coordinator.schedule("old", [parent, child], [parent, child])
     assert not coordinator._tasks
     launch.assert_not_awaited()
@@ -132,7 +139,9 @@ async def test_bindings_restored_before_launch_and_completed_child_left_alone(gr
     completed = _conv("completed", kind="sub_agent", parent_conversation_id=parent.id)
     completed.live_status = "idle"
     store.rows[completed.id] = completed
-    host = SimpleNamespace(pending_launches={})
+    host = SimpleNamespace(
+        hello=SimpleNamespace(supports_runner_recovery=True), pending_launches={}
+    )
     monkeypatch.setattr(helpers, "_spawn_superseded_runner_stop", lambda *_: None)
     monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
 
@@ -293,7 +302,12 @@ async def test_lost_root_cas_does_not_cool_down_user_selected_runner(group, monk
     monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
     launch = AsyncMock(return_value=helpers._HostLaunchAttempt(runner_id="new"))
     monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
-    coordinator = recovery.HostRunnerRecovery(store, SimpleNamespace(get=lambda _: object()))
+    coordinator = recovery.HostRunnerRecovery(
+        store,
+        SimpleNamespace(
+            get=lambda _: SimpleNamespace(hello=SimpleNamespace(supports_runner_recovery=True))
+        ),
+    )
     coordinator.schedule("user-replacement", [fresh], [fresh])
     await asyncio.gather(*coordinator._tasks.values())
     launch.assert_awaited_once()
@@ -327,7 +341,9 @@ async def test_lifecycle_change_during_root_cas_undoes_claims(group, lifecycle):
 @pytest.mark.asyncio
 async def test_launch_send_failure_rolls_back_bindings_and_logs_retry(group, monkeypatch, caplog):
     parent, child, store = group
-    host = SimpleNamespace(pending_launches={})
+    host = SimpleNamespace(
+        hello=SimpleNamespace(supports_runner_recovery=True), pending_launches={}
+    )
 
     def send(*_):
         raise ConnectionError("host disconnected")
@@ -351,7 +367,12 @@ async def test_launch_send_failure_rolls_back_bindings_and_logs_retry(group, mon
 @pytest.mark.asyncio
 async def test_shutdown_closes_scheduling_before_draining_tasks(group, monkeypatch):
     parent, child, store = group
-    coordinator = recovery.HostRunnerRecovery(store, SimpleNamespace(get=lambda _: object()))
+    coordinator = recovery.HostRunnerRecovery(
+        store,
+        SimpleNamespace(
+            get=lambda _: SimpleNamespace(hello=SimpleNamespace(supports_runner_recovery=True))
+        ),
+    )
     started = asyncio.Event()
     cancelled = asyncio.Event()
     release = asyncio.Event()
@@ -390,7 +411,12 @@ async def test_invalid_cooldown_does_not_strand_recovery(group, monkeypatch, cap
     monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
     launch = AsyncMock(return_value=helpers._HostLaunchAttempt(runner_id="new"))
     monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
-    coordinator = recovery.HostRunnerRecovery(store, SimpleNamespace(get=lambda _: object()))
+    coordinator = recovery.HostRunnerRecovery(
+        store,
+        SimpleNamespace(
+            get=lambda _: SimpleNamespace(hello=SimpleNamespace(supports_runner_recovery=True))
+        ),
+    )
     coordinator.schedule("old", [parent, child], [parent, child])
     await asyncio.gather(*coordinator._tasks.values())
     launch.assert_awaited_once()
@@ -400,7 +426,9 @@ async def test_invalid_cooldown_does_not_strand_recovery(group, monkeypatch, cap
 @pytest.mark.asyncio
 async def test_cancelled_launch_removes_pending_request(group, monkeypatch):
     parent, child, store = group
-    host = SimpleNamespace(pending_launches={})
+    host = SimpleNamespace(
+        hello=SimpleNamespace(supports_runner_recovery=True), pending_launches={}
+    )
     sent = asyncio.Event()
     monkeypatch.setattr(helpers, "_spawn_superseded_runner_stop", lambda *_: None)
     monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
@@ -491,7 +519,9 @@ async def test_failed_launch_rollback_preserves_concurrent_user_binding(
     group, monkeypatch, failure
 ):
     parent, child, store = group
-    host = SimpleNamespace(pending_launches={})
+    host = SimpleNamespace(
+        hello=SimpleNamespace(supports_runner_recovery=True), pending_launches={}
+    )
     stop = AsyncMock()
     monkeypatch.setattr(helpers, "_spawn_superseded_runner_stop", stop)
     monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
@@ -557,7 +587,9 @@ async def test_connect_rechecks_recovery_lifecycle_and_ownership(group, change):
 @pytest.mark.asyncio
 async def test_rolled_back_attempt_cools_down_duplicate_original_exit(group, monkeypatch):
     parent, child, store = group
-    host = SimpleNamespace(pending_launches={})
+    host = SimpleNamespace(
+        hello=SimpleNamespace(supports_runner_recovery=True), pending_launches={}
+    )
 
     def send(*_):
         raise ConnectionError("host disconnected before launch")
@@ -583,7 +615,9 @@ async def test_recovery_tracks_late_launch_result_without_holding_launch_lock(
     group, monkeypatch, outcome
 ):
     parent, child, store = group
-    host = SimpleNamespace(pending_launches={})
+    host = SimpleNamespace(
+        hello=SimpleNamespace(supports_runner_recovery=True), pending_launches={}
+    )
     hosts = SimpleNamespace(get=lambda _: host, send_text=lambda *_: None)
     monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
     monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
@@ -654,7 +688,9 @@ async def test_launch_preparation_errors_do_not_strand_claims(group, monkeypatch
     from omnigent.host import frames
 
     parent, child, store = group
-    host = SimpleNamespace(pending_launches={})
+    host = SimpleNamespace(
+        hello=SimpleNamespace(supports_runner_recovery=True), pending_launches={}
+    )
 
     def fail(*_):
         raise RuntimeError("launch preparation failed")
@@ -707,7 +743,9 @@ async def test_recovery_reaps_launch_when_root_moves_during_send(group, monkeypa
     import json
 
     parent, child, store = group
-    host = SimpleNamespace(pending_launches={})
+    host = SimpleNamespace(
+        hello=SimpleNamespace(supports_runner_recovery=True), pending_launches={}
+    )
     replacement = None
     sent = asyncio.Event()
 
@@ -797,3 +835,33 @@ async def test_deferred_cleanup_rechecks_bindings_before_stop(group, monkeypatch
         store.rows[parent.id].runner_id = "new"
     await asyncio.gather(*helpers._detached_supersede_stops)
     stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_older_host_is_ineligible_before_recovery_claims(group, monkeypatch):
+    parent, child, store = group
+    host = SimpleNamespace(hello=SimpleNamespace(supports_runner_recovery=False))
+    hosts = SimpleNamespace(get=lambda _: host)
+    launch = AsyncMock()
+    monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
+    coordinator = recovery.HostRunnerRecovery(store, hosts)
+    coordinator.schedule("old", [parent, child], [parent, child])
+    await asyncio.gather(*coordinator._tasks.values())
+    launch.assert_not_awaited()
+    attempt = await helpers._launch_runner_on_host_impl(
+        parent, store, hosts, host, recovery_sessions=[parent, child]
+    )
+    assert attempt.error_code == "host_recovery_unsupported"
+    assert store.rows[parent.id].runner_id == store.rows[child.id].runner_id == "old"
+    assert not store.rows[parent.id].labels
+
+
+@pytest.mark.asyncio
+async def test_concurrent_resume_can_reuse_already_cleared_stop(group):
+    parent, _, store = group
+    parent.labels[recovery.RECOVERY_STOPPED_LABEL] = "true:observed"
+    store.rows[parent.id].labels[recovery.RECOVERY_STOPPED_LABEL] = ""
+    store.compare_and_set_label = lambda *_: False
+    await recovery.clear_observed_recovery_stop(parent, store)
+    assert not recovery.recovery_is_stopped(parent)
+    assert store.rows[parent.id].labels[recovery.RECOVERY_STOPPED_LABEL] == ""

@@ -1809,3 +1809,14 @@ def test_recovery_launch_generation_round_trip() -> None:
         recovery_of_runner_id="crashed-runner",
     )
     assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+@pytest.mark.parametrize("advertised", [None, False, True, "true"])
+def test_host_recovery_capability_requires_explicit_boolean(advertised) -> None:
+    payload = {"kind": "host.hello", "version": "old", "frame_protocol_version": 1, "name": "host"}
+    if advertised is not None:
+        payload["supports_runner_recovery"] = advertised
+    hello = decode_host_frame(json.dumps(payload))
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.supports_runner_recovery is (advertised is True)
+    assert decode_host_frame(encode_host_frame(hello)) == hello

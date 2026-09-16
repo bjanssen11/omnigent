@@ -135,6 +135,7 @@ class HostFrameKind(str, Enum):
 class HostHelloFrame:
     """Host's first frame on a fresh tunnel.
 
+    :param supports_runner_recovery: Host enforces generation-guarded recovery launches.
     :param version: Host software version, e.g. ``"0.1.0"``.
     :param frame_protocol_version: Wire-protocol major. Server
         refuses on major mismatch.
@@ -171,6 +172,7 @@ class HostHelloFrame:
     interactive_shells: list[str] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+    supports_runner_recovery: bool = False
 
 
 @dataclass
@@ -1163,6 +1165,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "interactive_shells": frame.interactive_shells,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+                "supports_runner_recovery": frame.supports_runner_recovery,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1739,6 +1742,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         ),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
+        supports_runner_recovery=msg.get("supports_runner_recovery") is True,
     )
 
 
