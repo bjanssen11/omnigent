@@ -2875,6 +2875,7 @@ async def _publish_runner_recovered_status_impl(
     conversation_store: ConversationStore,
     *,
     require_disconnect_code: bool = False,
+    recovery_runner_id: str | None = None,
 ) -> None:
     """
     Clear a stale failed session status after runner recovery.
@@ -2912,6 +2913,8 @@ async def _publish_runner_recovered_status_impl(
         ``runner_disconnected``; when ``False`` (default, explicit
         rebind/handshake), clear any stale ``failed`` state. Labels are
         cleared in both cases.
+    :param recovery_runner_id: Successfully initialized replacement runner. A matching
+        recovery label also permits clearing its predecessor's startup failure.
     :returns: None.
     """
     if _session_status_cache.get(session_id) != "failed":
@@ -2925,7 +2928,16 @@ async def _publish_runner_recovered_status_impl(
     if require_disconnect_code:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
-        if last_error is None or last_error.get("code") != "runner_disconnected":
+        allowed_codes = {"runner_disconnected"}
+        if recovery_runner_id is not None and conv is not None:
+            from omnigent.server.runner_recovery import RECOVERY_MODE_LABEL
+
+            if conv.runner_id == recovery_runner_id and conv.labels.get(RECOVERY_MODE_LABEL) in {
+                f"{recovery_runner_id}:resume",
+                f"{recovery_runner_id}:restore",
+            }:
+                allowed_codes.add("runner_failed_to_start")
+        if last_error is None or last_error.get("code") not in allowed_codes:
             return
     _session_status_cache[session_id] = "idle"
     session_live_state.persist_live_status(session_id, "idle")

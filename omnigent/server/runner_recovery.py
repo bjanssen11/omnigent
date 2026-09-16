@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Sequence
 
@@ -153,6 +154,8 @@ async def prepare_recovery_bindings(
         else:
             mode = "resume" if conv.id in resume_ids else "restore"
         try:
+            # Stamp before binding so connect sees the mode; a lost CAS leaves
+            # it inert because every consumer matches the embedded runner id.
             await asyncio.to_thread(
                 store.set_labels, conv.id, {RECOVERY_MODE_LABEL: f"{runner_id}:{mode}"}
             )
@@ -180,6 +183,7 @@ class HostRunnerRecovery:
         conversation_store: ConversationStore,
         host_registry: HostRegistry,
     ) -> None:
+        self._closed = False
         self._store = conversation_store
         self._hosts = host_registry
         self._tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
@@ -196,7 +200,7 @@ class HostRunnerRecovery:
         Tunnel loss alone is not proof of an unexpected process exit.
         """
         key = (current_workspace_id(), runner_id)
-        if shutdown_state.server_shutting_down() or key in self._tasks:
+        if self._closed or shutdown_state.server_shutting_down() or key in self._tasks:
             return
         roots = [c for c in affected if c.host_id is not None and can_restore_session(c)]
         if len(roots) != 1:
@@ -248,7 +252,10 @@ class HostRunnerRecovery:
                 try:
                     last_attempt = float(fresh.labels.get(RECOVERY_ATTEMPT_LABEL, "0"))
                 except ValueError:
-                    return
+                    last_attempt = float("nan")
+                if not math.isfinite(last_attempt):
+                    _logger.warning("Ignoring invalid recovery timestamp for %s", root.id)
+                    last_attempt = 0
                 if time.time() - last_attempt < RECOVERY_COOLDOWN_S:
                     return
             attempt = await _launch_runner_on_host(
@@ -266,6 +273,7 @@ class HostRunnerRecovery:
 
     async def shutdown(self) -> None:
         """Cancel attempts before tearing down the server's transports."""
+        self._closed = True
         tasks = list(self._tasks.values())
         for task in tasks:
             task.cancel()

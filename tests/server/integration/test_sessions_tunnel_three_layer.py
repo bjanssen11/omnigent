@@ -1989,3 +1989,62 @@ async def test_patch_rebind_stamps_runner_liveness(
 
     _drain_session_live_state()
     assert _runner_last_seen(session_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize(
+    "mode,error_code,init_status,cleared",
+    [
+        ("restore", "runner_failed_to_start", 201, True),
+        ("resume", "runner_failed_to_start", 201, True),
+        ("stale", "runner_failed_to_start", 201, False),
+        ("", "runner_failed_to_start", 201, False),
+        ("restore", "native_turn_error", 201, False),
+        ("restore", "runner_failed_to_start", 500, False),
+    ],
+)
+async def test_replacement_init_clears_only_matching_recovery_failure(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    error_code: str,
+    init_status: int,
+    cleared: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.runner_recovery import RECOVERY_MODE_LABEL
+
+    stack = tunnel_three_layer_stack
+    sid = await _bind_failed_session(
+        stack.ap_client, error_code=error_code, error_message="Previous failure"
+    )
+    store = get_conversation_store()
+    store.set_labels(
+        sid,
+        {
+            RECOVERY_MODE_LABEL: (
+                "other-runner:restore" if mode == "stale" else f"{_RUNNER_ID}:{mode}"
+            )
+        },
+    )
+    initialize = AsyncMock(
+        return_value=httpx.Response(
+            init_status, request=httpx.Request("POST", "http://runner/v1/sessions")
+        )
+    )
+    monkeypatch.setattr(stack.ap_app.state.runner_session_initializer, "initialize", initialize)
+    async with _reconnect_fires_connect_hook(stack.ap_app, stack.fake_pm, wait_for_recover=sid):
+        initialize.assert_awaited_once()
+        assert initialize.call_args.kwargs["suppress_recovery_turn"] == (mode == "restore")
+        assert sessions_module._session_status_cache[sid] == ("idle" if cleared else "failed")
+        fresh = store.get_conversation(sid)
+        assert fresh is not None
+        error = sessions_module._last_task_error_from_labels(fresh.labels)
+        if cleared:
+            assert error is None
+        else:
+            assert error is not None and error["code"] == error_code

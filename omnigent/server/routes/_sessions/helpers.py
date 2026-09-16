@@ -5742,8 +5742,9 @@ async def _launch_runner_on_host_locked(
     except asyncio.TimeoutError:
         # No result yet — fall through to the caller's connect wait, which
         # preserves the prior fire-and-forget timing for a slow-but-fine host.
-        host_conn.pending_launches.pop(request_id, None)
         return _HostLaunchAttempt(runner_id=new_runner_id)
+    finally:
+        host_conn.pending_launches.pop(request_id, None)
     if result.get("status") == "failed":
         return _HostLaunchAttempt(
             runner_id=new_runner_id,

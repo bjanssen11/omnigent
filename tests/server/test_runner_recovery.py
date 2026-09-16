@@ -345,3 +345,76 @@ async def test_launch_send_failure_retains_bindings_and_logs_retry(group, monkey
     assert not host.pending_launches
     assert "host_disconnected" in caplog.text
     assert "explicit Retry" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_scheduling_before_draining_tasks(group, monkeypatch):
+    parent, child, store = group
+    coordinator = recovery.HostRunnerRecovery(store, SimpleNamespace(get=lambda _: object()))
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def recover(*_):
+        started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+
+    monkeypatch.setattr(coordinator, "_recover", recover)
+    coordinator.schedule("old", [parent, child], [parent, child])
+    await started.wait()
+    drain = asyncio.create_task(coordinator.shutdown())
+    await cancelled.wait()
+    coordinator.schedule("new", [parent, child], [parent, child])
+    assert len(coordinator._tasks) == 1
+    release.set()
+    await drain
+    coordinator.schedule("new", [parent, child], [parent, child])
+    assert not coordinator._tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timestamp", ["bad", "nan", "inf"])
+async def test_invalid_cooldown_does_not_strand_recovery(group, monkeypatch, caplog, timestamp):
+    parent, child, store = group
+    store.rows[parent.id].labels.update(
+        {
+            recovery.RECOVERY_MODE_LABEL: "old:resume",
+            recovery.RECOVERY_ATTEMPT_LABEL: timestamp,
+        }
+    )
+    monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
+    launch = AsyncMock(return_value=SimpleNamespace(error_code=None))
+    monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
+    coordinator = recovery.HostRunnerRecovery(store, SimpleNamespace(get=lambda _: object()))
+    coordinator.schedule("old", [parent, child], [parent, child])
+    await asyncio.gather(*coordinator._tasks.values())
+    launch.assert_awaited_once()
+    assert "Ignoring invalid recovery timestamp" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_launch_removes_pending_request(group, monkeypatch):
+    parent, child, store = group
+    host = SimpleNamespace(pending_launches={})
+    sent = asyncio.Event()
+    monkeypatch.setattr(helpers, "_spawn_superseded_runner_stop", lambda *_: None)
+    monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
+    launch = asyncio.create_task(
+        helpers._launch_runner_on_host_impl(
+            parent,
+            store,
+            SimpleNamespace(send_text=lambda *_: sent.set()),
+            host,
+            recovery_sessions=[parent, child],
+        )
+    )
+    await sent.wait()
+    assert len(host.pending_launches) == 1
+    launch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await launch
+    assert not host.pending_launches

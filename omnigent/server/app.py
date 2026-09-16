@@ -3143,6 +3143,7 @@ def create_app(
                     conv.id,
                 )
                 continue
+            initialized = False
             if not conv.agent_id:
                 # The runner's create_session requires agent_id (it 400s
                 # without one), so don't send a request it rejects by
@@ -3156,12 +3157,14 @@ def create_app(
                 )
             elif await may_initialize_session(conv, conversation_store):
                 try:
-                    await runner_session_initializer.initialize(
+                    response = await runner_session_initializer.initialize(
                         conv,
                         routed.client,
                         timeout=10.0,
                         suppress_recovery_turn=recovery_suppresses_turn(conv),
                     )
+                    response.raise_for_status()
+                    initialized = True
                 except Exception:
                     _logger.exception(
                         "Failed to re-assign session %s on reconnect",
@@ -3199,7 +3202,10 @@ def create_app(
             # a genuine task failure survives the reconnect untouched.
             if not recovery_waits_for_parent(conv):
                 await _publish_runner_recovered_status(
-                    conv.id, conversation_store, require_disconnect_code=True
+                    conv.id,
+                    conversation_store,
+                    require_disconnect_code=True,
+                    recovery_runner_id=runner_id if initialized else None,
                 )
             # A managed launch that outlived its connect timeout cached
             # sandbox_status "failed"; this runner connecting proves the
