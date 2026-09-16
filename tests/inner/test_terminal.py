@@ -94,13 +94,15 @@ def test_threaded_idle_watcher_reports_terminal_exit(
 
     assert exited.wait(timeout=1.0)
     assert instance.running is False
-    errors = [record for record in caplog.records if record.levelno == logging.ERROR]
-    assert len(errors) == 1
-    assert errors[0].event_name == "terminal_unavailable"
-    assert errors[0].attributes["terminal_instance_id"] == instance.diagnostic_id
-    assert errors[0].attributes["consecutive_probe_failures"] == 3
-    assert errors[0].attributes["pane_output_seen"] is False
-    assert errors[0].attributes["shutdown_requested"] is False
+    # An exit the callback classifies is a WARNING, so select the exit log by
+    # message; these assertions are about its diagnostics payload.
+    reports = [r for r in caplog.records if "tmux unavailable after" in r.getMessage()]
+    assert len(reports) == 1
+    assert reports[0].event_name == "terminal_unavailable"
+    assert reports[0].attributes["terminal_instance_id"] == instance.diagnostic_id
+    assert reports[0].attributes["consecutive_probe_failures"] == 3
+    assert reports[0].attributes["pane_output_seen"] is False
+    assert reports[0].attributes["shutdown_requested"] is False
 
 
 async def test_async_idle_watcher_logs_correlated_probe_diagnostics(
