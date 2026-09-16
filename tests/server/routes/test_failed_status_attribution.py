@@ -146,7 +146,7 @@ def test_failure_detail_is_bounded_to_one_line(
     back to the turn's persisted assistant text. Left whole, every reply is a
     distinct signature and the dashboard cannot group the failure mode.
     """
-    reply = "Direct answer: **no**.\n\n## The crux\n" + "detail " * 200
+    reply = "Direct answer: **no**.\n\n## The crux\n" + "detail " * 600
     record = _publish_failed(
         caplog,
         error=ErrorDetail(source="execution", code="native_turn_error", message=reply),
@@ -157,9 +157,33 @@ def test_failure_detail_is_bounded_to_one_line(
     # Bounded, single-line, and says how much was dropped.
     detail = message.split("): ", 1)[1]
     assert "\n" not in detail
-    assert len(detail) < 300, detail
+    assert len(detail) < 2100, detail
     assert detail.startswith("Direct answer: **no**. ## The crux")
     assert "chars)" in detail
+
+
+def test_runner_exit_reason_keeps_its_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner-exit reason carries an exit code, log path and tail — keep them.
+
+    Measured at ~4KB in production, and it is the whole diagnosis for a runner
+    that died, so the bound must not clip the path or the tail down to nothing.
+    """
+    reason = (
+        "runner process exited with code 1 "
+        "(log on host: ~/.omnigent/logs/runner/runner-abc123-def456-7-8.log)\n"
+        + "\n".join(f"traceback line {n}" for n in range(120))
+    )
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(source="execution", code="runner_exited", message=reason),
+        origin="runner_exited",
+    )
+    message = record.getMessage()
+    assert "runner process exited with code 1" in message
+    assert "~/.omnigent/logs/runner/runner-abc123-def456-7-8.log" in message
+    assert "traceback line 100" in message, "the log tail was clipped too aggressively"
 
 
 def test_short_failure_detail_is_preserved_verbatim(

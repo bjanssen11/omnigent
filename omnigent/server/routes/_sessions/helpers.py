@@ -4587,10 +4587,11 @@ def _require_codex_approval_mode_forward(
 
 # A failure detail can be the harness's whole last message: claude-native's
 # StopFailure edge posts none, so the reason falls back to the turn's persisted
-# assistant text, which may be pages of markdown. Bound it to one line so a
-# failure mode groups as one log signature instead of one per reply, and so a
-# reply's full text never lands in telemetry.
-_FAILURE_LOG_DETAIL_MAX_CHARS: Final[int] = 200
+# assistant text, which may be pages of markdown. Bound it so a whole reply
+# never lands in telemetry, but leave room for the details a diagnosis needs —
+# a runner-exit reason carries an exit code, a host log path and a log tail,
+# and has been measured at ~4KB.
+_FAILURE_LOG_DETAIL_MAX_CHARS: Final[int] = 2000
 
 
 def _failure_log_detail(error: ErrorDetail | None) -> str:
