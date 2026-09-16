@@ -534,3 +534,42 @@ async def test_cancelled_binding_preparation_drains_writes_before_rollback(group
     with pytest.raises(asyncio.CancelledError):
         await task
     assert store.rows[parent.id].runner_id == store.rows[child.id].runner_id == "old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["completed", "ancestor_rebound", "ownership_removed"])
+async def test_connect_rechecks_recovery_lifecycle_and_ownership(group, change):
+    parent, child, store = group
+    if change == "ownership_removed":
+        store.rows[child.id].labels["omnigent.wrapper"] = "claude-code-native-ui-subagent"
+    assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    if change == "completed":
+        store.rows[child.id].live_status = "idle"
+    elif change == "ancestor_rebound":
+        store.rows[parent.id].runner_id = "user-selected"
+    else:
+        store.rows[child.id].labels.pop("omnigent.wrapper")
+    assert not await recovery.may_initialize_session(store.rows[child.id], store)
+
+
+@pytest.mark.asyncio
+async def test_rolled_back_attempt_cools_down_duplicate_original_exit(group, monkeypatch):
+    parent, child, store = group
+    host = SimpleNamespace(pending_launches={})
+
+    def send(*_):
+        raise ConnectionError("host disconnected before launch")
+
+    hosts = SimpleNamespace(get=lambda _: host, send_text=send)
+    monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
+    monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
+    launch = AsyncMock(wraps=helpers._launch_runner_on_host_impl)
+    monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
+    for _ in range(2):
+        coordinator = recovery.HostRunnerRecovery(store, hosts)
+        fresh = store.get_conversation(parent.id)
+        coordinator.schedule("old", [fresh, child], [fresh, child])
+        await asyncio.gather(*coordinator._tasks.values())
+    launch.assert_awaited_once()
+    assert store.rows[parent.id].runner_id == "old"
+    assert store.rows[parent.id].labels[recovery.RECOVERY_ATTEMPT_RUNNER_LABEL] == "old"

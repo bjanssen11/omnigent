@@ -4680,6 +4680,7 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.runner_recovery.stopped": "true",
             "omnigent.runner_recovery.mode": "old:resume",
             "omnigent.runner_recovery.attempted_at": "1000000",
+            "omnigent.runner_recovery.attempted_runner": "old",
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
             # An ordinary, non-instance label that SHOULD carry over.

@@ -179,6 +179,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.runner_recovery.stopped",
         "omnigent.runner_recovery.mode",
         "omnigent.runner_recovery.attempted_at",
+        "omnigent.runner_recovery.attempted_runner",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )

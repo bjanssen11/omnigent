@@ -21,6 +21,7 @@ _logger = logging.getLogger(__name__)
 RECOVERY_STOPPED_LABEL = "omnigent.runner_recovery.stopped"
 RECOVERY_MODE_LABEL = "omnigent.runner_recovery.mode"
 RECOVERY_ATTEMPT_LABEL = "omnigent.runner_recovery.attempted_at"
+RECOVERY_ATTEMPT_RUNNER_LABEL = "omnigent.runner_recovery.attempted_runner"
 RECOVERY_COOLDOWN_S = 60
 
 
@@ -95,8 +96,13 @@ async def may_initialize_session(conv: Conversation, store: ConversationStore) -
     """Initialize only independent sessions whose lifecycle still allows recovery."""
     # The parent's harness owns these children, including their recovery status.
     # Initializing the mirror would create an unrelated, empty native terminal.
-    if is_parent_owned_subagent(conv):
+    if is_parent_owned_subagent(conv) or recovery_waits_for_parent(conv):
         return False
+    if conv.labels.get(RECOVERY_MODE_LABEL) == f"{conv.runner_id}:resume" and not was_interrupted(
+        conv, reconciled=True
+    ):
+        return False
+    runner_id = conv.runner_id
     seen: set[str] = set()
     check_ancestors = conv.labels.get(RECOVERY_MODE_LABEL, "").startswith(f"{conv.runner_id}:")
     while True:
@@ -112,7 +118,7 @@ async def may_initialize_session(conv: Conversation, store: ConversationStore) -
         if conv.parent_conversation_id in seen:
             return False
         parent = await asyncio.to_thread(store.get_conversation, conv.parent_conversation_id)
-        if parent is None:
+        if parent is None or parent.runner_id != runner_id:
             return False
         conv = parent
 
@@ -133,9 +139,13 @@ async def rollback_recovery_bindings(
     rows = await asyncio.to_thread(store.list_conversations_by_runner_id, runner_id)
     for row in rows:
         try:
-            await asyncio.to_thread(
+            rebound = await asyncio.to_thread(
                 store.replace_runner_id, row.id, previous_runner_id, expected_runner_id=runner_id
             )
+            if rebound.runner_id == previous_runner_id and row.host_id is not None:
+                await asyncio.to_thread(
+                    store.set_labels, row.id, {RECOVERY_ATTEMPT_RUNNER_LABEL: previous_runner_id}
+                )
         except ConversationNotFoundError:
             continue
 
@@ -271,7 +281,14 @@ async def _prepare_recovery_bindings(
     ):
         await rollback_recovery_bindings(runner_id, previous_runner_id, store)
         return False
-    await asyncio.to_thread(store.set_labels, root.id, {RECOVERY_ATTEMPT_LABEL: str(time.time())})
+    await asyncio.to_thread(
+        store.set_labels,
+        root.id,
+        {
+            RECOVERY_ATTEMPT_LABEL: str(time.time()),
+            RECOVERY_ATTEMPT_RUNNER_LABEL: runner_id,
+        },
+    )
     return True
 
 
@@ -304,6 +321,11 @@ class HostRunnerRecovery:
             return
         roots = [c for c in affected if c.host_id is not None and can_restore_session(c)]
         if len(roots) != 1:
+            _logger.debug(
+                "Skipping recovery for runner %s: expected one host root, found %d",
+                runner_id,
+                len(roots),
+            )
             return
         root = roots[0]
         members = {root.id}
@@ -348,7 +370,11 @@ class HostRunnerRecovery:
                 or shutdown_state.server_shutting_down()
             ):
                 return
-            if fresh.labels.get(RECOVERY_MODE_LABEL, "").startswith(f"{runner_id}:"):
+            attempt_runner = fresh.labels.get(RECOVERY_ATTEMPT_RUNNER_LABEL)
+            if attempt_runner == runner_id or (
+                attempt_runner is None
+                and fresh.labels.get(RECOVERY_MODE_LABEL, "").startswith(f"{runner_id}:")
+            ):
                 try:
                     last_attempt = float(fresh.labels.get(RECOVERY_ATTEMPT_LABEL, "0"))
                 except ValueError:
