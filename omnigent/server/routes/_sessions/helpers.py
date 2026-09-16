@@ -5745,6 +5745,14 @@ async def _launch_runner_on_host_locked(
             asyncio.shield(launch_future) if recovery_sessions is not None else launch_future,
             timeout=_HOST_LAUNCH_RESULT_TIMEOUT_S,
         )
+    except asyncio.CancelledError:
+        if recovery_sessions is not None:
+            _logger.info(
+                "Recovery launch wait cancelled for %s; "
+                "retaining bindings because launch outcome is unknown",
+                conv.id,
+            )
+        raise
     except asyncio.TimeoutError:
         # Launch may have succeeded. Recovery owns a bounded late-result wait
         # outside this lock; user-driven callers use their existing connect wait.
@@ -9698,21 +9706,17 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"{PINNED_LABEL_KEY!r} key to pin for yourself",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Sandbox lifecycle labels are written only by server internals and re-read
-    # across a relaunch to rebuild the runner Pod (e.g. the repository it
-    # re-clones). A client seed here would forge that reconstruction state, so
-    # reserve the whole namespace — every current and future key under it —
-    # rather than enumerating one key at a time.
-    sandbox_key = next(
-        (k for k in labels if k.startswith(MANAGED_SANDBOX_LABEL_NAMESPACE)),
-        None,
-    )
-    if sandbox_key is not None:
-        raise OmnigentError(
-            f"label {sandbox_key!r} is in the server-internal "
-            f"{MANAGED_SANDBOX_LABEL_NAMESPACE}* namespace and cannot be set by clients",
-            code=ErrorCode.INVALID_INPUT,
-        )
+    from omnigent.server.runner_recovery import RECOVERY_LABEL_NAMESPACE
+
+    # Server-owned lifecycle state must not be seeded or edited by clients.
+    for namespace in (MANAGED_SANDBOX_LABEL_NAMESPACE, RECOVERY_LABEL_NAMESPACE):
+        reserved_key = next((k for k in labels if k.startswith(namespace)), None)
+        if reserved_key is not None:
+            raise OmnigentError(
+                f"label {reserved_key!r} is in the server-internal "
+                f"{namespace}* namespace and cannot be set by clients",
+                code=ErrorCode.INVALID_INPUT,
+            )
     # The codex side-chat child's thread id is what the follow-up path drives
     # ``turn/start`` on (via the parent's bridge). It is written by the server at
     # sub-agent registration; a client seed would let a caller repoint a child at

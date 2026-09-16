@@ -1324,22 +1324,23 @@ def _bound_conv(
     *,
     kind: str = "default",
     live_status: str | None = None,
+    host_id: str | None = None,
 ) -> Any:
     """
     Build a conversation-shaped row for the offline-reconciliation helper.
 
-    ``_mark_runner_sessions_offline`` reads only ``id``, ``kind`` and
-    ``live_status`` off each row, so a namespace is enough.
+    A namespace supplies the identity, lifecycle, and host ownership fields.
 
     :param session_id: Conversation identifier.
     :param kind: ``"default"`` (top-level) or ``"sub_agent"``.
     :param live_status: Persisted live status, read only on a cache miss.
     :returns: A conversation-shaped namespace.
     """
-    return SimpleNamespace(id=session_id, kind=kind, live_status=live_status)
+    return SimpleNamespace(id=session_id, kind=kind, live_status=live_status, host_id=host_id)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("host_bound", [False, True])
 @pytest.mark.parametrize(
     ("kind", "cached", "live_status", "intentional_stop", "fail_idle_top_level", "expect_failed"),
     [
@@ -1377,6 +1378,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
     intentional_stop: bool,
     fail_idle_top_level: bool,
     expect_failed: bool,
+    host_bound: bool,
 ) -> None:
     """
     Only the sessions a departed runner interrupted are failed, with cause.
@@ -1401,7 +1403,14 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
 
     try:
         await sessions_module._mark_runner_sessions_offline(
-            [_bound_conv(session_id, kind=kind, live_status=live_status)],
+            [
+                _bound_conv(
+                    session_id,
+                    kind=kind,
+                    live_status=live_status,
+                    host_id="host" if host_bound else None,
+                )
+            ],
             error,
             store,  # type: ignore[arg-type]
             fail_idle_top_level=fail_idle_top_level,
@@ -1409,7 +1418,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
 
         status = sessions_module._session_status_cache.get(session_id)
         persisted = store.labels.get(session_id)
-        if expect_failed:
+        if expect_failed or (host_bound and fail_idle_top_level and not intentional_stop):
             assert status == "failed"
             # The cause must be durable: it is what lets the UI render a
             # benign "Disconnected" and what

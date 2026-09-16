@@ -471,16 +471,18 @@ async def test_session_snapshot_populates_runner_online_from_session_lookup() ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "kind,live_status,expected_status",
+    "kind,live_status,host_bound,expected_status",
     [
-        ("default", "idle", "failed"),
-        ("sub_agent", "idle", "idle"),
-        ("sub_agent", None, "failed"),
+        ("default", "idle", False, "failed"),
+        ("sub_agent", "idle", False, "idle"),
+        ("sub_agent", "idle", True, "failed"),
+        ("sub_agent", None, False, "failed"),
     ],
 )
 async def test_session_snapshot_surfaces_runner_exit_report_as_failed(
     kind: str,
     live_status: str | None,
+    host_bound: bool,
     expected_status: str,
 ) -> None:
     """A crashed runner's exit report surfaces as failed + last_task_error.
@@ -503,6 +505,8 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed(
         runner_id="runner_dead",
         kind=kind,
         live_status=live_status,
+        host_id="aa876a3cec563d43c2430b633747c7b7" if host_bound else None,
+        workspace="/workspace" if host_bound else None,
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],

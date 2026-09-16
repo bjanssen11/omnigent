@@ -18,10 +18,11 @@ from omnigent.util.session_lifecycle import is_session_closed
 
 _logger = logging.getLogger(__name__)
 
-RECOVERY_STOPPED_LABEL = "omnigent.runner_recovery.stopped"
-RECOVERY_MODE_LABEL = "omnigent.runner_recovery.mode"
-RECOVERY_ATTEMPT_LABEL = "omnigent.runner_recovery.attempted_at"
-RECOVERY_ATTEMPT_RUNNER_LABEL = "omnigent.runner_recovery.attempted_runner"
+RECOVERY_LABEL_NAMESPACE = "omnigent.runner_recovery."
+RECOVERY_STOPPED_LABEL = f"{RECOVERY_LABEL_NAMESPACE}stopped"
+RECOVERY_MODE_LABEL = f"{RECOVERY_LABEL_NAMESPACE}mode"
+RECOVERY_ATTEMPT_LABEL = f"{RECOVERY_LABEL_NAMESPACE}attempted_at"
+RECOVERY_ATTEMPT_RUNNER_LABEL = f"{RECOVERY_LABEL_NAMESPACE}attempted_runner"
 RECOVERY_COOLDOWN_S = 60
 RECOVERY_RESULT_GRACE_S = 60
 

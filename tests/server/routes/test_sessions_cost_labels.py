@@ -457,3 +457,41 @@ def test_create_session_with_ordinary_labels_succeeds(
     conv = conversation_store.get_conversation(resp.json()["id"])
     assert conv is not None
     assert conv.labels["team"] == "ml"
+
+
+@pytest.mark.parametrize("actor", [ALICE, BOB])
+@pytest.mark.parametrize(
+    "suffix", ["stopped", "mode", "attempted_at", "attempted_runner", "future_key"]
+)
+def test_clients_cannot_patch_recovery_control_labels(stores, actor, suffix):
+    """Recovery control is server-owned even for an owner or editor client."""
+    sid = _seed_session(stores, editor=BOB)
+    key = f"omnigent.runner_recovery.{suffix}"
+    before = stores[0].get_conversation(sid)
+    response = TestClient(_multi_user_app(stores)).patch(
+        f"/v1/sessions/{sid}",
+        json={"title": "must not apply", "labels": {key: "test-value"}},
+        headers={"X-Forwarded-Email": actor},
+    )
+    assert response.status_code == 400
+    assert "server-internal" in response.json()["error"]["message"]
+    after = stores[0].get_conversation(sid)
+    assert after.title == before.title
+    assert key not in after.labels
+
+
+@pytest.mark.parametrize(
+    "suffix", ["stopped", "mode", "attempted_at", "attempted_runner", "future_key"]
+)
+def test_clients_cannot_seed_recovery_control_labels(stores, suffix):
+    _seed_session(stores)
+    response = TestClient(_multi_user_app(stores)).post(
+        "/v1/sessions",
+        json={
+            "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
+            "labels": {f"omnigent.runner_recovery.{suffix}": "test-value"},
+        },
+        headers={"X-Forwarded-Email": ALICE, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    )
+    assert response.status_code == 400
+    assert "server-internal" in response.json()["error"]["message"]

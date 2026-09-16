@@ -2985,9 +2985,9 @@ async def _mark_runner_sessions_offline_impl(
     :param fail_idle_top_level: When ``True``, also fail an idle top-level
         session. A crash report covers the runner that died *before* it
         could run anything, so its session never reached ``running`` and
-        would otherwise sit silent; a sub-agent is spawned by an
-        already-live runner and can never be in that state, so idle
-        children are skipped either way.
+        would otherwise sit silent. A host-owning child can fail during
+        its own runner startup too; idle children sharing a parent runner
+        are spared.
     :returns: None.
     """
     for conv in convs:
@@ -3001,7 +3001,9 @@ async def _mark_runner_sessions_offline_impl(
         # was published before a restart.
         live = _session_status_cache.get(conv.id, conv.live_status)
         interrupted = live in _MID_TURN_STATUSES
-        dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
+        dead_on_arrival = fail_idle_top_level and (
+            conv.kind != "sub_agent" or conv.host_id is not None
+        )
         if not interrupted and not dead_on_arrival:
             continue
         _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
@@ -10385,7 +10387,12 @@ async def _get_session_snapshot(
     if (
         runner_exit_reports is not None
         and conv.runner_id is not None
-        and (conv.kind != "sub_agent" or status != "idle" or conv.live_status is None)
+        and (
+            conv.kind != "sub_agent"
+            or conv.host_id is not None
+            or status != "idle"
+            or conv.live_status is None
+        )
     ):
         exit_error = runner_exit_reports.get(conv.runner_id)
         if exit_error is not None:
