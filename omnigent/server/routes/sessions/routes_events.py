@@ -1048,7 +1048,6 @@ def register_events_routes(
             await _require_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
-            previous_recovery_stop = conv.labels.get(RECOVERY_STOPPED_LABEL, "")
             await asyncio.to_thread(
                 conversation_store.set_labels, session_id, {RECOVERY_STOPPED_LABEL: "true"}
             )
@@ -1068,11 +1067,8 @@ def register_events_routes(
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
-                await asyncio.to_thread(
-                    conversation_store.set_labels,
-                    session_id,
-                    {RECOVERY_STOPPED_LABEL: previous_recovery_stop},
-                )
+                # Keep durable Stop intent until explicit resume/Retry. A
+                # failed delivery must not overwrite a newer control request.
                 raise
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).

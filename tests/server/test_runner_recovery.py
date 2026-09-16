@@ -643,3 +643,56 @@ async def test_cancelled_rollback_drains_store_writes(group):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert store.rows[parent.id].runner_id == store.rows[child.id].runner_id == "old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["harness", "encode", "send"])
+async def test_launch_preparation_errors_do_not_strand_claims(group, monkeypatch, stage):
+    from omnigent.host import frames
+
+    parent, child, store = group
+    host = SimpleNamespace(pending_launches={})
+
+    def fail(*_):
+        raise RuntimeError("launch preparation failed")
+
+    monkeypatch.setattr(
+        helpers, "_resolve_harness", fail if stage == "harness" else lambda _: "openai-agents"
+    )
+    if stage == "encode":
+        monkeypatch.setattr(frames, "encode_host_frame", fail)
+    launch = helpers._launch_runner_on_host_impl(
+        parent, store, SimpleNamespace(send_text=fail), host, recovery_sessions=[parent, child]
+    )
+    if stage == "send":
+        attempt = await launch
+        assert attempt.error_code == "host_launch_failed"
+    else:
+        with pytest.raises(RuntimeError, match="launch preparation failed"):
+            await launch
+    assert store.rows[parent.id].runner_id == store.rows[child.id].runner_id == "old"
+    assert not host.pending_launches
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["stopped", "closed", "rebound", "fenced"])
+async def test_initialization_rechecks_target_after_ancestor_read(group, change):
+    parent, child, store = group
+    assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    original_get = store.get_conversation
+
+    def racing_get(sid):
+        if sid == parent.id:
+            if change == "rebound":
+                store.rows[child.id].runner_id = "user-selected"
+            elif change == "fenced":
+                common._interrupt_fenced_sessions.add(child.id)
+            else:
+                label = (
+                    recovery.RECOVERY_STOPPED_LABEL if change == "stopped" else "omnigent.closed"
+                )
+                store.rows[child.id].labels[label] = "true"
+        return original_get(sid)
+
+    store.get_conversation = racing_get
+    assert not await recovery.may_initialize_session(copy.deepcopy(store.rows[child.id]), store)

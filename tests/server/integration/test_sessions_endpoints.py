@@ -9635,7 +9635,7 @@ async def test_stop_session_surfaces_runner_failure_as_error(
         "a failed stop_session must remove the interrupt fence it installed"
     )
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
-    assert snapshot.json()["labels"].get("omnigent.runner_recovery.stopped") != "true"
+    assert snapshot.json()["labels"]["omnigent.runner_recovery.stopped"] == "true"
 
 
 async def test_stop_session_no_runner_lifts_stop_fence(
@@ -9732,9 +9732,10 @@ async def test_retry_session_ensures_dead_required_native_terminal_once(
     monkeypatch.setattr(routes_events, "_ensure_native_terminal_ready", ensure_terminal)
     monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", relay_ready)
 
-    await client.patch(
-        f"/v1/sessions/{session['id']}",
-        json={"labels": {"omnigent.runner_recovery.stopped": "true"}},
+    from omnigent.runtime import get_conversation_store
+
+    get_conversation_store().set_labels(
+        session["id"], {"omnigent.runner_recovery.stopped": "true"}
     )
 
     response = await client.post(
@@ -11899,3 +11900,51 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+@pytest.mark.parametrize("newer_intent", ["stop", "resume"])
+async def test_failed_stop_does_not_overwrite_newer_recovery_intent(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    newer_intent: str,
+) -> None:
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes.sessions import routes_events
+    from omnigent.server.runner_recovery import RECOVERY_STOPPED_LABEL
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def stop(*_):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+            raise OmnigentError("Stop delivery failed", code=ErrorCode.RUNNER_UNAVAILABLE)
+        return True
+
+    monkeypatch.setattr(routes_events, "_stop_session_via_runner", stop)
+    first = asyncio.create_task(
+        client.post(f"/v1/sessions/{sid}/events", json={"type": "stop_session", "data": {}})
+    )
+    try:
+        await entered.wait()
+        if newer_intent == "stop":
+            second = await client.post(
+                f"/v1/sessions/{sid}/events", json={"type": "stop_session", "data": {}}
+            )
+            assert second.status_code == 202
+        else:
+            get_conversation_store().set_labels(sid, {RECOVERY_STOPPED_LABEL: ""})
+    finally:
+        release.set()
+    response = await first
+    assert response.status_code == 503
+    fresh = get_conversation_store().get_conversation(sid)
+    assert fresh is not None
+    assert fresh.labels[RECOVERY_STOPPED_LABEL] == ("true" if newer_intent == "stop" else "")

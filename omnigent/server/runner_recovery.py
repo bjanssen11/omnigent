@@ -94,35 +94,56 @@ def recovery_waits_for_parent(conv: Conversation) -> bool:
     return conv.labels.get(RECOVERY_MODE_LABEL) == f"{conv.runner_id}:parent"
 
 
-async def may_initialize_session(conv: Conversation, store: ConversationStore) -> bool:
-    """Initialize only independent sessions whose lifecycle still allows recovery."""
-    # The parent's harness owns these children, including their recovery status.
-    # Initializing the mirror would create an unrelated, empty native terminal.
-    if is_parent_owned_subagent(conv) or recovery_waits_for_parent(conv):
-        return False
-    if conv.labels.get(RECOVERY_MODE_LABEL) == f"{conv.runner_id}:resume" and not was_interrupted(
-        conv, reconciled=True
+def _may_initialize_snapshot(conv: Conversation) -> bool:
+    if (
+        not can_restore_session(conv)
+        or is_parent_owned_subagent(conv)
+        or recovery_waits_for_parent(conv)
     ):
         return False
-    runner_id = conv.runner_id
+    return conv.labels.get(RECOVERY_MODE_LABEL) != f"{conv.runner_id}:resume" or was_interrupted(
+        conv, reconciled=True
+    )
+
+
+async def may_initialize_session(conv: Conversation, store: ConversationStore) -> bool:
+    """Recheck recovery ownership and lifecycle before sending initialization."""
+    from omnigent.server.routes._sessions.common import (
+        _intentional_stop_sessions,
+        _interrupt_fenced_sessions,
+    )
+
+    if not _may_initialize_snapshot(conv):
+        return False
+    target = conv
     seen: set[str] = set()
     check_ancestors = conv.labels.get(RECOVERY_MODE_LABEL, "").startswith(f"{conv.runner_id}:")
     while True:
-        if (
-            conv.archived
-            or is_session_closed(conv.labels, conv.title)
-            or conv.labels.get(RECOVERY_STOPPED_LABEL) == "true"
-        ):
+        if not can_restore_session(conv):
             return False
         seen.add(conv.id)
         if not check_ancestors or not conv.parent_conversation_id:
-            return True
+            break
         if conv.parent_conversation_id in seen:
             return False
         parent = await asyncio.to_thread(store.get_conversation, conv.parent_conversation_id)
-        if parent is None or parent.runner_id != runner_id:
+        if parent is None or parent.runner_id != target.runner_id:
             return False
         conv = parent
+    if len(seen) > 1:
+        fresh = await asyncio.to_thread(store.get_conversation, target.id)
+        if (
+            fresh is None
+            or fresh.runner_id != target.runner_id
+            or not _same_recovery_location(fresh, target)
+            or not _may_initialize_snapshot(fresh)
+        ):
+            return False
+    # An ancestor read can yield to Stop on this replica; check its fences
+    # again after the final await, even before durable labels catch up.
+    return not any(
+        sid in _intentional_stop_sessions or sid in _interrupt_fenced_sessions for sid in seen
+    )
 
 
 def _same_recovery_location(fresh: Conversation, snapshot: Conversation) -> bool:

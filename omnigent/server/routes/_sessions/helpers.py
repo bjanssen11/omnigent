@@ -5664,6 +5664,34 @@ async def _launch_runner_on_host_locked(
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
+    # Pull workspace from the session row — populated and validated
+    # at session create per designs/SESSION_WORKSPACE_SELECTION.md.
+    # The check constraint guarantees workspace is non-NULL when
+    # host_id is set, so this assertion is a tripwire for any path
+    # that bypassed the validation.
+    if conv.workspace is None:  # pragma: no cover — constraint guards
+        _logger.error(
+            "session %s has host_id=%s but workspace is NULL — schema "
+            "constraint should have prevented this",
+            conv.id,
+            conv.host_id,
+            extra={"session_id": conv.id},
+        )
+        return _HostLaunchAttempt(runner_id=conv.runner_id or "", error_code="workspace_missing")
+    request_id = secrets.token_hex(8)
+    launch_frame = encode_host_frame(
+        HostLaunchRunnerFrame(
+            request_id=request_id,
+            binding_token=binding_token,
+            workspace=conv.workspace,
+            session_id=conv.id,
+            # Canonical harness (see _resolve_harness) so the host runs the
+            # same configuration check it does at create-time launch. None
+            # (agent not resolvable) skips the host-side check — fail open.
+            harness=_resolve_harness(conv),
+        )
+    )
+
     if recovery_sessions is not None:
         from omnigent.server.runner_recovery import prepare_recovery_bindings
 
@@ -5685,43 +5713,16 @@ async def _launch_runner_on_host_locked(
         # forwarder still tailing this session).
         _spawn_superseded_runner_stop(conv.id, conv.host_id, superseded_runner_id, host_registry)
 
-    # Pull workspace from the session row — populated and validated
-    # at session create per designs/SESSION_WORKSPACE_SELECTION.md.
-    # The check constraint guarantees workspace is non-NULL when
-    # host_id is set, so this assertion is a tripwire for any path
-    # that bypassed the validation.
-    if conv.workspace is None:  # pragma: no cover — constraint guards
-        _logger.error(
-            "session %s has host_id=%s but workspace is NULL — schema "
-            "constraint should have prevented this",
-            conv.id,
-            conv.host_id,
-            extra={"session_id": conv.id},
-        )
-        return _HostLaunchAttempt(runner_id=new_runner_id)
-    request_id = secrets.token_hex(8)
     launch_future: asyncio.Future[dict[str, str | None]] = (
         asyncio.get_running_loop().create_future()
     )
     host_conn.pending_launches[request_id] = launch_future
-    launch_frame = encode_host_frame(
-        HostLaunchRunnerFrame(
-            request_id=request_id,
-            binding_token=binding_token,
-            workspace=conv.workspace,
-            session_id=conv.id,
-            # Canonical harness (see _resolve_harness) so the host runs the
-            # same configuration check it does at create-time launch. None
-            # (agent not resolvable) skips the host-side check — fail open.
-            harness=_resolve_harness(conv),
-        )
-    )
     try:
         host_registry.send_text(host_conn, launch_frame)
-    except ConnectionError:
+    except Exception as exc:
         host_conn.pending_launches.pop(request_id, None)
         _logger.warning(
-            "Host %s connection lost while launching runner for %s",
+            "Host %s launch send failed for %s",
             conv.host_id,
             conv.id,
             extra={"session_id": conv.id},
@@ -5735,9 +5736,13 @@ async def _launch_runner_on_host_locked(
             )
             return _HostLaunchAttempt(
                 runner_id=new_runner_id,
-                error_code="host_disconnected",
-                error="Host connection lost; retry recovery when the original host is online.",
+                error_code="host_disconnected"
+                if isinstance(exc, ConnectionError)
+                else "host_launch_failed",
+                error="Could not send the runner launch request to the original host.",
             )
+        if not isinstance(exc, ConnectionError):
+            raise
         return _HostLaunchAttempt(runner_id=new_runner_id)
     retain_result = False
     try:
