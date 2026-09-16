@@ -1390,7 +1390,11 @@ def register_events_routes(
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
-            from omnigent.server.runner_recovery import is_parent_owned_subagent
+            from omnigent.server.runner_recovery import (
+                RECOVERY_MODE_LABEL,
+                is_parent_owned_subagent,
+                recovery_waits_for_parent,
+            )
 
             status = body.data.get("status")
             if not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
@@ -1504,6 +1508,10 @@ def register_events_routes(
                         await _persist_session_status_error_labels(
                             session_id, None, conversation_store
                         )
+            if status in {"running", "idle"} and recovery_waits_for_parent(conv):
+                await asyncio.to_thread(
+                    conversation_store.set_labels, session_id, {RECOVERY_MODE_LABEL: ""}
+                )
             _publish_status(
                 session_id,
                 status,

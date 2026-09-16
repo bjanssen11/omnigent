@@ -99,6 +99,7 @@ async def test_recovery_rechecks_lifecycle_before_launch(group, monkeypatch, cha
             fresh.runner_id = "user-replacement"
         elif change == "cooldown":
             fresh.labels[recovery.RECOVERY_ATTEMPT_LABEL] = str(time.time())
+            fresh.labels[recovery.RECOVERY_MODE_LABEL] = "old:resume"
         return "dead"
 
     monkeypatch.setattr(helpers, "_query_host_runner_status", status)
@@ -266,3 +267,81 @@ async def test_deleted_child_does_not_abort_parent_recovery(group):
     store.replace_runner_id = racing_replace
     assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
     assert store.rows[parent.id].runner_id == "new"
+
+
+@pytest.mark.asyncio
+async def test_lost_root_cas_does_not_cool_down_user_selected_runner(group, monkeypatch):
+    parent, child, store = group
+    original_replace = store.replace_runner_id
+
+    def racing_replace(session_id, runner_id, **kwargs):
+        if session_id == parent.id:
+            store.rows[parent.id].runner_id = "user-replacement"
+        return original_replace(session_id, runner_id, **kwargs)
+
+    store.replace_runner_id = racing_replace
+    assert not await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    assert recovery.RECOVERY_ATTEMPT_LABEL not in store.rows[parent.id].labels
+    assert store.rows[child.id].runner_id == "old"
+
+    # Even a previous attempt's timestamp must not cool down a user's new binding.
+    store.rows[parent.id].labels[recovery.RECOVERY_ATTEMPT_LABEL] = str(time.time())
+    fresh = store.rows[parent.id]
+    monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
+    launch = AsyncMock(return_value=SimpleNamespace(error_code=None))
+    monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
+    coordinator = recovery.HostRunnerRecovery(store, SimpleNamespace(get=lambda _: object()))
+    coordinator.schedule("user-replacement", [fresh], [fresh])
+    await asyncio.gather(*coordinator._tasks.values())
+    launch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle", ["stopped", "archived", "closed"])
+async def test_lifecycle_change_during_root_cas_prevents_initialization(group, lifecycle):
+    parent, child, store = group
+    original_replace = store.replace_runner_id
+
+    def racing_replace(session_id, runner_id, **kwargs):
+        if session_id == parent.id:
+            if lifecycle == "archived":
+                store.rows[parent.id].archived = True
+            else:
+                label = (
+                    recovery.RECOVERY_STOPPED_LABEL
+                    if lifecycle == "stopped"
+                    else "omnigent.closed"
+                )
+                store.rows[parent.id].labels[label] = "true"
+        return original_replace(session_id, runner_id, **kwargs)
+
+    store.replace_runner_id = racing_replace
+    assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    for session_id in [parent.id, child.id]:
+        assert store.rows[session_id].runner_id == "new"
+        assert not await recovery.may_initialize_session(store.rows[session_id], store)
+
+
+@pytest.mark.asyncio
+async def test_launch_send_failure_retains_bindings_and_logs_retry(group, monkeypatch, caplog):
+    parent, child, store = group
+    host = SimpleNamespace(pending_launches={})
+
+    def send(*_):
+        raise ConnectionError("host disconnected")
+
+    hosts = SimpleNamespace(get=lambda _: host, send_text=send)
+    monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
+    monkeypatch.setattr(helpers, "_spawn_superseded_runner_stop", lambda *_: None)
+    monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
+    launch = AsyncMock(wraps=helpers._launch_runner_on_host_impl)
+    monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
+    coordinator = recovery.HostRunnerRecovery(store, hosts)
+    coordinator.schedule("old", [parent, child], [parent, child])
+    await asyncio.gather(*coordinator._tasks.values())
+    launch.assert_awaited_once()
+    assert store.rows[parent.id].runner_id != "old"
+    assert store.rows[parent.id].runner_id == store.rows[child.id].runner_id
+    assert not host.pending_launches
+    assert "host_disconnected" in caplog.text
+    assert "explicit Retry" in caplog.text

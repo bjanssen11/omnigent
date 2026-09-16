@@ -5725,6 +5725,14 @@ async def _launch_runner_on_host_locked(
             conv.id,
             extra={"session_id": conv.id},
         )
+        if recovery_sessions is not None:
+            # Retain replacement bindings; explicit Retry can relaunch once
+            # the original host is online again.
+            return _HostLaunchAttempt(
+                runner_id=new_runner_id,
+                error_code="host_disconnected",
+                error="Host connection lost; retry recovery when the original host is online.",
+            )
         return _HostLaunchAttempt(runner_id=new_runner_id)
     try:
         result = await asyncio.wait_for(

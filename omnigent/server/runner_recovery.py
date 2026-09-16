@@ -84,6 +84,11 @@ def recovery_suppresses_turn(conv: Conversation) -> bool:
     return conv.labels.get(RECOVERY_MODE_LABEL) == f"{conv.runner_id}:restore"
 
 
+def recovery_waits_for_parent(conv: Conversation) -> bool:
+    """A replacement runner alone cannot confirm a mirrored child's recovery."""
+    return conv.labels.get(RECOVERY_MODE_LABEL) == f"{conv.runner_id}:parent"
+
+
 async def may_initialize_session(conv: Conversation, store: ConversationStore) -> bool:
     """Initialize only independent sessions whose lifecycle still allows recovery."""
     # The parent's harness owns these children, including their recovery status.
@@ -140,7 +145,8 @@ async def prepare_recovery_bindings(
     if not eligible:
         return False
     resume_ids = {conv.id for conv in eligible}
-    await asyncio.to_thread(store.set_labels, root.id, {RECOVERY_ATTEMPT_LABEL: str(time.time())})
+    # Stop can race the binding CAS; initialization rechecks lifecycle
+    # even if that race leaves an unused replacement runner behind.
     for conv in [root, *(c for c in eligible if c.id != root.id)]:
         if is_parent_owned_subagent(conv):
             mode = "parent"
@@ -157,8 +163,12 @@ async def prepare_recovery_bindings(
             if conv.id == root.id:
                 return False
             continue
-        if conv.id == root.id and rebound.runner_id != runner_id:
-            return False
+        if conv.id == root.id:
+            if rebound.runner_id != runner_id:
+                return False
+            await asyncio.to_thread(
+                store.set_labels, root.id, {RECOVERY_ATTEMPT_LABEL: str(time.time())}
+            )
     return True
 
 
@@ -234,18 +244,22 @@ class HostRunnerRecovery:
                 or shutdown_state.server_shutting_down()
             ):
                 return
-            try:
-                last_attempt = float(fresh.labels.get(RECOVERY_ATTEMPT_LABEL, "0"))
-            except ValueError:
-                return
-            if time.time() - last_attempt < RECOVERY_COOLDOWN_S:
-                return
+            if fresh.labels.get(RECOVERY_MODE_LABEL, "").startswith(f"{runner_id}:"):
+                try:
+                    last_attempt = float(fresh.labels.get(RECOVERY_ATTEMPT_LABEL, "0"))
+                except ValueError:
+                    return
+                if time.time() - last_attempt < RECOVERY_COOLDOWN_S:
+                    return
             attempt = await _launch_runner_on_host(
                 fresh, self._store, self._hosts, host, recovery_sessions=interrupted
             )
             if attempt.error_code is not None:
                 _logger.warning(
-                    "Automatic runner recovery refused for %s: %s", root.id, attempt.error_code
+                    "Automatic runner recovery refused for %s: %s; "
+                    "use explicit Retry if the session remains disconnected",
+                    root.id,
+                    attempt.error_code,
                 )
         except Exception:
             _logger.exception("Automatic runner recovery failed for %s", root.id)

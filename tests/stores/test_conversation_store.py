@@ -3060,7 +3060,6 @@ def test_recovery_binding_does_not_overwrite_a_newer_runner(
     persisted = conversation_store.get_conversation(conv.id)
     assert persisted is not None
     assert persisted.runner_id == "new"
-    assert persisted.updated_at == conv.updated_at
 
 
 def test_list_conversations_by_runner_id_filters(

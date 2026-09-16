@@ -40,13 +40,13 @@ def _wait_until(predicate: Callable[[], bool], timeout: float = 60) -> None:
 
 
 @pytest.mark.timeout(240)
-@pytest.mark.parametrize("stop_intentionally", [False, True])
+@pytest.mark.parametrize("stop_target", [None, "parent", "child"])
 def test_host_runner_recovers_group_only_after_crash(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,
     mock_llm_server_url: str,
-    stop_intentionally: bool,
+    stop_target: str | None,
 ) -> None:
     daemon = _spawn_host_daemon(
         tmp_path=tmp_path, live_server=live_server, mock_llm_server_url=mock_llm_server_url
@@ -125,11 +125,15 @@ def test_host_runner_recovers_group_only_after_crash(
             assert snapshot(session_id)["status"] == "running"
             assert snapshot(session_id)["runner_id"] == original_runner
 
-        if stop_intentionally:
+        if stop_target is not None:
+            stopped_id = parent if stop_target == "parent" else worker
             response = http_client.post(
-                f"/v1/sessions/{parent}/events", json={"type": "stop_session", "data": {}}
+                f"/v1/sessions/{stopped_id}/events", json={"type": "stop_session", "data": {}}
             )
             response.raise_for_status()
+            assert snapshot(stopped_id)["labels"]["omnigent.runner_recovery.stopped"] == "true"
+        if stop_target == "parent":
+            # Parent Stop terminates the dedicated runner itself.
             time.sleep(12)
             assert snapshot(parent)["runner_id"] == original_runner
             assert snapshot(worker)["runner_id"] == original_runner
@@ -139,7 +143,10 @@ def test_host_runner_recovers_group_only_after_crash(
             runner_pid = _runner_pid_from_daemon_log(daemon.daemon_log)
             assert runner_pid is not None
             os.kill(runner_pid, signal.SIGKILL)
-            for session_id, marker in [(parent, "PARENT_RECOVERED"), (worker, "CHILD_RECOVERED")]:
+            expected = [(parent, "PARENT_RECOVERED")]
+            if stop_target is None:
+                expected.append((worker, "CHILD_RECOVERED"))
+            for session_id, marker in expected:
                 _wait_until(
                     lambda marker=marker, session_id=session_id: (
                         marker in transcript(session_id)
@@ -149,11 +156,15 @@ def test_host_runner_recovers_group_only_after_crash(
                 )
             recovered_parent = snapshot(parent)
             assert recovered_parent["runner_id"] != original_runner
-            assert recovered_parent["runner_id"] == snapshot(worker)["runner_id"]
             assert recovered_parent["host_id"] == daemon.host_id
             assert recovered_parent["workspace"] == str(tmp_path)
             assert transcript(parent).count("PARENT_RECOVERED") == 1
-            assert transcript(worker).count("CHILD_RECOVERED") == 1
+            if stop_target == "child":
+                assert snapshot(worker)["runner_id"] == original_runner
+                assert "CHILD_RECOVERED" not in transcript(worker)
+            else:
+                assert recovered_parent["runner_id"] == snapshot(worker)["runner_id"]
+                assert transcript(worker).count("CHILD_RECOVERED") == 1
         assert snapshot(completed)["runner_id"] == original_runner
         assert snapshot(completed)["status"] == "idle"
         assert transcript(completed).count("ALREADY_FINISHED") == 1

@@ -2899,6 +2899,7 @@ def create_app(
         HostRunnerRecovery,
         may_initialize_session,
         recovery_suppresses_turn,
+        recovery_waits_for_parent,
         was_interrupted,
     )
 
@@ -3127,11 +3128,7 @@ def create_app(
         )
         for conv in convs:
             conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
-            if (
-                conv is None
-                or conv.runner_id != runner_id
-                or not await may_initialize_session(conv, conversation_store)
-            ):
+            if conv is None or conv.runner_id != runner_id:
                 continue
             _logger.info(
                 "_on_runner_connect: matched %s (agent=%s)",
@@ -3157,7 +3154,7 @@ def create_app(
                     "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
                     conv.id,
                 )
-            else:
+            elif await may_initialize_session(conv, conversation_store):
                 try:
                     await runner_session_initializer.initialize(
                         conv,
@@ -3200,9 +3197,10 @@ def create_app(
             # is reachable again. The helper self-guards: it only clears a
             # session whose persisted failure is ``runner_disconnected``, so
             # a genuine task failure survives the reconnect untouched.
-            await _publish_runner_recovered_status(
-                conv.id, conversation_store, require_disconnect_code=True
-            )
+            if not recovery_waits_for_parent(conv):
+                await _publish_runner_recovered_status(
+                    conv.id, conversation_store, require_disconnect_code=True
+                )
             # A managed launch that outlived its connect timeout cached
             # sandbox_status "failed"; this runner connecting proves the
             # sandbox is live, so drop the stale banner. Only "failed" is

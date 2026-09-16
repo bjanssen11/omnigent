@@ -1053,6 +1053,7 @@ async def _reconnect_fires_connect_hook(
     fake_pm: Any,
     *,
     wait_for_recover: str,
+    relay_calls: list[str] | None = None,
 ) -> AsyncIterator[list[str]]:
     """Drive a real tunnel disconnect/reconnect so ``_on_runner_connect`` fires.
 
@@ -1093,7 +1094,8 @@ async def _reconnect_fires_connect_hook(
     real_ensure = sessions_routes._ensure_runner_relay
 
     def _stub_ensure(sid, rid, client, store=None):  # type: ignore[no-untyped-def]
-        return None
+        if relay_calls is not None:
+            relay_calls.append(sid)
 
     sessions_routes._ensure_runner_relay = _stub_ensure  # type: ignore[assignment]
 
@@ -1441,10 +1443,12 @@ async def test_on_runner_connect_preserves_genuine_failure_on_reconnect(
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
 @pytest.mark.parametrize("child_status", ["failed", "idle"])
+@pytest.mark.parametrize("after_crash", [True, False])
 async def test_reconnect_does_not_initialize_or_complete_native_subagent_mirrors(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
     child_status: str,
+    after_crash: bool,
 ) -> None:
     """A parent reconnect cannot launch a blank child or prove its task completed."""
     from omnigent.runtime import get_conversation_store
@@ -1471,7 +1475,7 @@ async def test_reconnect_does_not_initialize_or_complete_native_subagent_mirrors
         child.id,
         {
             "omnigent.wrapper": "claude-code-native-ui-subagent",
-            RECOVERY_MODE_LABEL: f"{_RUNNER_ID}:parent",
+            RECOVERY_MODE_LABEL: f"{_RUNNER_ID}:parent" if after_crash else "",
         },
     )
     sessions_module._session_status_cache[child.id] = child_status
@@ -1498,19 +1502,63 @@ async def test_reconnect_does_not_initialize_or_complete_native_subagent_mirrors
         return await original_initialize(conv, *args, **kwargs)
 
     monkeypatch.setattr(initializer, "initialize", record_initialize)
+    relays: list[str] = []
     async with _reconnect_fires_connect_hook(
-        ap_app, tunnel_three_layer_stack.fake_pm, wait_for_recover=parent_id
+        ap_app, tunnel_three_layer_stack.fake_pm, wait_for_recover=parent_id, relay_calls=relays
     ) as recovered:
         assert initialized == [parent_id]
-        assert recovered == [parent_id]
-        assert sessions_module._session_status_cache[child.id] == child_status
+        assert relays == [child.id, parent_id]
+        assert recovered == ([parent_id] if after_crash else [child.id, parent_id])
+        expected_status = child_status if after_crash else "idle"
+        assert sessions_module._session_status_cache[child.id] == expected_status
         fresh = store.get_conversation(child.id)
         assert fresh is not None
         error = sessions_module._last_task_error_from_labels(fresh.labels)
-        if child_status == "failed":
+        if after_crash and child_status == "failed":
             assert error is not None and error["code"] == "runner_disconnected"
         else:
             assert error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("lifecycle", ["archived", "closed", "stopped"])
+async def test_reconnect_reconciles_inactive_sessions_without_initializing(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    lifecycle: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.runner_recovery import RECOVERY_STOPPED_LABEL
+
+    stack = tunnel_three_layer_stack
+    sid = await _bind_failed_session(
+        stack.ap_client,
+        error_code="runner_disconnected",
+        error_message="Runner disconnected unexpectedly.",
+    )
+    store = get_conversation_store()
+    if lifecycle == "archived":
+        store.update_conversation(sid, archived=True)
+    else:
+        store.set_labels(
+            sid, {"omnigent.closed" if lifecycle == "closed" else RECOVERY_STOPPED_LABEL: "true"}
+        )
+    initialize = AsyncMock()
+    monkeypatch.setattr(stack.ap_app.state.runner_session_initializer, "initialize", initialize)
+    relays: list[str] = []
+    async with _reconnect_fires_connect_hook(
+        stack.ap_app, stack.fake_pm, wait_for_recover=sid, relay_calls=relays
+    ):
+        initialize.assert_not_awaited()
+        assert relays == [sid]
+        assert sessions_module._session_status_cache[sid] == "idle"
+        fresh = store.get_conversation(sid)
+        assert fresh is not None
+        assert sessions_module._last_task_error_from_labels(fresh.labels) is None
 
 
 def _stub_connect_hook_for_pumpless_ws(ap_app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:

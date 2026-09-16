@@ -4897,6 +4897,7 @@ async def test_native_child_completion_clears_only_disconnect_errors(
 ) -> None:
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.runner_recovery import RECOVERY_MODE_LABEL
     from omnigent.server.schemas import ErrorDetail
 
     agent = await create_test_agent(client)
@@ -4906,7 +4907,14 @@ async def test_native_child_completion_clears_only_disconnect_errors(
         agent_id=agent["id"], kind="sub_agent", parent_conversation_id=parent["id"]
     )
     if mirrored:
-        store.set_labels(child.id, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
+        store.replace_runner_id(child.id, "replacement")
+        store.set_labels(
+            child.id,
+            {
+                "omnigent.wrapper": "claude-code-native-ui-subagent",
+                RECOVERY_MODE_LABEL: "replacement:parent",
+            },
+        )
     if cached:
         sessions_module._session_status_cache[child.id] = "failed"
     await sessions_module._persist_session_status_error_labels(
@@ -4927,6 +4935,7 @@ async def test_native_child_completion_clears_only_disconnect_errors(
     assert response.status_code == 202, response.text
     fresh = store.get_conversation(child.id)
     assert fresh is not None
+    assert not fresh.labels.get(RECOVERY_MODE_LABEL)
     error = sessions_module._last_task_error_from_labels(fresh.labels)
     if mirrored and error_code != "native_turn_error":
         assert sessions_module._session_status_cache[child.id] == "idle"
@@ -4934,6 +4943,55 @@ async def test_native_child_completion_clears_only_disconnect_errors(
     else:
         assert sessions_module._session_status_cache[child.id] == ("failed" if cached else "idle")
         assert error is not None and error["code"] == error_code
+
+
+@pytest.mark.parametrize("status", ["running", "quiesced"])
+async def test_native_child_recovery_waits_for_authoritative_parent_activity(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.runner_recovery import RECOVERY_MODE_LABEL
+    from omnigent.server.schemas import ErrorDetail
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = get_conversation_store()
+    child = store.create_conversation(
+        agent_id=agent["id"], kind="sub_agent", parent_conversation_id=parent["id"]
+    )
+    store.replace_runner_id(child.id, "replacement")
+    store.set_labels(
+        child.id,
+        {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            RECOVERY_MODE_LABEL: "replacement:parent",
+        },
+    )
+    sessions_module._session_status_cache[child.id] = "failed"
+    await sessions_module._persist_session_status_error_labels(
+        child.id, ErrorDetail(code="runner_disconnected", message="Runner crashed"), store
+    )
+    forward = AsyncMock(return_value=_RunnerForwardResult(status_code=204, body=""))
+    monkeypatch.setattr(sessions_module, "_forward_session_change_to_runner", forward)
+    response = await client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={"type": "external_session_status", "data": {"status": status}},
+    )
+    assert response.status_code == 202, response.text
+    fresh = store.get_conversation(child.id)
+    assert fresh is not None
+    error = sessions_module._last_task_error_from_labels(fresh.labels)
+    if status == "running":
+        assert not fresh.labels.get(RECOVERY_MODE_LABEL)
+        assert error is None
+        forward.assert_awaited_once()
+    else:
+        assert fresh.labels[RECOVERY_MODE_LABEL] == "replacement:parent"
+        assert error is not None and error["code"] == "runner_disconnected"
+        forward.assert_not_awaited()
 
 
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
@@ -9614,6 +9672,9 @@ async def test_stop_session_no_runner_lifts_stop_fence(
             "a no-runner stop_session must remove the fence it installed — "
             "nothing else would ever lift it"
         )
+        # Persist Stop intent so a delayed crash report cannot restart this session.
+        snapshot = await client.get(f"/v1/sessions/{session_id}")
+        assert snapshot.json()["labels"]["omnigent.runner_recovery.stopped"] == "true"
     finally:
         if session_id is not None:
             _interrupt_fenced_sessions.discard(session_id)
