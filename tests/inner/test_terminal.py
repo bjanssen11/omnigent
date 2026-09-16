@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -204,10 +205,10 @@ def test_tmux_gone_diagnostics_summarizes_available_signals(tmp_path: Path) -> N
     assert "last pane tail:" in summary and "Segmentation fault" in summary
 
 
-def test_tmux_unavailable_error_log_carries_the_cause(
+def test_tmux_unavailable_log_carries_the_cause(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The 'tmux unavailable' exit ERROR names why: probe stderr + pane tail.
+    """The 'tmux unavailable' exit log names why: probe stderr + pane tail.
 
     Drives the real capture/has-session helpers (both failing) so the log
     proves the probe errors are recorded and surfaced, not just formattable.
@@ -229,20 +230,83 @@ def test_tmux_unavailable_error_log_carries_the_cause(
     instance.note_client_interaction()
     exited = threading.Event()
 
-    with caplog.at_level(logging.ERROR, logger=terminal_mod.__name__):
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
         instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
         assert exited.wait(timeout=2.0)
 
     unavailable = [
         record.getMessage()
         for record in caplog.records
-        if record.levelno == logging.ERROR and "tmux unavailable after" in record.getMessage()
+        if "tmux unavailable after" in record.getMessage()
     ]
-    assert unavailable, "expected a 'tmux unavailable' ERROR"
+    assert unavailable, "expected a 'tmux unavailable' log"
     message = unavailable[0]
     assert "no server running" in message  # has-session stderr → whole-server death
     assert "since web client interaction" in message
     assert "Traceback" in message  # last pane tail carried into the exit log
+
+
+def _watcher_instance(tmp_path: Path, name: str) -> TerminalInstance:
+    """A TerminalInstance whose tmux probes all fail, as if the server is gone."""
+    instance = TerminalInstance(
+        name=name,
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    def _fail(*_args: str) -> str:
+        raise RuntimeError("tmux command failed (rc=1): no server running on /tmp/x/default")
+
+    instance._tmux_output_sync = _fail  # type: ignore[method-assign]
+    return instance
+
+
+def test_tmux_unavailable_is_a_warning_when_the_exit_is_reported(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A managed terminal ending takes its private server with it.
+
+    The exit callback publishes the classified exit (status + whether the
+    session was idle), so this probe's detection is not itself a failure.
+    """
+    instance = _watcher_instance(tmp_path, "codex")
+    exited = threading.Event()
+
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+        assert exited.wait(timeout=2.0)
+
+    unavailable = [r for r in caplog.records if "tmux unavailable after" in r.getMessage()]
+    assert unavailable, "expected a 'tmux unavailable' log"
+    assert [r.levelno for r in unavailable] == [logging.WARNING], (
+        "an exit the callback reports must not also be logged as an ERROR"
+    )
+    # The structured event records which path classified the exit.
+    assert unavailable[0].attributes["exit_reported"] is True  # type: ignore[attr-defined]
+
+
+def test_tmux_unavailable_stays_an_error_without_an_exit_callback(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With no callback to publish the exit, this log is the only report.
+
+    Mirrors the activity-only watcher the tool-dispatch attach path starts.
+    """
+    instance = _watcher_instance(tmp_path, "codex")
+
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        instance.start_idle_watcher_thread(on_activity=lambda: None, poll_interval_s=0.01)
+        deadline = time.monotonic() + 2.0
+        while instance.running and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not instance.running, "watcher never declared tmux gone"
+
+    unavailable = [r for r in caplog.records if "tmux unavailable after" in r.getMessage()]
+    assert unavailable, "expected a 'tmux unavailable' log"
+    assert unavailable[0].levelno == logging.ERROR
+    assert unavailable[0].attributes["exit_reported"] is False  # type: ignore[attr-defined]
 
 
 def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path) -> None:

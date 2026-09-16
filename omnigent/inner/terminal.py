@@ -1158,8 +1158,26 @@ class TerminalInstance:
             }
         )
 
-    def _log_tmux_unavailable(self, consecutive_failures: int) -> None:
-        """Persist the failed probes before exit callbacks remove the private socket."""
+    def _log_tmux_unavailable(self, consecutive_failures: int, *, exit_reported: bool) -> None:
+        """Persist the failed probes before exit callbacks remove the private socket.
+
+        This is reached only once ``has-session`` has confirmed the session
+        gone, and a managed terminal is one pane on its own private server: the
+        inner CLI exiting takes the server with it unless ``remain-on-exit`` is
+        set. So "tmux is gone" is ordinary end-of-life as often as it is a
+        fault, and this probe cannot tell them apart — the pane's exit status
+        died with the server.
+
+        The exit callback can: it reports the exit with that status and whether
+        the session was idle, which is the verdict on whether the exit was
+        clean. So log at WARNING when a callback will publish that verdict, and
+        keep ERROR when there is none and this line is the only report.
+
+        :param consecutive_failures: Failed probe streak that declared tmux
+            gone, e.g. ``3``.
+        :param exit_reported: Whether an exit callback will publish the
+            classified exit after this returns.
+        """
         socket_attributes: dict[str, object] = {}
         for name, path in (("socket", self.socket_path), ("private_dir", self.private_dir)):
             try:
@@ -1185,10 +1203,12 @@ class TerminalInstance:
             probe_failures_json=json.dumps(list(self._probe_failures)),
             process_id=os.getpid(),
             effective_uid=os.geteuid() if not IS_WINDOWS else None,
+            exit_reported=exit_reported,
             **socket_attributes,
         )
         # File formatters omit structured extras; keep the same evidence locally.
-        logger.error(
+        log = logger.warning if exit_reported else logger.error
+        log(
             "tmux unavailable after %d consecutive probes for terminal %s:%s (%s); diagnostics=%s",
             consecutive_failures,
             self.name,
@@ -1726,7 +1746,9 @@ class TerminalInstance:
                 consecutive_capture_failures += 1
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
                     continue
-                self._log_tmux_unavailable(consecutive_capture_failures)
+                self._log_tmux_unavailable(
+                    consecutive_capture_failures, exit_reported=on_exit is not None
+                )
                 self.running = False
                 if on_exit is not None:
                     await _fire(on_exit, "exit")
@@ -1930,7 +1952,9 @@ class TerminalInstance:
                 consecutive_capture_failures += 1
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
                     continue
-                self._log_tmux_unavailable(consecutive_capture_failures)
+                self._log_tmux_unavailable(
+                    consecutive_capture_failures, exit_reported=on_exit is not None
+                )
                 self.running = False
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
