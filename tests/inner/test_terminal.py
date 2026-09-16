@@ -284,7 +284,7 @@ def test_tmux_unavailable_is_a_warning_when_the_exit_is_reported(
         "an exit the callback reports must not also be logged as an ERROR"
     )
     # The structured event records which path classified the exit.
-    assert unavailable[0].attributes["exit_reported"] is True  # type: ignore[attr-defined]
+    assert unavailable[0].attributes["exit_callback_present"] is True  # type: ignore[attr-defined]
 
 
 def test_tmux_unavailable_stays_an_error_without_an_exit_callback(
@@ -306,7 +306,36 @@ def test_tmux_unavailable_stays_an_error_without_an_exit_callback(
     unavailable = [r for r in caplog.records if "tmux unavailable after" in r.getMessage()]
     assert unavailable, "expected a 'tmux unavailable' log"
     assert unavailable[0].levelno == logging.ERROR
-    assert unavailable[0].attributes["exit_reported"] is False  # type: ignore[attr-defined]
+    assert unavailable[0].attributes["exit_callback_present"] is False  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_async_idle_watcher_applies_the_same_severity_split(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The asyncio watcher splits severity exactly like the threaded one."""
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+    async def _fail(*_args: str) -> str:
+        raise RuntimeError("tmux command failed (rc=1): no server running on /tmp/x/default")
+
+    instance._tmux_output = _fail  # type: ignore[method-assign]
+    exited = asyncio.Event()
+
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        instance.start_idle_watcher(lambda: None, on_exit=exited.set)
+        await asyncio.wait_for(exited.wait(), timeout=5.0)
+
+    unavailable = [r for r in caplog.records if "tmux unavailable after" in r.getMessage()]
+    assert unavailable, "expected a 'tmux unavailable' log from the async watcher"
+    assert unavailable[0].levelno == logging.WARNING
+    assert unavailable[0].attributes["exit_callback_present"] is True  # type: ignore[attr-defined]
 
 
 def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path) -> None:
