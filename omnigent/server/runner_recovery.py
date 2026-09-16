@@ -7,6 +7,7 @@ import logging
 import math
 import time
 from collections.abc import Sequence
+from contextlib import suppress
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.entities import Conversation
@@ -116,62 +117,161 @@ async def may_initialize_session(conv: Conversation, store: ConversationStore) -
         conv = parent
 
 
+def _same_recovery_location(fresh: Conversation, snapshot: Conversation) -> bool:
+    return (
+        fresh.host_id == snapshot.host_id
+        and fresh.workspace == snapshot.workspace
+        and fresh.parent_conversation_id == snapshot.parent_conversation_id
+        and fresh.agent_id == snapshot.agent_id
+    )
+
+
+async def rollback_recovery_bindings(
+    runner_id: str, previous_runner_id: str, store: ConversationStore
+) -> None:
+    """Undo only this unlaunched attempt; preserve concurrent user rebindings."""
+    rows = await asyncio.to_thread(store.list_conversations_by_runner_id, runner_id)
+    for row in rows:
+        try:
+            await asyncio.to_thread(
+                store.replace_runner_id, row.id, previous_runner_id, expected_runner_id=runner_id
+            )
+        except ConversationNotFoundError:
+            continue
+
+
 async def prepare_recovery_bindings(
     root: Conversation,
     runner_id: str,
     interrupted: Sequence[Conversation],
     store: ConversationStore,
 ) -> bool:
-    """Restore the affected group before the replacement runner can connect.
+    """Finish in-flight store writes before undoing a cancelled/failed claim."""
+    task = asyncio.create_task(_prepare_recovery_bindings(root, runner_id, interrupted, store))
+    try:
+        return await asyncio.shield(task)
+    except (Exception, asyncio.CancelledError):
+        await asyncio.gather(task, return_exceptions=True)
+        if root.runner_id is not None:
+            await rollback_recovery_bindings(runner_id, root.runner_id, store)
+        raise
 
-    The host-launch lock owns this operation. Conditional writes preserve a
-    child's binding when a concurrent user action has already moved it.
+
+async def _prepare_recovery_bindings(
+    root: Conversation,
+    runner_id: str,
+    interrupted: Sequence[Conversation],
+    store: ConversationStore,
+) -> bool:
+    """Claim interrupted work and its ancestor chain under the host-launch lock.
+
+    Lifecycle labels and bindings can live in separate databases. Recheck after
+    claiming and undo stale claims; initialization is the final lifecycle gate.
     """
-    if root.runner_id is None or not can_restore_session(root):
-        return False
     previous_runner_id = root.runner_id
-    eligible: list[Conversation] = []
+    if previous_runner_id is None or not can_restore_session(root):
+        return False
+    plan: dict[str, Conversation] = {root.id: root}
+    resume_ids: set[str] = set()
     for snapshot in interrupted:
         fresh = await asyncio.to_thread(store.get_conversation, snapshot.id)
         if (
-            fresh is not None
-            and fresh.runner_id == root.runner_id
-            and fresh.host_id == snapshot.host_id
-            and fresh.workspace == snapshot.workspace
-            and fresh.parent_conversation_id == snapshot.parent_conversation_id
-            and fresh.agent_id == snapshot.agent_id
-            and was_interrupted(fresh, reconciled=True)
+            fresh is None
+            or fresh.runner_id != previous_runner_id
+            or not _same_recovery_location(fresh, snapshot)
+            or not was_interrupted(fresh, reconciled=True)
         ):
-            eligible.append(fresh)
-    if not eligible:
-        return False
-    resume_ids = {conv.id for conv in eligible}
-    # Stop can race the binding CAS; initialization rechecks lifecycle
-    # even if that race leaves an unused replacement runner behind.
-    for conv in [root, *(c for c in eligible if c.id != root.id)]:
-        if is_parent_owned_subagent(conv):
-            mode = "parent"
+            continue
+        chain = [fresh]
+        seen = {fresh.id}
+        while chain[-1].id != root.id:
+            parent_id = chain[-1].parent_conversation_id
+            parent = (
+                await asyncio.to_thread(store.get_conversation, parent_id) if parent_id else None
+            )
+            if (
+                parent is None
+                or parent.id in seen
+                or parent.runner_id != previous_runner_id
+                or not can_restore_session(parent)
+                or (parent.id != root.id and parent.host_id is not None)
+                or (parent.id == root.id and not _same_recovery_location(parent, root))
+            ):
+                break
+            seen.add(parent.id)
+            chain.append(parent)
         else:
-            mode = "resume" if conv.id in resume_ids else "restore"
+            for ancestor in reversed(chain):
+                plan.setdefault(ancestor.id, ancestor)
+            resume_ids.add(fresh.id)
+    if not resume_ids:
+        return False
+
+    claimed: set[str] = set()
+    for snapshot in plan.values():
+        fresh = await asyncio.to_thread(store.get_conversation, snapshot.id)
+        if (
+            fresh is None
+            or fresh.runner_id != previous_runner_id
+            or not _same_recovery_location(fresh, snapshot)
+            or not can_restore_session(fresh)
+            or (fresh.id in resume_ids and not was_interrupted(fresh, reconciled=True))
+            or (fresh.id != root.id and fresh.parent_conversation_id not in claimed)
+        ):
+            continue
+        mode = (
+            "parent"
+            if is_parent_owned_subagent(fresh)
+            else ("resume" if fresh.id in resume_ids else "restore")
+        )
         try:
-            # Stamp before binding so connect sees the mode; a lost CAS leaves
-            # it inert because every consumer matches the embedded runner id.
+            # Connect must see the mode with the new binding. Lost/undone
+            # claims leave it inert because consumers match the runner id.
             await asyncio.to_thread(
-                store.set_labels, conv.id, {RECOVERY_MODE_LABEL: f"{runner_id}:{mode}"}
+                store.set_labels, fresh.id, {RECOVERY_MODE_LABEL: f"{runner_id}:{mode}"}
             )
             rebound = await asyncio.to_thread(
-                store.replace_runner_id, conv.id, runner_id, expected_runner_id=previous_runner_id
+                store.replace_runner_id, fresh.id, runner_id, expected_runner_id=previous_runner_id
             )
         except ConversationNotFoundError:
-            if conv.id == root.id:
-                return False
             continue
-        if conv.id == root.id:
-            if rebound.runner_id != runner_id:
-                return False
-            await asyncio.to_thread(
-                store.set_labels, root.id, {RECOVERY_ATTEMPT_LABEL: str(time.time())}
-            )
+        if rebound.runner_id == runner_id:
+            claimed.add(fresh.id)
+
+    # A Stop, completion, or user rebind can land during any claim above.
+    valid: set[str] = set()
+    for snapshot in plan.values():
+        if snapshot.id not in claimed:
+            continue
+        fresh = await asyncio.to_thread(store.get_conversation, snapshot.id)
+        if (
+            fresh is not None
+            and fresh.runner_id == runner_id
+            and _same_recovery_location(fresh, snapshot)
+            and can_restore_session(fresh)
+            and (fresh.id not in resume_ids or was_interrupted(fresh, reconciled=True))
+            and (fresh.id == root.id or fresh.parent_conversation_id in valid)
+        ):
+            valid.add(fresh.id)
+        else:
+            with suppress(ConversationNotFoundError):
+                await asyncio.to_thread(
+                    store.replace_runner_id,
+                    snapshot.id,
+                    previous_runner_id,
+                    expected_runner_id=runner_id,
+                )
+    fresh_root = await asyncio.to_thread(store.get_conversation, root.id)
+    if (
+        not (resume_ids & valid)
+        or fresh_root is None
+        or fresh_root.runner_id != runner_id
+        or not _same_recovery_location(fresh_root, root)
+        or not can_restore_session(fresh_root)
+    ):
+        await rollback_recovery_bindings(runner_id, previous_runner_id, store)
+        return False
+    await asyncio.to_thread(store.set_labels, root.id, {RECOVERY_ATTEMPT_LABEL: str(time.time())})
     return True
 
 
@@ -253,10 +353,11 @@ class HostRunnerRecovery:
                     last_attempt = float(fresh.labels.get(RECOVERY_ATTEMPT_LABEL, "0"))
                 except ValueError:
                     last_attempt = float("nan")
-                if not math.isfinite(last_attempt):
+                now = time.time()
+                if not math.isfinite(last_attempt) or last_attempt > now:
                     _logger.warning("Ignoring invalid recovery timestamp for %s", root.id)
                     last_attempt = 0
-                if time.time() - last_attempt < RECOVERY_COOLDOWN_S:
+                if now - last_attempt < RECOVERY_COOLDOWN_S:
                     return
             attempt = await _launch_runner_on_host(
                 fresh, self._store, self._hosts, host, recovery_sessions=interrupted

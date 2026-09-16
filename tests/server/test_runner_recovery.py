@@ -36,6 +36,9 @@ class Store:
     def get_conversation(self, session_id: str) -> Conversation | None:
         return copy.deepcopy(self.rows.get(session_id))
 
+    def list_conversations_by_runner_id(self, runner_id: str) -> list[Conversation]:
+        return [copy.deepcopy(c) for c in self.rows.values() if c.runner_id == runner_id]
+
     def set_labels(self, session_id: str, labels: dict[str, str]) -> None:
         self.rows[session_id].labels.update(labels)
 
@@ -298,7 +301,7 @@ async def test_lost_root_cas_does_not_cool_down_user_selected_runner(group, monk
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("lifecycle", ["stopped", "archived", "closed"])
-async def test_lifecycle_change_during_root_cas_prevents_initialization(group, lifecycle):
+async def test_lifecycle_change_during_root_cas_undoes_claims(group, lifecycle):
     parent, child, store = group
     original_replace = store.replace_runner_id
 
@@ -316,14 +319,13 @@ async def test_lifecycle_change_during_root_cas_prevents_initialization(group, l
         return original_replace(session_id, runner_id, **kwargs)
 
     store.replace_runner_id = racing_replace
-    assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    assert not await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
     for session_id in [parent.id, child.id]:
-        assert store.rows[session_id].runner_id == "new"
-        assert not await recovery.may_initialize_session(store.rows[session_id], store)
+        assert store.rows[session_id].runner_id == "old"
 
 
 @pytest.mark.asyncio
-async def test_launch_send_failure_retains_bindings_and_logs_retry(group, monkeypatch, caplog):
+async def test_launch_send_failure_rolls_back_bindings_and_logs_retry(group, monkeypatch, caplog):
     parent, child, store = group
     host = SimpleNamespace(pending_launches={})
 
@@ -340,8 +342,7 @@ async def test_launch_send_failure_retains_bindings_and_logs_retry(group, monkey
     coordinator.schedule("old", [parent, child], [parent, child])
     await asyncio.gather(*coordinator._tasks.values())
     launch.assert_awaited_once()
-    assert store.rows[parent.id].runner_id != "old"
-    assert store.rows[parent.id].runner_id == store.rows[child.id].runner_id
+    assert store.rows[parent.id].runner_id == store.rows[child.id].runner_id == "old"
     assert not host.pending_launches
     assert "host_disconnected" in caplog.text
     assert "explicit Retry" in caplog.text
@@ -377,7 +378,7 @@ async def test_shutdown_closes_scheduling_before_draining_tasks(group, monkeypat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("timestamp", ["bad", "nan", "inf"])
+@pytest.mark.parametrize("timestamp", ["bad", "nan", "inf", "99999999999"])
 async def test_invalid_cooldown_does_not_strand_recovery(group, monkeypatch, caplog, timestamp):
     parent, child, store = group
     store.rows[parent.id].labels.update(
@@ -418,3 +419,118 @@ async def test_cancelled_launch_removes_pending_request(group, monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await launch
     assert not host.pending_launches
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mirrored", [False, True])
+@pytest.mark.parametrize("change", ["stopped", "closed", "archived", "completed"])
+async def test_child_lifecycle_change_during_claim_is_undone(group, mirrored, change):
+    parent, child, store = group
+    if mirrored:
+        store.rows[child.id].labels["omnigent.wrapper"] = "claude-code-native-ui-subagent"
+    original_replace = store.replace_runner_id
+
+    def racing_replace(sid, rid, **kwargs):
+        result = original_replace(sid, rid, **kwargs)
+        if sid == child.id and rid == "new":
+            if change == "completed":
+                store.rows[sid].live_status = "idle"
+            elif change == "archived":
+                store.rows[sid].archived = True
+            else:
+                label = (
+                    recovery.RECOVERY_STOPPED_LABEL if change == "stopped" else "omnigent.closed"
+                )
+                store.rows[sid].labels[label] = "true"
+        return result
+
+    store.replace_runner_id = racing_replace
+    assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    assert store.rows[parent.id].runner_id == "new"
+    assert store.rows[child.id].runner_id == "old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mirrored", [False, True])
+async def test_nested_idle_ancestors_are_restored_without_turn_replay(group, mirrored):
+    parent, child, store = group
+    store.rows[parent.id].live_status = parent.live_status = "idle"
+    intermediate = _conv("intermediate", kind="sub_agent", parent_conversation_id=parent.id)
+    intermediate.live_status = "idle"
+    store.rows[intermediate.id] = intermediate
+    store.rows[child.id].parent_conversation_id = child.parent_conversation_id = intermediate.id
+    if mirrored:
+        for sid in [intermediate.id, child.id]:
+            store.rows[sid].labels["omnigent.wrapper"] = "claude-code-native-ui-subagent"
+    assert await recovery.prepare_recovery_bindings(parent, "new", [child], store)
+    for sid in [parent.id, intermediate.id, child.id]:
+        assert store.rows[sid].runner_id == "new"
+    assert recovery.recovery_suppresses_turn(store.rows[parent.id])
+    assert await recovery.may_initialize_session(store.rows[child.id], store) is not mirrored
+    if mirrored:
+        assert recovery.recovery_waits_for_parent(store.rows[intermediate.id])
+        assert not await recovery.may_initialize_session(store.rows[intermediate.id], store)
+    else:
+        assert recovery.recovery_suppresses_turn(store.rows[intermediate.id])
+
+
+@pytest.mark.asyncio
+async def test_stopped_intermediate_blocks_its_descendants(group):
+    parent, child, store = group
+    intermediate = _conv("intermediate", kind="sub_agent", parent_conversation_id=parent.id)
+    intermediate.labels[recovery.RECOVERY_STOPPED_LABEL] = "true"
+    store.rows[intermediate.id] = intermediate
+    store.rows[child.id].parent_conversation_id = child.parent_conversation_id = intermediate.id
+    assert not await recovery.prepare_recovery_bindings(parent, "new", [child], store)
+    assert all(c.runner_id == "old" for c in store.rows.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["send", "refused"])
+async def test_failed_launch_rollback_preserves_concurrent_user_binding(
+    group, monkeypatch, failure
+):
+    parent, child, store = group
+    host = SimpleNamespace(pending_launches={})
+    stop = AsyncMock()
+    monkeypatch.setattr(helpers, "_spawn_superseded_runner_stop", stop)
+    monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
+
+    def send(*_):
+        store.rows[child.id].runner_id = "user-selected"
+        if failure == "send":
+            raise ConnectionError("offline")
+        for future in host.pending_launches.values():
+            future.set_result({"status": "failed", "error_code": "unconfigured"})
+
+    attempt = await helpers._launch_runner_on_host_impl(
+        parent, store, SimpleNamespace(send_text=send), host, recovery_sessions=[parent, child]
+    )
+    assert attempt.error_code == ("host_disconnected" if failure == "send" else "unconfigured")
+    assert store.rows[parent.id].runner_id == "old"
+    assert store.rows[child.id].runner_id == "user-selected"
+    stop.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_binding_preparation_drains_writes_before_rollback(group, monkeypatch):
+    parent, child, store = group
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def prepare(*_):
+        store.rows[parent.id].runner_id = "new"
+        entered.set()
+        await release.wait()
+        store.rows[child.id].runner_id = "new"
+        return True
+
+    monkeypatch.setattr(recovery, "_prepare_recovery_bindings", prepare)
+    task = asyncio.create_task(
+        recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    )
+    await entered.wait()
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.rows[parent.id].runner_id == store.rows[child.id].runner_id == "old"

@@ -5678,7 +5678,7 @@ async def _launch_runner_on_host_locked(
             conv.id,
             new_runner_id,
         )
-    if superseded_runner_id and conv.host_id is not None:
+    if recovery_sessions is None and superseded_runner_id and conv.host_id is not None:
         # The old runner is unbound as of the replace above; reap it so it
         # doesn't idle on the host forever (tunnel still authenticating,
         # forwarder still tailing this session).
@@ -5726,8 +5726,12 @@ async def _launch_runner_on_host_locked(
             extra={"session_id": conv.id},
         )
         if recovery_sessions is not None:
-            # Retain replacement bindings; explicit Retry can relaunch once
-            # the original host is online again.
+            from omnigent.server.runner_recovery import rollback_recovery_bindings
+
+            assert superseded_runner_id is not None
+            await rollback_recovery_bindings(
+                new_runner_id, superseded_runner_id, conversation_store
+            )
             return _HostLaunchAttempt(
                 runner_id=new_runner_id,
                 error_code="host_disconnected",
@@ -5746,6 +5750,13 @@ async def _launch_runner_on_host_locked(
     finally:
         host_conn.pending_launches.pop(request_id, None)
     if result.get("status") == "failed":
+        if recovery_sessions is not None:
+            from omnigent.server.runner_recovery import rollback_recovery_bindings
+
+            assert superseded_runner_id is not None
+            await rollback_recovery_bindings(
+                new_runner_id, superseded_runner_id, conversation_store
+            )
         return _HostLaunchAttempt(
             runner_id=new_runner_id,
             error_code=result.get("error_code"),

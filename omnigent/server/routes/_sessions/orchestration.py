@@ -10385,7 +10385,7 @@ async def _get_session_snapshot(
     if (
         runner_exit_reports is not None
         and conv.runner_id is not None
-        and (conv.kind != "sub_agent" or status != "idle")
+        and (conv.kind != "sub_agent" or status != "idle" or conv.live_status is None)
     ):
         exit_error = runner_exit_reports.get(conv.runner_id)
         if exit_error is not None:

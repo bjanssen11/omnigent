@@ -470,9 +470,17 @@ async def test_session_snapshot_populates_runner_online_from_session_lookup() ->
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind,expected_status", [("default", "failed"), ("sub_agent", "idle")])
+@pytest.mark.parametrize(
+    "kind,live_status,expected_status",
+    [
+        ("default", "idle", "failed"),
+        ("sub_agent", "idle", "idle"),
+        ("sub_agent", None, "failed"),
+    ],
+)
 async def test_session_snapshot_surfaces_runner_exit_report_as_failed(
     kind: str,
+    live_status: str | None,
     expected_status: str,
 ) -> None:
     """A crashed runner's exit report surfaces as failed + last_task_error.
@@ -494,7 +502,7 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed(
         agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         runner_id="runner_dead",
         kind=kind,
-        live_status="idle",
+        live_status=live_status,
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
@@ -513,7 +521,7 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed(
     # Forced to failed by the exit report even though no task ran and the
     # status cache is empty (a fresh crash before any turn).
     assert snapshot.status == expected_status
-    if kind == "sub_agent":
+    if expected_status == "idle":
         assert snapshot.last_task_error is None
         return
     assert snapshot.last_task_error is not None

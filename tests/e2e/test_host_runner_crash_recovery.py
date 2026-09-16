@@ -40,7 +40,9 @@ def _wait_until(predicate: Callable[[], bool], timeout: float = 60) -> None:
 
 
 @pytest.mark.timeout(240)
-@pytest.mark.parametrize("scenario", ["crash", "parent_stop", "child_stop", "idle_parent"])
+@pytest.mark.parametrize(
+    "scenario", ["crash", "parent_stop", "child_stop", "idle_parent", "nested"]
+)
 def test_host_runner_recovers_group_only_after_crash(
     live_server: str,
     http_client: httpx.Client,
@@ -75,16 +77,17 @@ def test_host_runner_recovers_group_only_after_crash(
             f"/v1/sessions/{parent}", json={"runner_id": original_runner}
         ).raise_for_status()
 
-        def child() -> str:
+        def child(parent_id: str = parent) -> str:
             response = http_client.post(
                 "/v1/sessions",
-                json={"agent_id": agent_id, "parent_session_id": parent},
+                json={"agent_id": agent_id, "parent_session_id": parent_id},
                 headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
             )
             response.raise_for_status()
             return response.json()["id"]
 
-        worker, completed = child(), child()
+        intermediate = child() if scenario == "nested" else None
+        worker, completed = child(intermediate or parent), child()
 
         def snapshot(session_id: str) -> dict:
             response = http_client.get(f"/v1/sessions/{session_id}")
@@ -108,7 +111,20 @@ def test_host_runner_recovers_group_only_after_crash(
             )
         )
 
-        parent_idle = scenario == "idle_parent"
+        if intermediate is not None:
+            token = f"intermediate-{uuid.uuid4().hex}"
+            configure_mock_llm(
+                mock_llm_server_url, [{"text": "INTERMEDIATE_FINISHED"}], match=token
+            )
+            send_user_message_to_session(http_client, session_id=intermediate, content=token)
+            _wait_until(
+                lambda: (
+                    "INTERMEDIATE_FINISHED" in transcript(intermediate)
+                    and snapshot(intermediate)["status"] == "idle"
+                )
+            )
+
+        parent_idle = scenario in {"idle_parent", "nested"}
         if parent_idle:
             token = f"idle-parent-{uuid.uuid4().hex}"
             configure_mock_llm(mock_llm_server_url, [{"text": "PARENT_FINISHED"}], match=token)
@@ -187,6 +203,10 @@ def test_host_runner_recovers_group_only_after_crash(
             else:
                 assert recovered_parent["runner_id"] == snapshot(worker)["runner_id"]
                 assert transcript(worker).count("CHILD_RECOVERED") == 1
+        if intermediate is not None:
+            assert snapshot(intermediate)["runner_id"] == snapshot(parent)["runner_id"]
+            assert snapshot(intermediate)["status"] == "idle"
+            assert transcript(intermediate).count("INTERMEDIATE_FINISHED") == 1
         assert snapshot(completed)["runner_id"] == original_runner
         assert snapshot(completed)["status"] == "idle"
         assert transcript(completed).count("ALREADY_FINISHED") == 1
