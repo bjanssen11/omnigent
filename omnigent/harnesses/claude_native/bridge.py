@@ -53,7 +53,7 @@ from http import HTTPStatus
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 from urllib import request
 
 from omnigent._platform import is_wsl, stable_user_id
@@ -5174,6 +5174,47 @@ def _format_terminal_failure_tail(pane: str) -> str:
     return f" Last terminal output:\n{tail}"
 
 
+# Text an interactive auth or consent step leaves on screen while it waits for
+# the user. Claude Code has not started yet, so its prompt cannot render and the
+# readiness gate times out — a step the user has to finish, not a harness fault.
+_PANE_AWAITING_USER_MARKERS: Final[tuple[str, ...]] = (
+    "dbcert:",
+    "Running dbcert",
+    "Logging in via SSO",
+    "If the browser does not open automatically",
+    "Select login method",
+    "Press Enter to continue",
+    "(y/n)",
+    "[Y/n]",
+    "[y/N]",
+    "Enter your password",
+    "Passcode or option",
+)
+
+
+def _stalled_pane_state(pane: str, *, polls: int, empty_polls: int) -> str:
+    """Name why the readiness poll never saw Claude Code's input prompt.
+
+    Groups the timeout by cause instead of leaving every occurrence to be read
+    from its own pane tail: without this every stall is one undifferentiated
+    signature whose only distinguishing text is the user's screen contents.
+
+    :param pane: Last non-empty captured pane text.
+    :param polls: Readiness polls performed before the deadline, e.g. ``198``.
+    :param empty_polls: How many of those captures came back blank.
+    :returns: A short state slug, e.g. ``"awaiting-user-input"``.
+    """
+    if any(marker in pane for marker in _PANE_AWAITING_USER_MARKERS):
+        return "awaiting-user-input"
+    if not pane.strip():
+        return "pane-never-rendered"
+    # Mostly-blank captures are a torn read under a busy repaint, not a pane
+    # that stayed empty; the session is alive and drawing.
+    if polls and empty_polls >= polls / 2:
+        return "captures-mostly-empty"
+    return "prompt-absent-from-pane"
+
+
 def _wait_for_claude_prompt_ready(
     socket_path: str,
     tmux_target: str,
@@ -5251,9 +5292,18 @@ def _wait_for_claude_prompt_ready(
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     waited_s = time.monotonic() - started
+    state = _stalled_pane_state(last_nonempty, polls=polls, empty_polls=empty_polls)
+    if state == "awaiting-user-input":
+        # Name the step the user has to finish; the pane tail shows which one.
+        raise ClaudePromptTimeout(
+            f"The terminal is waiting on an interactive prompt, so Claude Code has "
+            f"not started yet (state={state}, waited {waited_s:.1f}s). Finish it in "
+            f"the terminal, then send the message again."
+            + _format_terminal_failure_tail(last_nonempty)
+        )
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
-        f"(input prompt never rendered in {polls} polls, "
+        f"(state={state}, input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
         + _format_terminal_failure_tail(last_nonempty)
     )
