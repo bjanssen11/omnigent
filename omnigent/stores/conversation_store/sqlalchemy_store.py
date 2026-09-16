@@ -1395,6 +1395,26 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._conv_session_immediate, "set_labels", write)
 
+    def compare_and_set_label(
+        self, conversation_id: str, key: str, expected_value: str, value: str
+    ) -> bool:
+        """Conditionally update a label in its owning database with one SQL write."""
+
+        def write(session: Session) -> bool:
+            result = session.execute(
+                update(SqlConversationLabel)
+                .where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key == key,
+                    SqlConversationLabel.value == expected_value,
+                )
+                .values(value=value[:LABEL_VALUE_MAX_LEN], updated_at=now_epoch())
+            )
+            return cast(_RowCountResult, result).rowcount == 1
+
+        return run_write_transaction(self._conv_session_immediate, "compare_and_set_label", write)
+
     def set_session_state(
         self,
         conversation_id: str,

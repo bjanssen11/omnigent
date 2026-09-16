@@ -2276,8 +2276,10 @@ def register_core_routes(
             ) from exc
 
         if body.runner_id is not None:
+            from omnigent.server.runner_recovery import clear_observed_recovery_stop
             from omnigent.server.runner_session_init import runner_binding_locks
 
+            observed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             async with runner_binding_locks(
                 session_id, body.runner_id.strip() or None, conversation_store
             ):
@@ -2294,6 +2296,8 @@ def register_core_routes(
                     runner_id = _sf._registered_runner_id(
                         runner_router, body.runner_id, user_id=user_id
                     )
+                    if observed is not None:
+                        await clear_observed_recovery_stop(observed, conversation_store)
                     try:
                         await asyncio.to_thread(
                             conversation_store.replace_runner_id, session_id, runner_id

@@ -54,8 +54,34 @@ def can_restore_session(conv: Conversation) -> bool:
         conv.agent_id is not None
         and not conv.archived
         and not is_session_closed(conv.labels, conv.title)
-        and conv.labels.get(RECOVERY_STOPPED_LABEL) != "true"
+        and not recovery_is_stopped(conv)
     )
+
+
+def recovery_is_stopped(conv: Conversation) -> bool:
+    """Recognize both legacy Stop flags and unique tokens preventing stale clears."""
+    value = conv.labels.get(RECOVERY_STOPPED_LABEL, "")
+    return value == "true" or value.startswith("true:")
+
+
+async def clear_observed_recovery_stop(conv: Conversation, store: ConversationStore) -> None:
+    """Explicit resume may clear its observed Stop, never a newer Stop token."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    if not recovery_is_stopped(conv):
+        return
+    if not await asyncio.to_thread(
+        store.compare_and_set_label,
+        conv.id,
+        RECOVERY_STOPPED_LABEL,
+        conv.labels[RECOVERY_STOPPED_LABEL],
+        "",
+    ):
+        raise OmnigentError(
+            "Stop intent changed while resuming; retry your input.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    conv.labels.pop(RECOVERY_STOPPED_LABEL, None)
 
 
 def was_interrupted(conv: Conversation, *, reconciled: bool = False) -> bool:

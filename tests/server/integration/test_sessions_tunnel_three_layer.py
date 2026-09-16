@@ -2100,7 +2100,9 @@ async def test_stop_waits_for_reconnect_initialization_before_delivery(
         async def wait_for_stop_intent():
             while True:
                 row = await asyncio.to_thread(store.get_conversation, sid)
-                if row is not None and row.labels.get(RECOVERY_STOPPED_LABEL) == "true":
+                if row is not None and row.labels.get(RECOVERY_STOPPED_LABEL, "").startswith(
+                    "true:"
+                ):
                     return
                 await asyncio.sleep(0.01)
 
@@ -2135,6 +2137,7 @@ async def test_patch_binding_waits_for_runner_lifecycle(
     store = get_conversation_store()
     entered = asyncio.Event()
     mutations = []
+    store.set_labels(sid, {"omnigent.runner_recovery.stopped": "true:observed"})
     original_guard = runner_session_init.runner_binding_locks
     original_mutate = store.clear_runner_id if not target else store.replace_runner_id
 
@@ -2162,3 +2165,4 @@ async def test_patch_binding_waits_for_runner_lifecycle(
     assert mutations
     row = store.get_conversation(sid)
     assert row is not None and row.runner_id == (target or None)
+    assert bool(row.labels.get("omnigent.runner_recovery.stopped")) is (not target)

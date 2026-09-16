@@ -9552,7 +9552,7 @@ async def test_stop_session_forwards_stop_session_event_to_runner(
         f"runner; got {events_forwards[0].body!r}"
     )
     stopped = await client.get(f"/v1/sessions/{session['id']}")
-    assert stopped.json()["labels"]["omnigent.runner_recovery.stopped"] == "true"
+    assert stopped.json()["labels"]["omnigent.runner_recovery.stopped"].startswith("true:")
 
 
 @pytest.mark.parametrize(
@@ -9635,7 +9635,7 @@ async def test_stop_session_surfaces_runner_failure_as_error(
         "a failed stop_session must remove the interrupt fence it installed"
     )
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
-    assert snapshot.json()["labels"]["omnigent.runner_recovery.stopped"] == "true"
+    assert snapshot.json()["labels"]["omnigent.runner_recovery.stopped"].startswith("true:")
 
 
 async def test_stop_session_no_runner_lifts_stop_fence(
@@ -9674,7 +9674,7 @@ async def test_stop_session_no_runner_lifts_stop_fence(
         )
         # Persist Stop intent so a delayed crash report cannot restart this session.
         snapshot = await client.get(f"/v1/sessions/{session_id}")
-        assert snapshot.json()["labels"]["omnigent.runner_recovery.stopped"] == "true"
+        assert snapshot.json()["labels"]["omnigent.runner_recovery.stopped"].startswith("true:")
     finally:
         if session_id is not None:
             _interrupt_fenced_sessions.discard(session_id)
@@ -9754,7 +9754,7 @@ async def test_retry_session_ensures_dead_required_native_terminal_once(
     relay_ready.assert_awaited_once()
     after = await client.get(f"/v1/sessions/{session['id']}")
     assert after.json()["items"] == before_items
-    assert after.json()["labels"].get("omnigent.runner_recovery.stopped") != "true"
+    assert not after.json()["labels"].get("omnigent.runner_recovery.stopped")
 
 
 async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
@@ -11951,4 +11951,42 @@ async def test_failed_stop_does_not_overwrite_newer_recovery_intent(
     assert response.status_code == 503
     fresh = get_conversation_store().get_conversation(sid)
     assert fresh is not None
-    assert fresh.labels[RECOVERY_STOPPED_LABEL] == ("true" if newer_intent == "stop" else "")
+    assert fresh.labels[RECOVERY_STOPPED_LABEL].startswith("true:") is (newer_intent == "stop")
+
+
+@pytest.mark.parametrize("action", ["retry_session", "message", "rebind"])
+async def test_stale_resume_does_not_clear_newer_stop(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions
+    from omnigent.server.runner_recovery import RECOVERY_STOPPED_LABEL
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    store = get_conversation_store()
+    store.set_labels(sid, {RECOVERY_STOPPED_LABEL: "true:older"})
+    original_cas = type(store).compare_and_set_label
+
+    def newer_stop_before_clear(self, conv_id, key, expected, value):
+        self.set_labels(sid, {RECOVERY_STOPPED_LABEL: "true:newer"})
+        return original_cas(self, conv_id, key, expected, value)
+
+    monkeypatch.setattr(type(store), "compare_and_set_label", newer_stop_before_clear)
+    if action == "rebind":
+        monkeypatch.setattr(sessions, "_registered_runner_id", lambda *args, **kwargs: "new")
+        response = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "new"})
+    else:
+        data = (
+            {"role": "user", "content": [{"type": "input_text", "text": "resume"}]}
+            if action == "message"
+            else {}
+        )
+        response = await client.post(
+            f"/v1/sessions/{sid}/events", json={"type": action, "data": data}
+        )
+    assert response.status_code == 503, response.text
+    fresh = store.get_conversation(sid)
+    assert fresh is not None and fresh.labels[RECOVERY_STOPPED_LABEL] == "true:newer"
+    assert not store.list_items(sid).data

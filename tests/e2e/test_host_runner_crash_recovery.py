@@ -161,7 +161,9 @@ def test_host_runner_recovers_group_only_after_crash(
                 f"/v1/sessions/{stopped_id}/events", json={"type": "stop_session", "data": {}}
             )
             response.raise_for_status()
-            assert snapshot(stopped_id)["labels"]["omnigent.runner_recovery.stopped"] == "true"
+            assert snapshot(stopped_id)["labels"]["omnigent.runner_recovery.stopped"].startswith(
+                "true:"
+            )
         if scenario == "parent_stop":
             # Parent Stop terminates the dedicated runner itself.
             time.sleep(12)

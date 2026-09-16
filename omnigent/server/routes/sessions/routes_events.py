@@ -717,12 +717,9 @@ def register_events_routes(
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         if body.type == _RETRY_SESSION_TYPE:
-            from omnigent.server.runner_recovery import RECOVERY_STOPPED_LABEL
+            from omnigent.server.runner_recovery import clear_observed_recovery_stop
 
-            if conv.labels.get(RECOVERY_STOPPED_LABEL) == "true":
-                await asyncio.to_thread(
-                    conversation_store.set_labels, session_id, {RECOVERY_STOPPED_LABEL: ""}
-                )
+            await clear_observed_recovery_stop(conv, conversation_store)
             return await _retry_session_single_flight(
                 request=request,
                 session_id=session_id,
@@ -1049,7 +1046,9 @@ def register_events_routes(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
             await asyncio.to_thread(
-                conversation_store.set_labels, session_id, {RECOVERY_STOPPED_LABEL: "true"}
+                conversation_store.set_labels,
+                session_id,
+                {RECOVERY_STOPPED_LABEL: f"true:{secrets.token_hex(16)}"},
             )
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
@@ -1790,13 +1789,9 @@ def register_events_routes(
                 ) from exc
             return {"queued": True, "item_id": body.data["call_id"]}
         if body.type == "message" and body.data.get("role") == "user":
-            from omnigent.server.runner_recovery import RECOVERY_STOPPED_LABEL
+            from omnigent.server.runner_recovery import clear_observed_recovery_stop
 
-            if conv.labels.get(RECOVERY_STOPPED_LABEL) == "true":
-                await asyncio.to_thread(
-                    conversation_store.set_labels, session_id, {RECOVERY_STOPPED_LABEL: ""}
-                )
-                conv.labels.pop(RECOVERY_STOPPED_LABEL, None)
+            await clear_observed_recovery_stop(conv, conversation_store)
         # Whether the runner was initially unavailable or was woken below. In
         # that case the session-init handshake may still be racing the first
         # message, even if we reused the original binding instead of launching
@@ -2086,7 +2081,7 @@ def register_events_routes(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
-        from omnigent.server.runner_recovery import RECOVERY_MODE_LABEL, RECOVERY_STOPPED_LABEL
+        from omnigent.server.runner_recovery import RECOVERY_MODE_LABEL, recovery_is_stopped
         from omnigent.server.runner_session_init import runner_lifecycle_lock
 
         recovery_init = conv.labels.get(RECOVERY_MODE_LABEL) in {
@@ -2104,10 +2099,7 @@ def register_events_routes(
                 fresh = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if fresh is None:
                     raise _session_not_found()
-                if (
-                    fresh.runner_id != conv.runner_id
-                    or fresh.labels.get(RECOVERY_STOPPED_LABEL) == "true"
-                ):
+                if fresh.runner_id != conv.runner_id or recovery_is_stopped(fresh):
                     raise OmnigentError(
                         "Session stopped or moved while awaiting initialization; retry your input.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,

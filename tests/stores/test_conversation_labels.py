@@ -489,3 +489,23 @@ def test_fork_does_not_inherit_archived_at_label(
     forked = conversation_store.get_conversation(fork.id)
     assert forked is not None
     assert ARCHIVED_AT_LABEL_KEY not in forked.labels
+
+
+@pytest.mark.parametrize("expected", ["true", "true:current", "true:older"])
+def test_compare_and_set_label_preserves_newer_value_and_other_sessions(
+    conversation_store: SqlAlchemyConversationStore, expected: str
+) -> None:
+    first = conversation_store.create_conversation()
+    second = conversation_store.create_conversation()
+    current = "true" if expected == "true" else "true:current"
+    for conv in (first, second):
+        conversation_store.set_labels(conv.id, {"stop": current, "other": "unchanged"})
+    assert conversation_store.compare_and_set_label(first.id, "stop", expected, "") is (
+        expected == current
+    )
+    row = conversation_store.get_conversation(first.id)
+    other = conversation_store.get_conversation(second.id)
+    assert row is not None and other is not None
+    assert row.labels == {"stop": "" if expected == current else current, "other": "unchanged"}
+    assert other.labels == {"stop": current, "other": "unchanged"}
+    assert not conversation_store.compare_and_set_label(first.id, "missing", "", "new")
