@@ -347,7 +347,7 @@ async def reconcile_recovery_launch(
     store: ConversationStore,
     hosts: HostRegistry,
 ) -> bool:
-    """Reap a confirmed launch whose root moved while the host was spawning."""
+    """Reap a launch whose root moved while the host was spawning."""
     from omnigent.server.routes._sessions.helpers import _spawn_superseded_runner_stop
 
     if root.runner_id is None or root.host_id is None:
@@ -367,7 +367,7 @@ async def reconcile_recovery_launch(
         store.list_conversations_by_runner_id, replacement_runner_id
     )
     if not remaining:
-        _spawn_superseded_runner_stop(root.id, root.host_id, replacement_runner_id, hosts)
+        _spawn_superseded_runner_stop(root.id, root.host_id, replacement_runner_id, hosts, store)
     else:
         _logger.warning(
             "Retaining superseded recovery runner %s: other sessions still use it",
@@ -486,14 +486,19 @@ class HostRunnerRecovery:
                     ):
                         attempt.error_code = "recovery_superseded"
                 except asyncio.TimeoutError:
-                    _logger.warning(
-                        "Recovery launch outcome unknown for %s; retaining bindings; "
-                        "use explicit Retry if the session remains disconnected",
-                        root.id,
-                    )
+                    if await reconcile_recovery_launch(
+                        fresh, attempt.runner_id, self._store, self._hosts
+                    ):
+                        _logger.warning(
+                            "Recovery launch outcome unknown for %s; retaining bindings; "
+                            "use explicit Retry if the session remains disconnected",
+                            root.id,
+                        )
+                    else:
+                        attempt.error_code = "recovery_superseded"
                 finally:
-                    # Timeout/shutdown does not prove launch failed. A runner
-                    # already started by the host must retain its bindings.
+                    # Unknown outcomes retain eligible bindings; only a
+                    # definitive lifecycle/ownership change permits cleanup.
                     host.pending_launches.pop(request_id, None)
                     attempt.pending_launch = None
                     if not result_future.done():

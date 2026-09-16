@@ -702,8 +702,8 @@ async def test_initialization_rechecks_target_after_ancestor_read(group, change)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("late", [False, True])
-async def test_recovery_reaps_launch_when_root_moves_during_send(group, monkeypatch, late):
+@pytest.mark.parametrize("outcome", ["immediate", "late", "unknown"])
+async def test_recovery_reaps_launch_when_root_moves_during_send(group, monkeypatch, outcome):
     import json
 
     parent, child, store = group
@@ -718,7 +718,7 @@ async def test_recovery_reaps_launch_when_root_moves_during_send(group, monkeypa
         replacement = store.rows[parent.id].runner_id
         store.rows[parent.id].runner_id = "user-selected"
         sent.set()
-        if not late:
+        if outcome == "immediate":
             host.pending_launches[frame["request_id"]].set_result({"status": "launched"})
 
     hosts = SimpleNamespace(get=lambda _: host, send_text=send)
@@ -727,11 +727,12 @@ async def test_recovery_reaps_launch_when_root_moves_during_send(group, monkeypa
     monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
     monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
     monkeypatch.setattr(helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(recovery, "RECOVERY_RESULT_GRACE_S", 0.05)
     monkeypatch.setattr(sessions, "_launch_runner_on_host", helpers._launch_runner_on_host_impl)
     coordinator = recovery.HostRunnerRecovery(store, hosts)
     coordinator.schedule("old", [parent, child], [parent, child])
     await sent.wait()
-    if late:
+    if outcome == "late":
         await asyncio.sleep(0.03)
         next(iter(host.pending_launches.values())).set_result({"status": "launched"})
     await asyncio.gather(*coordinator._tasks.values())
@@ -780,3 +781,19 @@ async def test_launch_rider_receives_snapshot_without_pending_result_ownership(g
     finally:
         future.cancel()
         helpers._relaunch_last_attempt.pop(parent.id, None)
+
+
+@pytest.mark.asyncio
+async def test_deferred_cleanup_rechecks_bindings_before_stop(group, monkeypatch):
+    from omnigent.server.runner_session_init import runner_lifecycle_lock
+
+    parent, _, store = group
+    stop = AsyncMock(return_value=True)
+    monkeypatch.setattr(helpers, "_stop_session_host_runner", stop)
+    async with runner_lifecycle_lock("new"):
+        helpers._spawn_superseded_runner_stop(
+            parent.id, parent.host_id, "new", SimpleNamespace(), store
+        )
+        store.rows[parent.id].runner_id = "new"
+    await asyncio.gather(*helpers._detached_supersede_stops)
+    stop.assert_not_awaited()

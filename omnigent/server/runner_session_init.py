@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import weakref
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import TYPE_CHECKING
 
 import httpx
@@ -13,6 +15,7 @@ from omnigent.runner.session_init_protocol import build_runner_session_init_payl
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.stores.conversation_store import ConversationStore
 
 
 # custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
@@ -22,6 +25,25 @@ _lifecycle_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakV
 def runner_lifecycle_lock(runner_id: str) -> asyncio.Lock:
     """Order reconnect initialization and Stop for all sessions sharing a runner."""
     return _lifecycle_locks.setdefault(runner_id, asyncio.Lock())
+
+
+@asynccontextmanager
+async def runner_binding_locks(
+    session_id: str, target_runner_id: str | None, store: ConversationStore
+) -> AsyncIterator[None]:
+    """Order local rebindings against initialization on both runner generations."""
+    while True:
+        before = await asyncio.to_thread(store.get_conversation, session_id)
+        previous = before.runner_id if before is not None else None
+        keys = {f"session:{session_id}", *filter(None, (previous, target_runner_id))}
+        async with AsyncExitStack() as stack:
+            for key in sorted(keys):
+                await stack.enter_async_context(runner_lifecycle_lock(key))
+            fresh = await asyncio.to_thread(store.get_conversation, session_id)
+            if fresh is not None and fresh.runner_id not in {None, previous}:
+                continue
+            yield
+            return
 
 
 class RunnerSessionInitializer:

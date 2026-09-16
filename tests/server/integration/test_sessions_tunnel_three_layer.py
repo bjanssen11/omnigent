@@ -2116,3 +2116,49 @@ async def test_stop_waits_for_reconnect_initialization_before_delivery(
         await asyncio.gather(
             reconnect_task, *([stop_task] if stop_task else []), return_exceptions=True
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["", _RUNNER_ID])
+async def test_patch_binding_waits_for_runner_lifecycle(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import runner_session_init
+
+    stack = tunnel_three_layer_stack
+    sid = await _bind_failed_session(
+        stack.ap_client, error_code="runner_disconnected", error_message="Previous failure"
+    )
+    store = get_conversation_store()
+    entered = asyncio.Event()
+    mutations = []
+    original_guard = runner_session_init.runner_binding_locks
+    original_mutate = store.clear_runner_id if not target else store.replace_runner_id
+
+    @contextlib.asynccontextmanager
+    async def observed_guard(*args):
+        entered.set()
+        async with original_guard(*args):
+            yield
+
+    def mutate(*args, **kwargs):
+        mutations.append(args)
+        return original_mutate(*args, **kwargs)
+
+    monkeypatch.setattr(runner_session_init, "runner_binding_locks", observed_guard)
+    monkeypatch.setattr(store, "clear_runner_id" if not target else "replace_runner_id", mutate)
+    async with runner_session_init.runner_lifecycle_lock(_RUNNER_ID):
+        patch_task = asyncio.create_task(
+            stack.ap_client.patch(f"/v1/sessions/{sid}", json={"runner_id": target})
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        assert not mutations
+        assert not patch_task.done()
+    response = await asyncio.wait_for(patch_task, 15)
+    assert response.status_code == 200, response.text
+    assert mutations
+    row = store.get_conversation(sid)
+    assert row is not None and row.runner_id == (target or None)

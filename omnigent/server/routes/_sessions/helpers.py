@@ -5521,6 +5521,7 @@ def _spawn_superseded_runner_stop(
     host_id: str,
     runner_id: str,
     host_registry: HostRegistry,
+    unbound_store: ConversationStore | None = None,
 ) -> None:
     """
     Stop a relaunch's superseded runner as a retained background task.
@@ -5539,17 +5540,27 @@ def _spawn_superseded_runner_stop(
     :param host_id: The session's owning host.
     :param runner_id: The superseded runner's id.
     :param host_registry: Registry holding the live host tunnel.
+    :param unbound_store: For recovery cleanup, recheck that no sessions use this runner.
     """
 
     async def _stop_and_log() -> None:
         try:
-            await _stop_session_host_runner(
-                session_id,
-                host_id,
-                runner_id,
-                host_registry,
-                expect_already_stopped=True,
-            )
+            from omnigent.server.runner_session_init import runner_lifecycle_lock
+
+            async with contextlib.AsyncExitStack() as lifecycle:
+                if unbound_store is not None:
+                    await lifecycle.enter_async_context(runner_lifecycle_lock(runner_id))
+                    if await asyncio.to_thread(
+                        unbound_store.list_conversations_by_runner_id, runner_id
+                    ):
+                        return
+                await _stop_session_host_runner(
+                    session_id,
+                    host_id,
+                    runner_id,
+                    host_registry,
+                    expect_already_stopped=True,
+                )
         except Exception:  # noqa: BLE001 — must never die unobserved
             _logger.warning(
                 "Superseded-runner stop failed for session %s runner %s; "

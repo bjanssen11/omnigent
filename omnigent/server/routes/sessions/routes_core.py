@@ -2276,80 +2276,91 @@ def register_core_routes(
             ) from exc
 
         if body.runner_id is not None:
-            # Empty string is the clear sentinel (None = leave unchanged);
-            # used by /clear and /switch to move the runner between sessions.
-            if body.runner_id == "":
-                try:
-                    await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
-                except ConversationNotFoundError as exc:
-                    raise _session_not_found() from exc
-            else:
-                from omnigent.server.routes import sessions as _sf
+            from omnigent.server.runner_session_init import runner_binding_locks
 
-                runner_id = _sf._registered_runner_id(
-                    runner_router, body.runner_id, user_id=user_id
-                )
-                try:
-                    await asyncio.to_thread(
-                        conversation_store.replace_runner_id, session_id, runner_id
-                    )
-                except ConversationNotFoundError as exc:
-                    raise _session_not_found() from exc
-                _runner_client = await _get_runner_client(
-                    session_id,
-                    runner_router,
-                )
-                # Notify the runner about the session so it can
-                # resolve the spec and cache it before the first turn.
-                # This is the design doc's "Server POST /v1/sessions
-                # (to runner)" step from §7 Flow: session creation.
-                conv = conversation_store.get_conversation(
-                    session_id,
-                )
-                if _runner_client is not None and conv is not None and conv.agent_id is not None:
-                    # The versioned payload's snapshot carries harness_override,
-                    # so a rebind after a cross-harness create initializes the
-                    # override harness — a bare body left the runner resolving
-                    # from the spec, and the recovery turn that executes seeded
-                    # initial_items ran on the spec's harness. Recovery stays
-                    # enabled: on rebind it is what runs the pending kickoff.
+            async with runner_binding_locks(
+                session_id, body.runner_id.strip() or None, conversation_store
+            ):
+                # Empty string is the clear sentinel (None = leave unchanged);
+                # used by /clear and /switch to move the runner between sessions.
+                if body.runner_id == "":
                     try:
-                        runner_init_resp = await _runner_client.post(
-                            "/v1/sessions",
-                            json=build_runner_session_init_payload(
-                                conv,
-                                server_version=VERSION,
-                            ),
-                            timeout=10.0,
+                        await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                    except ConversationNotFoundError as exc:
+                        raise _session_not_found() from exc
+                else:
+                    from omnigent.server.routes import sessions as _sf
+
+                    runner_id = _sf._registered_runner_id(
+                        runner_router, body.runner_id, user_id=user_id
+                    )
+                    try:
+                        await asyncio.to_thread(
+                            conversation_store.replace_runner_id, session_id, runner_id
                         )
-                        if runner_init_resp.status_code < 400:
-                            await _publish_runner_recovered_status(session_id, conversation_store)
-                    except (httpx.HTTPError, ConnectionError):
-                        # ConnectionError covers a tunnel close mid-POST
-                        # (same source as the relay's except clause).
-                        _logger.warning(
-                            "Failed to notify runner about session %s",
-                            session_id,
-                            exc_info=True,
-                        )
-                if _runner_client is None:
-                    # Runner deregistered between validation and
-                    # lookup; PATCH still returns 200 but no
-                    # relay starts, so log the silent-skip case.
-                    _logger.warning(
-                        "PATCH rebind to %s on session %s: no runner "
-                        "client resolved; relay not restarted.",
-                        runner_id,
+                    except ConversationNotFoundError as exc:
+                        raise _session_not_found() from exc
+                    _runner_client = await _get_runner_client(
+                        session_id,
+                        runner_router,
+                    )
+                    # Notify the runner about the session so it can
+                    # resolve the spec and cache it before the first turn.
+                    # This is the design doc's "Server POST /v1/sessions
+                    # (to runner)" step from §7 Flow: session creation.
+                    conv = conversation_store.get_conversation(
                         session_id,
                     )
-                # Restart the relay for the new runner; replaces
-                # any relay still pointing at the prior runner.
-                await _ensure_runner_relay_ready(
-                    session_id,
-                    runner_id,
-                    _runner_client,
-                    conversation_store,
-                )
+                    if (
+                        _runner_client is not None
+                        and conv is not None
+                        and conv.agent_id is not None
+                    ):
+                        # The versioned payload's snapshot carries harness_override,
+                        # so a rebind after a cross-harness create initializes the
+                        # override harness — a bare body left the runner resolving
+                        # from the spec, and the recovery turn that executes seeded
+                        # initial_items ran on the spec's harness. Recovery stays
+                        # enabled: on rebind it is what runs the pending kickoff.
+                        try:
+                            runner_init_resp = await _runner_client.post(
+                                "/v1/sessions",
+                                json=build_runner_session_init_payload(
+                                    conv,
+                                    server_version=VERSION,
+                                ),
+                                timeout=10.0,
+                            )
+                            if runner_init_resp.status_code < 400:
+                                await _publish_runner_recovered_status(
+                                    session_id, conversation_store
+                                )
+                        except (httpx.HTTPError, ConnectionError):
+                            # ConnectionError covers a tunnel close mid-POST
+                            # (same source as the relay's except clause).
+                            _logger.warning(
+                                "Failed to notify runner about session %s",
+                                session_id,
+                                exc_info=True,
+                            )
+                    if _runner_client is None:
+                        # Runner deregistered between validation and
+                        # lookup; PATCH still returns 200 but no
+                        # relay starts, so log the silent-skip case.
+                        _logger.warning(
+                            "PATCH rebind to %s on session %s: no runner "
+                            "client resolved; relay not restarted.",
+                            runner_id,
+                            session_id,
+                        )
+                    # Restart the relay for the new runner; replaces
+                    # any relay still pointing at the prior runner.
+                    await _ensure_runner_relay_ready(
+                        session_id,
+                        runner_id,
+                        _runner_client,
+                        conversation_store,
+                    )
         else:
             conv = conv_for_collaboration_mode
             if conv is None:

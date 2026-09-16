@@ -2093,11 +2093,14 @@ def register_events_routes(
             f"{conv.runner_id}:resume",
             f"{conv.runner_id}:restore",
         }
-        native_terminal_ready = False
-        if _runner_needs_session_init or recovery_init:
-            # A registered tunnel can still be initializing. Await its shared
-            # handshake before persistence so recovery cannot replay this input.
-            async with runner_lifecycle_lock(conv.runner_id or session_id):
+        async with contextlib.AsyncExitStack() as lifecycle:
+            native_terminal_ready = False
+            if _runner_needs_session_init or recovery_init:
+                # A registered tunnel can still be initializing. Await its shared
+                # handshake before persistence so recovery cannot replay this input.
+                await lifecycle.enter_async_context(
+                    runner_lifecycle_lock(conv.runner_id or session_id)
+                )
                 fresh = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if fresh is None:
                     raise _session_not_found()
@@ -2117,107 +2120,107 @@ def register_events_routes(
                     initializer=getattr(request.app.state, "runner_session_initializer", None),
                     suppress_recovery_turn=True,
                 )
-        await _ensure_runner_relay_ready(
-            session_id,
-            conv.runner_id,
-            runner_client,
-            conversation_store,
-        )
-        _agent = agent_store.get(conv.agent_id) if conv.agent_id else None
-        # Determine whether the agent has MCP servers so the runner's
-        # proxy_stream handler knows to initialise ProxyMcpManager.
-        # agent_cache.load() is O(1) on a warm in-memory cache; the
-        # asyncio.to_thread wrapper covers the rare cold-cache path
-        # where the bundle is extracted from disk for the first time.
-        _has_mcp_servers = False
-        if _agent is not None and agent_cache is not None and _agent.bundle_location:
-            try:
-                _loaded_agent = await asyncio.to_thread(
-                    agent_cache.load,
-                    _agent.id,
-                    _agent.bundle_location,
-                )
-                _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
-            except Exception:
-                _logger.warning(
-                    "Failed to load agent spec for MCP hint for session=%s",
+            await _ensure_runner_relay_ready(
+                session_id,
+                conv.runner_id,
+                runner_client,
+                conversation_store,
+            )
+            _agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+            # Determine whether the agent has MCP servers so the runner's
+            # proxy_stream handler knows to initialise ProxyMcpManager.
+            # agent_cache.load() is O(1) on a warm in-memory cache; the
+            # asyncio.to_thread wrapper covers the rare cold-cache path
+            # where the bundle is extracted from disk for the first time.
+            _has_mcp_servers = False
+            if _agent is not None and agent_cache is not None and _agent.bundle_location:
+                try:
+                    _loaded_agent = await asyncio.to_thread(
+                        agent_cache.load,
+                        _agent.id,
+                        _agent.bundle_location,
+                    )
+                    _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
+                except Exception:
+                    _logger.warning(
+                        "Failed to load agent spec for MCP hint for session=%s",
+                        session_id,
+                        exc_info=True,
+                    )
+            pending_background_title = prepare_background_session_title(
+                coordinator=background_title_coordinator,
+                conversation=conv,
+                event=body,
+                enabled=background_session_titles_enabled(request.headers),
+            )
+            # Schedule display-name generation for child sessions (the
+            # title coordinator skips children because their title is
+            # the stable spawn-or-continue key).
+            if (
+                conv.parent_conversation_id is not None
+                and conv.task_summary is None
+                and background_title_coordinator is not None
+            ):
+                _prompt_for_display = background_title_prompt(body)
+                if _prompt_for_display:
+                    schedule_background_child_task_summary(
+                        coordinator=background_title_coordinator,
+                        session_id=session_id,
+                        prompt=_prompt_for_display,
+                        agent_id=conv.agent_id,
+                        sub_agent_name=conv.sub_agent_name,
+                    )
+            if body.type == _SLASH_COMMAND_TYPE:
+                if _agent is None:
+                    raise OmnigentError(
+                        f"Session {session_id!r} has no agent; cannot run slash command",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                item_id = await _dispatch_skill_slash_command_to_runner(
                     session_id,
-                    exc_info=True,
+                    conv,
+                    body,
+                    conversation_store,
+                    runner_client,
+                    agent=_agent,
+                    has_mcp_servers=_has_mcp_servers,
+                    created_by=created_by,
                 )
-        pending_background_title = prepare_background_session_title(
-            coordinator=background_title_coordinator,
-            conversation=conv,
-            event=body,
-            enabled=background_session_titles_enabled(request.headers),
-        )
-        # Schedule display-name generation for child sessions (the
-        # title coordinator skips children because their title is
-        # the stable spawn-or-continue key).
-        if (
-            conv.parent_conversation_id is not None
-            and conv.task_summary is None
-            and background_title_coordinator is not None
-        ):
-            _prompt_for_display = background_title_prompt(body)
-            if _prompt_for_display:
-                schedule_background_child_task_summary(
-                    coordinator=background_title_coordinator,
-                    session_id=session_id,
-                    prompt=_prompt_for_display,
-                    agent_id=conv.agent_id,
-                    sub_agent_name=conv.sub_agent_name,
-                )
-        if body.type == _SLASH_COMMAND_TYPE:
-            if _agent is None:
-                raise OmnigentError(
-                    f"Session {session_id!r} has no agent; cannot run slash command",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            item_id = await _dispatch_skill_slash_command_to_runner(
+                if pending_background_title is not None:
+                    pending_background_title.schedule(expected_seed_title=conv.title)
+                return {"queued": True, "item_id": item_id}
+            dispatch = await _dispatch_session_event_to_runner(
                 session_id,
                 conv,
                 body,
                 conversation_store,
                 runner_client,
-                agent=_agent,
+                agent_name=_agent.name if _agent else None,
+                file_store=file_store,
+                artifact_store=artifact_store,
                 has_mcp_servers=_has_mcp_servers,
                 created_by=created_by,
+                runner_router=runner_router,
+                native_terminal_ready=native_terminal_ready,
+                background_titles_enabled=background_session_titles_enabled(request.headers),
+                # Read only for the gateway-backing check that decides which router
+                # serves this turn; absent, routing keeps its default posture.
+                host_store=getattr(request.app.state, "host_store", None),
             )
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
-            return {"queued": True, "item_id": item_id}
-        dispatch = await _dispatch_session_event_to_runner(
-            session_id,
-            conv,
-            body,
-            conversation_store,
-            runner_client,
-            agent_name=_agent.name if _agent else None,
-            file_store=file_store,
-            artifact_store=artifact_store,
-            has_mcp_servers=_has_mcp_servers,
-            created_by=created_by,
-            runner_router=runner_router,
-            native_terminal_ready=native_terminal_ready,
-            background_titles_enabled=background_session_titles_enabled(request.headers),
-            # Read only for the gateway-backing check that decides which router
-            # serves this turn; absent, routing keeps its default posture.
-            host_store=getattr(request.app.state, "host_store", None),
-        )
-        if pending_background_title is not None:
-            pending_background_title.schedule(expected_seed_title=conv.title)
-        response: dict[str, Any] = {"queued": True}
-        if dispatch.item_id is not None:
-            response["item_id"] = dispatch.item_id
-        # Native-terminal web message: hand back the pending-input id. It
-        # identifies the snapshot's replayed bubble on rebind and is the
-        # cleared_pending_id the consume event carries to drop it. Clients
-        # may adopt it onto their optimistic bubble for id-based dedupe;
-        # the first-party web client keeps its client temp id (React-key
-        # stability) and relies on stableKey + FIFO instead.
-        if dispatch.pending_id is not None:
-            response["pending_id"] = dispatch.pending_id
-        return response
+            response: dict[str, Any] = {"queued": True}
+            if dispatch.item_id is not None:
+                response["item_id"] = dispatch.item_id
+            # Native-terminal web message: hand back the pending-input id. It
+            # identifies the snapshot's replayed bubble on rebind and is the
+            # cleared_pending_id the consume event carries to drop it. Clients
+            # may adopt it onto their optimistic bubble for id-based dedupe;
+            # the first-party web client keeps its client temp id (React-key
+            # stability) and relies on stableKey + FIFO instead.
+            if dispatch.pending_id is not None:
+                response["pending_id"] = dispatch.pending_id
+            return response
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 
