@@ -4935,7 +4935,7 @@ async def test_native_child_completion_clears_only_disconnect_errors(
     assert response.status_code == 202, response.text
     fresh = store.get_conversation(child.id)
     assert fresh is not None
-    assert not fresh.labels.get(RECOVERY_MODE_LABEL)
+    assert fresh.labels[RECOVERY_MODE_LABEL] == "replacement:parent"
     error = sessions_module._last_task_error_from_labels(fresh.labels)
     if mirrored and error_code != "native_turn_error":
         assert sessions_module._session_status_cache[child.id] == "idle"
@@ -4985,7 +4985,7 @@ async def test_native_child_recovery_waits_for_authoritative_parent_activity(
     assert fresh is not None
     error = sessions_module._last_task_error_from_labels(fresh.labels)
     if status == "running":
-        assert not fresh.labels.get(RECOVERY_MODE_LABEL)
+        assert fresh.labels[RECOVERY_MODE_LABEL] == "replacement:parent"
         assert error is None
         forward.assert_awaited_once()
     else:

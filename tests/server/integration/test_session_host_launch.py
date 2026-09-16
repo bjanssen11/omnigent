@@ -1426,10 +1426,12 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     )
 
 
+@pytest.mark.parametrize("connected_recovery", [False, True])
 async def test_relaunch_posts_session_init_before_forwarding_message(
     client: httpx.AsyncClient,
     app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
+    connected_recovery: bool,
 ) -> None:
     """The auto-relaunch path runs the session-init handshake (POST
     /v1/sessions) BEFORE forwarding the user's message to the runner.
@@ -1475,6 +1477,10 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     from omnigent.runtime import get_conversation_store
 
     store = get_conversation_store()
+    if connected_recovery:
+        store.set_labels(
+            session_id, {"omnigent.runner_recovery.mode": f"{session['runner_id']}:resume"}
+        )
     history_at_init: list[object] = []
 
     async def _handler(request: httpx.Request) -> httpx.Response:
@@ -1509,7 +1515,7 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
         :returns: ``None``.
         """
         del sid, router
-        return None
+        return fake_runner if connected_recovery else None
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _staged_get_runner_client)
 

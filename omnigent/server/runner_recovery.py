@@ -350,6 +350,9 @@ async def reconcile_recovery_launch(
     """Reap a confirmed launch whose root moved while the host was spawning."""
     from omnigent.server.routes._sessions.helpers import _spawn_superseded_runner_stop
 
+    if root.runner_id is None or root.host_id is None:
+        _logger.warning("Cannot reconcile a recovery launch without its original runner and host")
+        return False
     fresh = await asyncio.to_thread(store.get_conversation, root.id)
     if (
         fresh is not None
@@ -358,7 +361,7 @@ async def reconcile_recovery_launch(
         and can_restore_session(fresh)
     ):
         return True
-    assert root.runner_id is not None and root.host_id is not None
+    # A user's new root binding does not authorize migrating child work to it.
     await rollback_recovery_bindings(replacement_runner_id, root.runner_id, store)
     remaining = await asyncio.to_thread(
         store.list_conversations_by_runner_id, replacement_runner_id

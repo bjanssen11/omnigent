@@ -1389,11 +1389,7 @@ def register_events_routes(
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
-            from omnigent.server.runner_recovery import (
-                RECOVERY_MODE_LABEL,
-                is_parent_owned_subagent,
-                recovery_waits_for_parent,
-            )
+            from omnigent.server.runner_recovery import is_parent_owned_subagent
 
             status = body.data.get("status")
             if not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
@@ -1507,10 +1503,6 @@ def register_events_routes(
                         await _persist_session_status_error_labels(
                             session_id, None, conversation_store
                         )
-            if status in {"running", "idle"} and recovery_waits_for_parent(conv):
-                await asyncio.to_thread(
-                    conversation_store.set_labels, session_id, {RECOVERY_MODE_LABEL: ""}
-                )
             _publish_status(
                 session_id,
                 status,
@@ -2094,27 +2086,37 @@ def register_events_routes(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
+        from omnigent.server.runner_recovery import RECOVERY_MODE_LABEL, RECOVERY_STOPPED_LABEL
+        from omnigent.server.runner_session_init import runner_lifecycle_lock
+
+        recovery_init = conv.labels.get(RECOVERY_MODE_LABEL) in {
+            f"{conv.runner_id}:resume",
+            f"{conv.runner_id}:restore",
+        }
         native_terminal_ready = False
-        if _runner_needs_session_init:
-            # The runner was unavailable when this request began, so its
-            # connect callback may still be racing us. Await the handshake
-            # so the terminal + transcript forwarder are watching before we
-            # inject the message — otherwise a native web message is
-            # forwarded into a TUI whose forwarder isn't attached, the
-            # round-trip never mirrors back, and the optimistic bubble
-            # sticks with no reply (host-restart bug).
-            #
-            # New input will drive continuation after initialization. Keep
-            # persistence/dispatch below this await so a concurrent recovery
-            # init cannot load and replay this message before it is forwarded.
-            native_terminal_ready = await _ensure_runner_session_initialized(
-                session_id,
-                conv,
-                runner_client,
-                conversation_store,
-                initializer=getattr(request.app.state, "runner_session_initializer", None),
-                suppress_recovery_turn=True,
-            )
+        if _runner_needs_session_init or recovery_init:
+            # A registered tunnel can still be initializing. Await its shared
+            # handshake before persistence so recovery cannot replay this input.
+            async with runner_lifecycle_lock(conv.runner_id or session_id):
+                fresh = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if fresh is None:
+                    raise _session_not_found()
+                if (
+                    fresh.runner_id != conv.runner_id
+                    or fresh.labels.get(RECOVERY_STOPPED_LABEL) == "true"
+                ):
+                    raise OmnigentError(
+                        "Session stopped or moved while awaiting initialization; retry your input.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                native_terminal_ready = await _ensure_runner_session_initialized(
+                    session_id,
+                    conv,
+                    runner_client,
+                    conversation_store,
+                    initializer=getattr(request.app.state, "runner_session_initializer", None),
+                    suppress_recovery_turn=True,
+                )
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,
