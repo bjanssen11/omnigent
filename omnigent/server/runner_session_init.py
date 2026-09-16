@@ -43,6 +43,8 @@ class RunnerSessionInitializer:
         # identity fallback keeps embedded/test transports usable without
         # weakening the real tunnel-generation key.
         generation = id(connection) if connection is not None else id(runner_client)
+        # One initialization per generation, even when new input races recovery.
+        # The message path waits here before persisting/forwarding its input.
         key = (
             runner_id,
             generation,

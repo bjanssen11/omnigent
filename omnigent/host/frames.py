@@ -226,6 +226,8 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param recovery_of_runner_id: Crashed generation being recovered. When set,
+        refuse to supersede a different runner already serving this session.
     """
 
     request_id: str
@@ -233,6 +235,7 @@ class HostLaunchRunnerFrame:
     workspace: str
     session_id: str | None = None
     harness: str | None = None
+    recovery_of_runner_id: str | None = None
 
 
 @dataclass
@@ -1188,6 +1191,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "session_id": frame.session_id,
                 "harness": frame.harness,
+                "recovery_of_runner_id": frame.recovery_of_runner_id,
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -1768,6 +1772,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
+        recovery_of_runner_id=_optional_nullable_str(msg, "recovery_of_runner_id"),
     )
 
 

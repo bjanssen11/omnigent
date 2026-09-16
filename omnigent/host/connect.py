@@ -1729,6 +1729,18 @@ class HostProcess:
             ``"failed"`` result. Deterministic preflight refusals
             include a machine-readable ``error_code``.
         """
+        # Recovery must not supersede a newer user-launched generation.
+        # The dispatcher holds the lifecycle lock through this launch.
+        if frame.recovery_of_runner_id is not None and any(
+            handle.session_id == frame.session_id and rid != frame.recovery_of_runner_id
+            for rid, handle in self._runners.items()
+        ):
+            return self._launch_failed(
+                frame,
+                "Another runner already owns this session on the host.",
+                error_code="recovery_superseded",
+            )
+
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an

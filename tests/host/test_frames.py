@@ -1798,3 +1798,14 @@ def test_workspace_missing_message_is_the_host_spelling() -> None:
     assert classify_launch_refusal(None, workspace_missing_message("/w"), "/w") == (
         WORKSPACE_MISSING_ERROR_CODE
     )
+
+
+def test_recovery_launch_generation_round_trip() -> None:
+    frame = HostLaunchRunnerFrame(
+        request_id="recovery",
+        binding_token="token",
+        workspace="/tmp/workspace",
+        session_id="session",
+        recovery_of_runner_id="crashed-runner",
+    )
+    assert decode_host_frame(encode_host_frame(frame)) == frame

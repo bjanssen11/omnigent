@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from websockets.datastructures import Headers
@@ -6200,3 +6200,25 @@ async def test_github_pr_update_reports_lock_contention_on_host(
     assert registry.path.read_bytes() == before
     assert host._handle_fs_write(frame).status == "ok"
     assert (target in {entry.url for entry in registry.list()}) == (action == "attach")
+
+
+async def test_recovery_launch_preserves_newer_session_runner(tmp_path: Path) -> None:
+    host = _make_host_process()
+    newer = MagicMock()
+    newer.session_id = "conv_recovery"
+    host._runners["user-selected"] = newer
+    with patch.object(host, "_spawn_runner_proc") as spawn:
+        result = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="recover-old",
+                binding_token="recovery-token",
+                workspace=str(tmp_path),
+                session_id="conv_recovery",
+                recovery_of_runner_id="crashed-runner",
+            )
+        )
+    assert result.status == "failed"
+    assert result.error_code == "recovery_superseded"
+    spawn.assert_not_called()
+    assert host._runners == {"user-selected": newer}
+    newer.proc.terminate.assert_not_called()

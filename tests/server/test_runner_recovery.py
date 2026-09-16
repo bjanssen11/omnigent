@@ -696,3 +696,43 @@ async def test_initialization_rechecks_target_after_ancestor_read(group, change)
 
     store.get_conversation = racing_get
     assert not await recovery.may_initialize_session(copy.deepcopy(store.rows[child.id]), store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late", [False, True])
+async def test_recovery_reaps_launch_when_root_moves_during_send(group, monkeypatch, late):
+    import json
+
+    parent, child, store = group
+    host = SimpleNamespace(pending_launches={})
+    replacement = None
+    sent = asyncio.Event()
+
+    def send(_, payload):
+        nonlocal replacement
+        frame = json.loads(payload)
+        assert frame["recovery_of_runner_id"] == "old"
+        replacement = store.rows[parent.id].runner_id
+        store.rows[parent.id].runner_id = "user-selected"
+        sent.set()
+        if not late:
+            host.pending_launches[frame["request_id"]].set_result({"status": "launched"})
+
+    hosts = SimpleNamespace(get=lambda _: host, send_text=send)
+    stop = []
+    monkeypatch.setattr(helpers, "_spawn_superseded_runner_stop", lambda *args: stop.append(args))
+    monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
+    monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
+    monkeypatch.setattr(helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(sessions, "_launch_runner_on_host", helpers._launch_runner_on_host_impl)
+    coordinator = recovery.HostRunnerRecovery(store, hosts)
+    coordinator.schedule("old", [parent, child], [parent, child])
+    await sent.wait()
+    if late:
+        await asyncio.sleep(0.03)
+        next(iter(host.pending_launches.values())).set_result({"status": "launched"})
+    await asyncio.gather(*coordinator._tasks.values())
+    assert store.rows[parent.id].runner_id == "user-selected"
+    assert store.rows[child.id].runner_id == "old"
+    assert len(stop) == 1
+    assert stop[0][2] == replacement

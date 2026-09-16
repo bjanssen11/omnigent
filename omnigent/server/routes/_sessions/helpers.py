@@ -5689,6 +5689,7 @@ async def _launch_runner_on_host_locked(
             # same configuration check it does at create-time launch. None
             # (agent not resolvable) skips the host-side check — fail open.
             harness=_resolve_harness(conv),
+            recovery_of_runner_id=conv.runner_id if recovery_sessions is not None else None,
         )
     )
 
@@ -5784,6 +5785,13 @@ async def _launch_runner_on_host_locked(
             error_code=result.get("error_code"),
             error=result.get("error"),
         )
+    if recovery_sessions is not None:
+        from omnigent.server.runner_recovery import reconcile_recovery_launch
+
+        if not await reconcile_recovery_launch(
+            conv, new_runner_id, conversation_store, host_registry
+        ):
+            return _HostLaunchAttempt(runner_id=new_runner_id, error_code="recovery_superseded")
     return _HostLaunchAttempt(runner_id=new_runner_id)
 
 

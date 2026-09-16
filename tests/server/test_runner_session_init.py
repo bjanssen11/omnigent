@@ -60,7 +60,8 @@ def _conversation() -> Conversation:
 
 
 @pytest.mark.asyncio
-async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
+@pytest.mark.parametrize("first_suppresses", [False, True])
+async def test_initializer_shares_result_for_one_tunnel_generation(first_suppresses: bool) -> None:
     registry = _Registry()
     client = _Client()
     initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
@@ -69,15 +70,24 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     )
     conversation = _conversation()
 
-    first = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    first = asyncio.create_task(
+        initializer.initialize(
+            conversation, client, timeout=10, suppress_recovery_turn=first_suppresses
+        )
+    )  # type: ignore[arg-type]
     await client.entered.wait()
-    second = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
+    second = asyncio.create_task(
+        initializer.initialize(
+            conversation, client, timeout=10, suppress_recovery_turn=not first_suppresses
+        )
+    )  # type: ignore[arg-type]
     await asyncio.sleep(0)
     client.release.set()
     first_response, second_response = await asyncio.gather(first, second)
 
     assert first_response is second_response
     assert len(client.calls) == 1
+    assert client.calls[0]["session_init"]["suppress_recovery_turn"] is first_suppresses
     assert client.calls[0]["session_init"]["snapshot"]["workspace"] == "/tmp/workspace"
 
     cached = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]

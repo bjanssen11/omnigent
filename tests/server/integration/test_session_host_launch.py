@@ -1472,7 +1472,12 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     runner_paths: list[str] = []
     init_bodies: list[dict[str, Any]] = []
 
-    def _handler(request: httpx.Request) -> httpx.Response:
+    from omnigent.runtime import get_conversation_store
+
+    store = get_conversation_store()
+    history_at_init: list[object] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
         """Record runner POSTs in arrival order and accept them.
 
         :param request: Request the server sent to the relaunched runner,
@@ -1484,6 +1489,9 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
             runner_paths.append(request.url.path)
             if request.url.path == "/v1/sessions":
                 init_bodies.append(json.loads(request.content))
+                history_at_init.extend(
+                    (await asyncio.to_thread(store.list_items, session_id)).data
+                )
         if request.url.path.endswith("/events"):
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(200, json={})
@@ -1565,6 +1573,7 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
         await fake_runner.aclose()
 
     assert resp.status_code < 300, resp.text
+    assert not history_at_init, "new input must not be persisted before initialization finishes"
 
     # Handshake must be recorded AND precede the first /events forward.
     # Pre-fix: no "/v1/sessions" entry at all. Wrong order: handshake

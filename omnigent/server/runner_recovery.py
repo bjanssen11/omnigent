@@ -326,6 +326,29 @@ async def _prepare_recovery_bindings(
     return True
 
 
+async def reconcile_recovery_launch(
+    root: Conversation,
+    replacement_runner_id: str,
+    store: ConversationStore,
+    hosts: HostRegistry,
+) -> bool:
+    """Reap a confirmed launch whose root moved while the host was spawning."""
+    from omnigent.server.routes._sessions.helpers import _spawn_superseded_runner_stop
+
+    fresh = await asyncio.to_thread(store.get_conversation, root.id)
+    if (
+        fresh is not None
+        and fresh.runner_id == replacement_runner_id
+        and _same_recovery_location(fresh, root)
+        and can_restore_session(fresh)
+    ):
+        return True
+    assert root.runner_id is not None and root.host_id is not None
+    await rollback_recovery_bindings(replacement_runner_id, root.runner_id, store)
+    _spawn_superseded_runner_stop(root.id, root.host_id, replacement_runner_id, hosts)
+    return False
+
+
 class HostRunnerRecovery:
     """Schedule one recovery attempt without blocking the host frame reader."""
 
@@ -355,7 +378,8 @@ class HostRunnerRecovery:
             return
         roots = [c for c in affected if c.host_id is not None and can_restore_session(c)]
         if len(roots) != 1:
-            _logger.debug(
+            log = _logger.warning if len(roots) > 1 else _logger.debug
+            log(
                 "Skipping recovery for runner %s: expected one host root, found %d",
                 runner_id,
                 len(roots),
@@ -430,6 +454,10 @@ class HostRunnerRecovery:
                         await rollback_recovery_bindings(attempt.runner_id, runner_id, self._store)
                         attempt.error_code = result.get("error_code") or "runner_launch_failed"
                         attempt.error = result.get("error")
+                    elif not await reconcile_recovery_launch(
+                        fresh, attempt.runner_id, self._store, self._hosts
+                    ):
+                        attempt.error_code = "recovery_superseded"
                 except asyncio.TimeoutError:
                     _logger.warning(
                         "Recovery launch outcome unknown for %s; retaining bindings; "
