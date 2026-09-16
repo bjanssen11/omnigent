@@ -23,6 +23,7 @@ RECOVERY_MODE_LABEL = "omnigent.runner_recovery.mode"
 RECOVERY_ATTEMPT_LABEL = "omnigent.runner_recovery.attempted_at"
 RECOVERY_ATTEMPT_RUNNER_LABEL = "omnigent.runner_recovery.attempted_runner"
 RECOVERY_COOLDOWN_S = 60
+RECOVERY_RESULT_GRACE_S = 60
 
 
 def is_parent_owned_subagent(conv: Conversation) -> bool:
@@ -135,17 +136,28 @@ def _same_recovery_location(fresh: Conversation, snapshot: Conversation) -> bool
 async def rollback_recovery_bindings(
     runner_id: str, previous_runner_id: str, store: ConversationStore
 ) -> None:
+    """Drain rollback writes even when shutdown cancels the launch observer."""
+    task = asyncio.create_task(
+        asyncio.to_thread(_rollback_recovery_bindings, runner_id, previous_runner_id, store)
+    )
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+def _rollback_recovery_bindings(
+    runner_id: str, previous_runner_id: str, store: ConversationStore
+) -> None:
     """Undo only this unlaunched attempt; preserve concurrent user rebindings."""
-    rows = await asyncio.to_thread(store.list_conversations_by_runner_id, runner_id)
-    for row in rows:
+    for row in store.list_conversations_by_runner_id(runner_id):
         try:
-            rebound = await asyncio.to_thread(
-                store.replace_runner_id, row.id, previous_runner_id, expected_runner_id=runner_id
+            rebound = store.replace_runner_id(
+                row.id, previous_runner_id, expected_runner_id=runner_id
             )
             if rebound.runner_id == previous_runner_id and row.host_id is not None:
-                await asyncio.to_thread(
-                    store.set_labels, row.id, {RECOVERY_ATTEMPT_RUNNER_LABEL: previous_runner_id}
-                )
+                store.set_labels(row.id, {RECOVERY_ATTEMPT_RUNNER_LABEL: previous_runner_id})
         except ConversationNotFoundError:
             continue
 
@@ -388,6 +400,27 @@ class HostRunnerRecovery:
             attempt = await _launch_runner_on_host(
                 fresh, self._store, self._hosts, host, recovery_sessions=interrupted
             )
+            if attempt.pending_launch is not None:
+                request_id, result_future = attempt.pending_launch
+                try:
+                    result = await asyncio.wait_for(result_future, RECOVERY_RESULT_GRACE_S)
+                    if result.get("status") == "failed":
+                        await rollback_recovery_bindings(attempt.runner_id, runner_id, self._store)
+                        attempt.error_code = result.get("error_code") or "runner_launch_failed"
+                        attempt.error = result.get("error")
+                except asyncio.TimeoutError:
+                    _logger.warning(
+                        "Recovery launch outcome unknown for %s; retaining bindings; "
+                        "use explicit Retry if the session remains disconnected",
+                        root.id,
+                    )
+                finally:
+                    # Timeout/shutdown does not prove launch failed. A runner
+                    # already started by the host must retain its bindings.
+                    host.pending_launches.pop(request_id, None)
+                    attempt.pending_launch = None
+                    if not result_future.done():
+                        result_future.cancel()
             if attempt.error_code is not None:
                 _logger.warning(
                     "Automatic runner recovery refused for %s: %s; "

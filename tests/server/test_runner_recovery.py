@@ -69,7 +69,7 @@ async def test_only_confirmed_death_reuses_original_host(group, monkeypatch, hos
     host = SimpleNamespace(host_id="original-host")
     hosts = SimpleNamespace(get=lambda host_id: host if host_id == parent.host_id else None)
     monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value=host_status))
-    launch = AsyncMock(return_value=SimpleNamespace(error_code=None))
+    launch = AsyncMock(return_value=helpers._HostLaunchAttempt(runner_id="new"))
     monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
     coordinator = recovery.HostRunnerRecovery(store, hosts)
     coordinator.schedule("old", [parent, child], [parent, child])
@@ -291,7 +291,7 @@ async def test_lost_root_cas_does_not_cool_down_user_selected_runner(group, monk
     store.rows[parent.id].labels[recovery.RECOVERY_ATTEMPT_LABEL] = str(time.time())
     fresh = store.rows[parent.id]
     monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
-    launch = AsyncMock(return_value=SimpleNamespace(error_code=None))
+    launch = AsyncMock(return_value=helpers._HostLaunchAttempt(runner_id="new"))
     monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
     coordinator = recovery.HostRunnerRecovery(store, SimpleNamespace(get=lambda _: object()))
     coordinator.schedule("user-replacement", [fresh], [fresh])
@@ -388,7 +388,7 @@ async def test_invalid_cooldown_does_not_strand_recovery(group, monkeypatch, cap
         }
     )
     monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
-    launch = AsyncMock(return_value=SimpleNamespace(error_code=None))
+    launch = AsyncMock(return_value=helpers._HostLaunchAttempt(runner_id="new"))
     monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
     coordinator = recovery.HostRunnerRecovery(store, SimpleNamespace(get=lambda _: object()))
     coordinator.schedule("old", [parent, child], [parent, child])
@@ -573,3 +573,73 @@ async def test_rolled_back_attempt_cools_down_duplicate_original_exit(group, mon
     launch.assert_awaited_once()
     assert store.rows[parent.id].runner_id == "old"
     assert store.rows[parent.id].labels[recovery.RECOVERY_ATTEMPT_RUNNER_LABEL] == "old"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["failed", "launched", "unknown", "shutdown"])
+async def test_recovery_tracks_late_launch_result_without_holding_launch_lock(
+    group, monkeypatch, outcome
+):
+    parent, child, store = group
+    host = SimpleNamespace(pending_launches={})
+    hosts = SimpleNamespace(get=lambda _: host, send_text=lambda *_: None)
+    monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value="dead"))
+    monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
+    monkeypatch.setattr(helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(recovery, "RECOVERY_RESULT_GRACE_S", 0.1)
+    timed_out = asyncio.Event()
+
+    async def launch(*args, **kwargs):
+        attempt = await helpers._launch_runner_on_host_impl(*args, **kwargs)
+        assert attempt.pending_launch is not None
+        assert not helpers._relaunch_locks.get(parent.id, asyncio.Lock()).locked()
+        timed_out.set()
+        return attempt
+
+    monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
+    coordinator = recovery.HostRunnerRecovery(store, hosts)
+    coordinator.schedule("old", [parent, child], [parent, child])
+    await timed_out.wait()
+    future = next(iter(host.pending_launches.values()))
+    assert not future.cancelled()
+    if outcome in {"failed", "launched"}:
+        future.set_result(
+            {"status": outcome, "error_code": "unconfigured" if outcome == "failed" else None}
+        )
+    if outcome == "shutdown":
+        await coordinator.shutdown()
+    else:
+        await asyncio.gather(*coordinator._tasks.values())
+    assert not host.pending_launches
+    assert future.done()
+    assert (store.rows[parent.id].runner_id == "old") is (outcome == "failed")
+    assert store.rows[child.id].runner_id == store.rows[parent.id].runner_id
+
+
+@pytest.mark.asyncio
+async def test_cancelled_rollback_drains_store_writes(group):
+    import threading
+
+    parent, child, store = group
+    for row in store.rows.values():
+        row.runner_id = "new"
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    original_replace = store.replace_runner_id
+
+    def replace(sid, rid, **kwargs):
+        if sid == parent.id:
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(timeout=5)
+        return original_replace(sid, rid, **kwargs)
+
+    store.replace_runner_id = replace
+    task = asyncio.create_task(recovery.rollback_recovery_bindings("new", "old", store))
+    try:
+        await entered.wait()
+        task.cancel()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.rows[parent.id].runner_id == store.rows[child.id].runner_id == "old"

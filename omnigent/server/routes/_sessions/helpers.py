@@ -5489,6 +5489,7 @@ class _HostLaunchAttempt:
     runner_id: str
     error_code: str | None = None
     error: str | None = None
+    pending_launch: tuple[str, asyncio.Future[dict[str, str | None]]] | None = None
 
 
 async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttempt:
@@ -5738,17 +5739,25 @@ async def _launch_runner_on_host_locked(
                 error="Host connection lost; retry recovery when the original host is online.",
             )
         return _HostLaunchAttempt(runner_id=new_runner_id)
+    retain_result = False
     try:
         result = await asyncio.wait_for(
-            launch_future,
+            asyncio.shield(launch_future) if recovery_sessions is not None else launch_future,
             timeout=_HOST_LAUNCH_RESULT_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
-        # No result yet — fall through to the caller's connect wait, which
-        # preserves the prior fire-and-forget timing for a slow-but-fine host.
-        return _HostLaunchAttempt(runner_id=new_runner_id)
+        # Launch may have succeeded. Recovery owns a bounded late-result wait
+        # outside this lock; user-driven callers use their existing connect wait.
+        retain_result = recovery_sessions is not None
+        return _HostLaunchAttempt(
+            runner_id=new_runner_id,
+            pending_launch=(request_id, launch_future) if retain_result else None,
+        )
     finally:
-        host_conn.pending_launches.pop(request_id, None)
+        if not retain_result:
+            host_conn.pending_launches.pop(request_id, None)
+            if not launch_future.done():
+                launch_future.cancel()
     if result.get("status") == "failed":
         if recovery_sessions is not None:
             from omnigent.server.runner_recovery import rollback_recovery_bindings
