@@ -27,7 +27,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 
 import httpx
 from fastapi import (
@@ -4585,6 +4585,34 @@ def _require_codex_approval_mode_forward(
         )
 
 
+# A failure detail can be the harness's whole last message: claude-native's
+# StopFailure edge posts none, so the reason falls back to the turn's persisted
+# assistant text, which may be pages of markdown. Bound it to one line so a
+# failure mode groups as one log signature instead of one per reply, and so a
+# reply's full text never lands in telemetry.
+_FAILURE_LOG_DETAIL_MAX_CHARS: Final[int] = 200
+
+
+def _failure_log_detail(error: ErrorDetail | None) -> str:
+    """Render a turn failure's reason as one bounded log line.
+
+    :param error: The failure's typed detail, or ``None`` when the publisher
+        attached none.
+    :returns: A single-line reason, truncated with an ellipsis, e.g.
+        ``"Native Codex terminal failed to start"``; ``"no detail"`` when
+        ``error`` is ``None`` or carries no message.
+    """
+    if error is None or not error.message:
+        return "no detail"
+    collapsed = " ".join(error.message.split())
+    if not collapsed:
+        return "no detail"
+    if len(collapsed) <= _FAILURE_LOG_DETAIL_MAX_CHARS:
+        return collapsed
+    dropped = len(collapsed) - _FAILURE_LOG_DETAIL_MAX_CHARS
+    return f"{collapsed[:_FAILURE_LOG_DETAIL_MAX_CHARS]}… (+{dropped} chars)"
+
+
 def _publish_status(
     session_id: str,
     status: str,
@@ -4694,7 +4722,7 @@ def _publish_status(
             origin,
             failure_code,
             previous_status or "unknown",
-            error.message if error is not None else "no detail",
+            _failure_log_detail(error),
             extra=debug_event(
                 "session_turn_failed",
                 session_id=session_id,

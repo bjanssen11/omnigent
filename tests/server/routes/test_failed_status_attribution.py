@@ -137,6 +137,47 @@ def _failure_publish_calls(source: str) -> list[ast.Call]:
     return calls
 
 
+def test_failure_detail_is_bounded_to_one_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A whole assistant reply must not become the log line.
+
+    claude-native's ``StopFailure`` edge posts no detail, so the reason falls
+    back to the turn's persisted assistant text. Left whole, every reply is a
+    distinct signature and the dashboard cannot group the failure mode.
+    """
+    reply = "Direct answer: **no**.\n\n## The crux\n" + "detail " * 200
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(source="execution", code="native_turn_error", message=reply),
+        origin="external_session_status",
+    )
+    message = record.getMessage()
+    assert "code=native_turn_error" in message
+    # Bounded, single-line, and says how much was dropped.
+    detail = message.split("): ", 1)[1]
+    assert "\n" not in detail
+    assert len(detail) < 300, detail
+    assert detail.startswith("Direct answer: **no**. ## The crux")
+    assert "chars)" in detail
+
+
+def test_short_failure_detail_is_preserved_verbatim(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Truncation must not touch the ordinary one-line reason."""
+    record = _publish_failed(
+        caplog,
+        error=ErrorDetail(
+            source="execution",
+            code="native_terminal_ensure_failed",
+            message="Native Codex terminal failed to start",
+        ),
+        origin="native_terminal_boot_failed",
+    )
+    assert record.getMessage().endswith(": Native Codex terminal failed to start")
+
+
 def test_every_failure_publish_site_names_itself() -> None:
     """A new failure path cannot silently rejoin the undifferentiated bucket.
 
