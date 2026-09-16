@@ -3047,6 +3047,22 @@ def test_replace_runner_id_allows_internal_non_session_conversation(
     assert fetched.runner_id == "runner-uuid-1"
 
 
+def test_recovery_binding_does_not_overwrite_a_newer_runner(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A delayed child recovery must preserve a binding changed by the user."""
+    conv = conversation_store.create_conversation()
+    conversation_store.replace_runner_id(conv.id, "old")
+    recovered = conversation_store.replace_runner_id(conv.id, "new", expected_runner_id="old")
+    assert recovered.runner_id == "new"
+    stale = conversation_store.replace_runner_id(conv.id, "other", expected_runner_id="old")
+    assert stale.runner_id == "new"
+    persisted = conversation_store.get_conversation(conv.id)
+    assert persisted is not None
+    assert persisted.runner_id == "new"
+    assert persisted.updated_at == conv.updated_at
+
+
 def test_list_conversations_by_runner_id_filters(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -4662,6 +4678,9 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.codex_native.bridge_id": source.id,
             "omnigent.last_context_tokens": "39903",
             "omnigent.last_context_window": "1000000",
+            "omnigent.runner_recovery.stopped": "true",
+            "omnigent.runner_recovery.mode": "old:resume",
+            "omnigent.runner_recovery.attempted_at": "1000000",
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
             # An ordinary, non-instance label that SHOULD carry over.

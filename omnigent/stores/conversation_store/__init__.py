@@ -176,6 +176,9 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        "omnigent.runner_recovery.stopped",
+        "omnigent.runner_recovery.mode",
+        "omnigent.runner_recovery.attempted_at",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
@@ -1377,11 +1380,13 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def replace_runner_id(self, conversation_id: str, runner_id: str) -> Conversation:
+    def replace_runner_id(
+        self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None
+    ) -> Conversation:
         """
         Replace ``conversations.runner_id`` for a conversation.
 
-        Atomic last-write-wins write. Public session binding routes
+        Atomic write, optionally conditional on the old binding. Public session binding routes
         validate session-scoped agent ownership before calling this
         method; internal sub-agent code also uses it to keep child
         conversations on the parent's current runner.
@@ -1395,6 +1400,8 @@ class ConversationStore(ABC):
         :param runner_id: Runner identifier to bind to,
             e.g. ``"runner_abc123"``. Online-ness is validated
             by the route before calling the store.
+        :param expected_runner_id: When set, preserve a concurrently changed binding
+            and return its current row.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.

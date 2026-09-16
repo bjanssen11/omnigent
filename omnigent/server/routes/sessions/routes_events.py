@@ -580,10 +580,8 @@ def register_events_routes(
           deleting the conversation (owner-only). Forwarded
           harness-agnostically to the runner, which hard-kills the
           external process for harnesses that have one (claude-native
-          kills its tmux pane) and 204s otherwise. Stop is non-sticky:
-          it writes no persistent marker, so the next message
-          auto-relaunches the session on its (still-online) host via
-          the normal message-dispatch relaunch path.
+          kills its tmux pane) and 204s otherwise. Stop blocks automatic
+          crash recovery until a new message or explicit Retry clears it.
         - ``"retry_session"`` reconnects or relaunches the existing
           session runner without persisting or replaying user input.
         - ``"message"`` on an ``omnigent claude`` terminal session
@@ -719,6 +717,12 @@ def register_events_routes(
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         if body.type == _RETRY_SESSION_TYPE:
+            from omnigent.server.runner_recovery import RECOVERY_STOPPED_LABEL
+
+            if conv.labels.get(RECOVERY_STOPPED_LABEL) == "true":
+                await asyncio.to_thread(
+                    conversation_store.set_labels, session_id, {RECOVERY_STOPPED_LABEL: ""}
+                )
             return await _retry_session_single_flight(
                 request=request,
                 session_id=session_id,
@@ -1035,12 +1039,18 @@ def register_events_routes(
                 _interrupt_fenced_sessions.discard(session_id)
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
+            from omnigent.server.runner_recovery import RECOVERY_STOPPED_LABEL
+
             # Terminating the whole session (not just the current turn)
             # is a lifecycle action; require owner access on top of the
             # LEVEL_EDIT gate above so a shared editor can't kill the
             # owner's session.
             await _require_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+            previous_recovery_stop = conv.labels.get(RECOVERY_STOPPED_LABEL, "")
+            await asyncio.to_thread(
+                conversation_store.set_labels, session_id, {RECOVERY_STOPPED_LABEL: "true"}
             )
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
@@ -1058,6 +1068,11 @@ def register_events_routes(
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
+                await asyncio.to_thread(
+                    conversation_store.set_labels,
+                    session_id,
+                    {RECOVERY_STOPPED_LABEL: previous_recovery_stop},
+                )
                 raise
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
@@ -1135,11 +1150,7 @@ def register_events_routes(
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
                     )
-            # Stop is non-sticky: no persistent marker is written. The
-            # runner tunnel dropping above flips ``runner_online`` to false
-            # honestly, and the next message auto-relaunches the session on
-            # its (still-online) host via the normal message-dispatch
-            # relaunch path below.
+            # New input clears the recovery fence and can relaunch the session.
             try:
                 import hashlib as _hashlib
 
@@ -1379,6 +1390,8 @@ def register_events_routes(
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
+            from omnigent.server.runner_recovery import is_parent_owned_subagent
+
             status = body.data.get("status")
             if not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
                 raise OmnigentError(
@@ -1475,6 +1488,22 @@ def register_events_routes(
                 )
             elif status == "running":
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
+            elif status == "idle" and is_parent_owned_subagent(conv):
+                from omnigent.server.routes import sessions as _sf
+
+                # A mirrored child's completion comes from its parent harness,
+                # not from an idle replacement terminal after a startup failure.
+                prior_error = _sf._last_task_error_from_labels(conv.labels)
+                if prior_error is not None and prior_error.get("code") in {
+                    "runner_disconnected",
+                    "runner_failed_to_start",
+                }:
+                    if _sf._session_status_cache.get(session_id) == "failed":
+                        await _sf._publish_runner_recovered_status(session_id, conversation_store)
+                    else:
+                        await _persist_session_status_error_labels(
+                            session_id, None, conversation_store
+                        )
             _publish_status(
                 session_id,
                 status,
@@ -1761,6 +1790,14 @@ def register_events_routes(
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 ) from exc
             return {"queued": True, "item_id": body.data["call_id"]}
+        if body.type == "message" and body.data.get("role") == "user":
+            from omnigent.server.runner_recovery import RECOVERY_STOPPED_LABEL
+
+            if conv.labels.get(RECOVERY_STOPPED_LABEL) == "true":
+                await asyncio.to_thread(
+                    conversation_store.set_labels, session_id, {RECOVERY_STOPPED_LABEL: ""}
+                )
+                conv.labels.pop(RECOVERY_STOPPED_LABEL, None)
         # Whether the runner was initially unavailable or was woken below. In
         # that case the session-init handshake may still be racing the first
         # message, even if we reused the original binding instead of launching

@@ -1553,6 +1553,7 @@ def create_app(
             # provider lifetime cap — see the hook's docstring).
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
+            await host_runner_recovery.shutdown()
             await cancel_managed_launch_tasks()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
@@ -2894,6 +2895,15 @@ def create_app(
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
 
+    from omnigent.server.runner_recovery import (
+        HostRunnerRecovery,
+        may_initialize_session,
+        recovery_suppresses_turn,
+        was_interrupted,
+    )
+
+    host_runner_recovery = HostRunnerRecovery(conversation_store, host_registry)
+
     # Pending per-runner grace timers: a disconnect schedules the
     # failed-marking after RUNNER_DISCONNECT_GRACE_S instead of doing it
     # immediately, so transient tunnel drops (ingress recycles,
@@ -3064,12 +3074,14 @@ def create_app(
             len(affected),
             error,
         )
+        interrupted = [conv for conv in affected if was_interrupted(conv)]
         await _mark_runner_sessions_offline(
             affected,
             ErrorDetail(code="runner_failed_to_start", message=error),
             conversation_store,
             fail_idle_top_level=True,
         )
+        host_runner_recovery.schedule(runner_id, affected, interrupted)
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
@@ -3114,6 +3126,13 @@ def create_app(
             len(convs),
         )
         for conv in convs:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+            if (
+                conv is None
+                or conv.runner_id != runner_id
+                or not await may_initialize_session(conv, conversation_store)
+            ):
+                continue
             _logger.info(
                 "_on_runner_connect: matched %s (agent=%s)",
                 conv.id,
@@ -3144,6 +3163,7 @@ def create_app(
                         conv,
                         routed.client,
                         timeout=10.0,
+                        suppress_recovery_turn=recovery_suppresses_turn(conv),
                     )
                 except Exception:
                     _logger.exception(

@@ -1,0 +1,268 @@
+"""Recovery stays with the original host and restores only interrupted work."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+from omnigent.entities import Conversation
+from omnigent.server import runner_recovery as recovery
+from omnigent.server.routes import sessions
+from omnigent.server.routes._sessions import common, helpers
+
+
+def _conv(session_id: str, **kwargs: object) -> Conversation:
+    return Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="parent",
+        agent_id="agent",
+        runner_id="old",
+        live_status="running",
+        **kwargs,
+    )
+
+
+class Store:
+    def __init__(self, *rows: Conversation) -> None:
+        self.rows = {c.id: copy.deepcopy(c) for c in rows}
+
+    def get_conversation(self, session_id: str) -> Conversation | None:
+        return copy.deepcopy(self.rows.get(session_id))
+
+    def set_labels(self, session_id: str, labels: dict[str, str]) -> None:
+        self.rows[session_id].labels.update(labels)
+
+    def replace_runner_id(
+        self, session_id: str, runner_id: str, *, expected_runner_id: str | None = None
+    ) -> Conversation:
+        row = self.rows[session_id]
+        if expected_runner_id is None or row.runner_id == expected_runner_id:
+            row.runner_id = runner_id
+        return copy.deepcopy(row)
+
+
+@pytest.fixture
+def group(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(common, "_session_status_cache", {})
+    monkeypatch.setattr(common, "_intentional_stop_sessions", set())
+    monkeypatch.setattr(common, "_interrupt_fenced_sessions", set())
+    monkeypatch.setattr(recovery.shutdown_state, "server_shutting_down", lambda: False)
+    parent = _conv("parent", host_id="original-host", workspace="/original/worktree")
+    child = _conv("child", kind="sub_agent", parent_conversation_id=parent.id)
+    return parent, child, Store(parent, child)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_status", ["dead", "alive", "unknown", None])
+async def test_only_confirmed_death_reuses_original_host(group, monkeypatch, host_status):
+    parent, child, store = group
+    host = SimpleNamespace(host_id="original-host")
+    hosts = SimpleNamespace(get=lambda host_id: host if host_id == parent.host_id else None)
+    monkeypatch.setattr(helpers, "_query_host_runner_status", AsyncMock(return_value=host_status))
+    launch = AsyncMock(return_value=SimpleNamespace(error_code=None))
+    monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
+    coordinator = recovery.HostRunnerRecovery(store, hosts)
+    coordinator.schedule("old", [parent, child], [parent, child])
+    coordinator.schedule("old", [parent, child], [parent, child])
+    await asyncio.gather(*coordinator._tasks.values())
+    if host_status == "dead":
+        launch.assert_awaited_once()
+        args, kwargs = launch.call_args
+        assert args[0].workspace == "/original/worktree"
+        assert args[3] is host
+        assert [c.id for c in kwargs["recovery_sessions"]] == ["parent", "child"]
+    else:
+        launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["stopped", "closed", "rebound", "cooldown", "offline"])
+async def test_recovery_rechecks_lifecycle_before_launch(group, monkeypatch, change):
+    parent, child, store = group
+    host = object()
+    hosts = SimpleNamespace(get=lambda _: None if change == "offline" else host)
+
+    async def status(*_):
+        fresh = store.rows[parent.id]
+        if change == "stopped":
+            fresh.labels[recovery.RECOVERY_STOPPED_LABEL] = "true"
+        elif change == "closed":
+            fresh.archived = True
+        elif change == "rebound":
+            fresh.runner_id = "user-replacement"
+        elif change == "cooldown":
+            fresh.labels[recovery.RECOVERY_ATTEMPT_LABEL] = str(time.time())
+        return "dead"
+
+    monkeypatch.setattr(helpers, "_query_host_runner_status", status)
+    launch = AsyncMock()
+    monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
+    coordinator = recovery.HostRunnerRecovery(store, hosts)
+    coordinator.schedule("old", [parent, child], [parent, child])
+    await asyncio.gather(*coordinator._tasks.values())
+    launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_does_not_adopt_children_without_original_host(group, monkeypatch):
+    parent, child, store = group
+    parent.host_id = None
+    launch = AsyncMock()
+    monkeypatch.setattr(sessions, "_launch_runner_on_host", launch)
+    coordinator = recovery.HostRunnerRecovery(store, SimpleNamespace(get=lambda _: object()))
+    coordinator.schedule("old", [parent, child], [parent, child])
+    assert not coordinator._tasks
+    launch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bindings_restored_before_launch_and_completed_child_left_alone(group, monkeypatch):
+    parent, child, store = group
+    completed = _conv("completed", kind="sub_agent", parent_conversation_id=parent.id)
+    completed.live_status = "idle"
+    store.rows[completed.id] = completed
+    host = SimpleNamespace(pending_launches={})
+    monkeypatch.setattr(helpers, "_spawn_superseded_runner_stop", lambda *_: None)
+    monkeypatch.setattr(helpers, "_resolve_harness", lambda _: "openai-agents")
+
+    def send(_host, _frame):
+        new_runner_id = store.rows[parent.id].runner_id
+        assert new_runner_id != "old"
+        assert store.rows[child.id].runner_id == new_runner_id
+        assert store.rows[completed.id].runner_id == "old"
+        for future in host.pending_launches.values():
+            future.set_result({"status": "launched"})
+
+    attempt = await helpers._launch_runner_on_host_impl(
+        parent,
+        store,
+        SimpleNamespace(send_text=send),
+        host,
+        recovery_sessions=[parent, child],
+    )
+    assert attempt.error_code is None
+    assert (
+        store.rows[child.id].labels[recovery.RECOVERY_MODE_LABEL] == f"{attempt.runner_id}:resume"
+    )
+
+
+@pytest.mark.asyncio
+async def test_idle_parent_is_restored_without_replaying_its_old_turn(group):
+    parent, child, store = group
+    parent.live_status = "idle"
+    store.rows[parent.id].live_status = "idle"
+    assert await recovery.prepare_recovery_bindings(parent, "new", [child], store)
+    assert recovery.recovery_suppresses_turn(store.rows[parent.id])
+    assert not recovery.recovery_suppresses_turn(store.rows[child.id])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+        {"omnigent.wrapper": "codex-native-ui-subagent"},
+        {"omnigent.wrapper": "opencode-native-ui-subagent"},
+        {"omnigent.wrapper": "antigravity-native-ui-subagent"},
+        {"omnigent.acp.subagent_id": "vendor-child"},
+    ],
+)
+async def test_mirrored_child_recovers_through_parent_without_standalone_init(group, labels):
+    parent, child, store = group
+    store.rows[parent.id].live_status = parent.live_status = "idle"
+    child.labels.update(labels)
+    store.rows[child.id].labels.update(labels)
+
+    assert await recovery.prepare_recovery_bindings(parent, "new", [child], store)
+    restored_parent, restored_child = store.rows[parent.id], store.rows[child.id]
+    assert restored_parent.runner_id == restored_child.runner_id == "new"
+    assert recovery.recovery_suppresses_turn(restored_parent)
+    assert restored_child.labels[recovery.RECOVERY_MODE_LABEL] == "new:parent"
+    assert await recovery.may_initialize_session(restored_parent, store)
+    assert not await recovery.may_initialize_session(restored_child, store)
+
+
+@pytest.mark.asyncio
+async def test_independent_native_child_still_initializes_after_recovery(group):
+    parent, child, store = group
+    child.labels["omnigent.wrapper"] = "claude-code-native-ui"
+    store.rows[child.id].labels.update(child.labels)
+    assert await recovery.prepare_recovery_bindings(parent, "new", [child], store)
+    assert store.rows[child.id].labels[recovery.RECOVERY_MODE_LABEL] == "new:resume"
+    assert await recovery.may_initialize_session(store.rows[child.id], store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["stopped", "closed", "rebound", "finished", "moved_host"])
+async def test_child_changed_while_recovery_waited_is_not_restarted(group, change):
+    parent, child, store = group
+    fresh = store.rows[child.id]
+    if change == "stopped":
+        fresh.labels[recovery.RECOVERY_STOPPED_LABEL] = "true"
+    elif change == "closed":
+        fresh.labels["omnigent.closed"] = "true"
+    elif change == "rebound":
+        fresh.runner_id = "user-replacement"
+    elif change == "moved_host":
+        fresh.host_id = "user-selected-host"
+    else:
+        fresh.live_status = "idle"
+    assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    assert store.rows[child.id].runner_id != "new"
+
+
+def test_interruption_evidence_excludes_completed_failed_and_cancelled(group):
+    parent, _, _ = group
+    assert recovery.was_interrupted(parent)
+    parent.live_status = "idle"
+    assert not recovery.was_interrupted(parent)
+    parent.live_status = "failed"
+    assert not recovery.was_interrupted(parent)
+    common._interrupt_fenced_sessions.add(parent.id)
+    parent.live_status = "running"
+    assert not recovery.was_interrupted(parent)
+
+
+@pytest.mark.asyncio
+async def test_stop_after_group_rebind_prevents_child_initialization(group):
+    parent, child, store = group
+    assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    store.rows[parent.id].labels[recovery.RECOVERY_STOPPED_LABEL] = "true"
+    assert not await recovery.may_initialize_session(store.rows[child.id], store)
+
+
+@pytest.mark.asyncio
+async def test_manual_child_rebind_during_recovery_is_preserved(group):
+    parent, child, store = group
+    original_replace = store.replace_runner_id
+
+    def racing_replace(session_id, runner_id, **kwargs):
+        if session_id == child.id:
+            store.rows[child.id].runner_id = "user-replacement"
+        return original_replace(session_id, runner_id, **kwargs)
+
+    store.replace_runner_id = racing_replace
+    assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    assert store.rows[child.id].runner_id == "user-replacement"
+
+
+@pytest.mark.asyncio
+async def test_deleted_child_does_not_abort_parent_recovery(group):
+    parent, child, store = group
+    original_replace = store.replace_runner_id
+
+    def racing_replace(session_id, runner_id, **kwargs):
+        if session_id == child.id:
+            raise recovery.ConversationNotFoundError(session_id)
+        return original_replace(session_id, runner_id, **kwargs)
+
+    store.replace_runner_id = racing_replace
+    assert await recovery.prepare_recovery_bindings(parent, "new", [parent, child], store)
+    assert store.rows[parent.id].runner_id == "new"

@@ -1438,6 +1438,81 @@ async def test_on_runner_connect_preserves_genuine_failure_on_reconnect(
         sessions_module._session_status_cache.pop(session_id, None)
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("child_status", ["failed", "idle"])
+async def test_reconnect_does_not_initialize_or_complete_native_subagent_mirrors(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    child_status: str,
+) -> None:
+    """A parent reconnect cannot launch a blank child or prove its task completed."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.runner_recovery import RECOVERY_MODE_LABEL
+    from omnigent.server.schemas import ErrorDetail
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    store = get_conversation_store()
+    parent_id = await _bind_failed_session(
+        tunnel_three_layer_stack.ap_client,
+        error_code="runner_disconnected",
+        error_message="Runner disconnected unexpectedly.",
+    )
+    parent = store.get_conversation(parent_id)
+    assert parent is not None
+    child = store.create_conversation(
+        agent_id=parent.agent_id,
+        runner_id=_RUNNER_ID,
+        kind="sub_agent",
+        parent_conversation_id=parent_id,
+    )
+    store.set_labels(
+        child.id,
+        {
+            "omnigent.wrapper": "claude-code-native-ui-subagent",
+            RECOVERY_MODE_LABEL: f"{_RUNNER_ID}:parent",
+        },
+    )
+    sessions_module._session_status_cache[child.id] = child_status
+    if child_status == "failed":
+        await sessions_module._persist_session_status_error_labels(
+            child.id,
+            ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly."),
+            store,
+        )
+
+    # Visit the child before the parent's completion signal used by the test.
+    original_list = store.list_conversations_by_runner_id
+    monkeypatch.setattr(
+        store,
+        "list_conversations_by_runner_id",
+        lambda rid: sorted(original_list(rid), key=lambda c: c.id == parent_id),
+    )
+    initializer = ap_app.state.runner_session_initializer
+    original_initialize = initializer.initialize
+    initialized: list[str] = []
+
+    async def record_initialize(conv, *args, **kwargs):
+        initialized.append(conv.id)
+        return await original_initialize(conv, *args, **kwargs)
+
+    monkeypatch.setattr(initializer, "initialize", record_initialize)
+    async with _reconnect_fires_connect_hook(
+        ap_app, tunnel_three_layer_stack.fake_pm, wait_for_recover=parent_id
+    ) as recovered:
+        assert initialized == [parent_id]
+        assert recovered == [parent_id]
+        assert sessions_module._session_status_cache[child.id] == child_status
+        fresh = store.get_conversation(child.id)
+        assert fresh is not None
+        error = sessions_module._last_task_error_from_labels(fresh.labels)
+        if child_status == "failed":
+            assert error is not None and error["code"] == "runner_disconnected"
+        else:
+            assert error is None
+
+
 def _stub_connect_hook_for_pumpless_ws(ap_app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep ``_on_runner_connect`` from hanging on a test-owned, pump-less WS.
 

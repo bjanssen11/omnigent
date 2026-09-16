@@ -10370,7 +10370,11 @@ async def _get_session_snapshot(
     # (new token-bound runner_id) naturally stops matching. Access is gated
     # by the session-snapshot's own authorization, so the unscoped get is
     # correct here (the report is this session's own runner).
-    if runner_exit_reports is not None and conv.runner_id is not None:
+    if (
+        runner_exit_reports is not None
+        and conv.runner_id is not None
+        and (conv.kind != "sub_agent" or status != "idle")
+    ):
         exit_error = runner_exit_reports.get(conv.runner_id)
         if exit_error is not None:
             last_task_error = {"code": "runner_failed_to_start", "message": exit_error}

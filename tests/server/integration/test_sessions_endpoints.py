@@ -4883,6 +4883,59 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert cache_after == "idle"
 
 
+@pytest.mark.parametrize(
+    "error_code", ["runner_disconnected", "runner_failed_to_start", "native_turn_error"]
+)
+@pytest.mark.parametrize("mirrored", [True, False])
+@pytest.mark.parametrize("cached", [True, False])
+async def test_native_child_completion_clears_only_disconnect_errors(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    mirrored: bool,
+    cached: bool,
+) -> None:
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = get_conversation_store()
+    child = store.create_conversation(
+        agent_id=agent["id"], kind="sub_agent", parent_conversation_id=parent["id"]
+    )
+    if mirrored:
+        store.set_labels(child.id, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
+    if cached:
+        sessions_module._session_status_cache[child.id] = "failed"
+    await sessions_module._persist_session_status_error_labels(
+        child.id, ErrorDetail(code=error_code, message="Previous failure"), store
+    )
+    monkeypatch.setattr(
+        sessions_module,
+        "_forward_session_change_to_runner",
+        AsyncMock(return_value=_RunnerForwardResult(status_code=204, body="")),
+    )
+    response = await client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "idle", "output": "Child finished its work."},
+        },
+    )
+    assert response.status_code == 202, response.text
+    fresh = store.get_conversation(child.id)
+    assert fresh is not None
+    error = sessions_module._last_task_error_from_labels(fresh.labels)
+    if mirrored and error_code != "native_turn_error":
+        assert sessions_module._session_status_cache[child.id] == "idle"
+        assert error is None
+    else:
+        assert sessions_module._session_status_cache[child.id] == ("failed" if cached else "idle")
+        assert error is not None and error["code"] == error_code
+
+
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -9440,6 +9493,8 @@ async def test_stop_session_forwards_stop_session_event_to_runner(
         f"AP must forward a bare stop_session control event to the "
         f"runner; got {events_forwards[0].body!r}"
     )
+    stopped = await client.get(f"/v1/sessions/{session['id']}")
+    assert stopped.json()["labels"]["omnigent.runner_recovery.stopped"] == "true"
 
 
 @pytest.mark.parametrize(
@@ -9521,6 +9576,8 @@ async def test_stop_session_surfaces_runner_failure_as_error(
     assert session["id"] not in _interrupt_fenced_sessions, (
         "a failed stop_session must remove the interrupt fence it installed"
     )
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["labels"].get("omnigent.runner_recovery.stopped") != "true"
 
 
 async def test_stop_session_no_runner_lifts_stop_fence(
@@ -9614,6 +9671,11 @@ async def test_retry_session_ensures_dead_required_native_terminal_once(
     monkeypatch.setattr(routes_events, "_ensure_native_terminal_ready", ensure_terminal)
     monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", relay_ready)
 
+    await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"labels": {"omnigent.runner_recovery.stopped": "true"}},
+    )
+
     response = await client.post(
         f"/v1/sessions/{session['id']}/events",
         json={"type": "retry_session", "data": {}},
@@ -9630,6 +9692,7 @@ async def test_retry_session_ensures_dead_required_native_terminal_once(
     relay_ready.assert_awaited_once()
     after = await client.get(f"/v1/sessions/{session['id']}")
     assert after.json()["items"] == before_items
+    assert after.json()["labels"].get("omnigent.runner_recovery.stopped") != "true"
 
 
 async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(

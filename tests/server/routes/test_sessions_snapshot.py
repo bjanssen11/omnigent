@@ -470,7 +470,11 @@ async def test_session_snapshot_populates_runner_online_from_session_lookup() ->
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
+@pytest.mark.parametrize("kind,expected_status", [("default", "failed"), ("sub_agent", "idle")])
+async def test_session_snapshot_surfaces_runner_exit_report_as_failed(
+    kind: str,
+    expected_status: str,
+) -> None:
     """A crashed runner's exit report surfaces as failed + last_task_error.
 
     This is the reload-durability leg: the live ``session.status:failed``
@@ -489,6 +493,8 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
         root_conversation_id="87876a3cec563d43c2430b633747c7b7",
         agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         runner_id="runner_dead",
+        kind=kind,
+        live_status="idle",
     )
     conv_store = _ConversationStore(
         [_message_item("item_1", "hi")],
@@ -506,7 +512,10 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
 
     # Forced to failed by the exit report even though no task ran and the
     # status cache is empty (a fresh crash before any turn).
-    assert snapshot.status == "failed"
+    assert snapshot.status == expected_status
+    if kind == "sub_agent":
+        assert snapshot.last_task_error is None
+        return
     assert snapshot.last_task_error is not None
     assert snapshot.last_task_error["code"] == "runner_failed_to_start"
     # The daemon's full cause (incl. log tail) rides through verbatim.

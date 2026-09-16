@@ -5569,6 +5569,8 @@ async def _launch_runner_on_host_impl(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    *,
+    recovery_sessions: Sequence[Conversation] | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -5594,6 +5596,8 @@ async def _launch_runner_on_host_impl(
     :param conversation_store: Store for updating ``runner_id``.
     :param host_registry: In-memory ``HostRegistry``.
     :param host_conn: The live ``HostConnection`` for the host.
+    :param recovery_sessions: Interrupted sessions to restore before launch;
+        ``None`` selects the existing user-driven launch path.
     :returns: The :class:`_HostLaunchAttempt` — the new runner id plus any
         structured refusal from the host.
     """
@@ -5619,8 +5623,20 @@ async def _launch_runner_on_host_impl(
             if last is not None and last.runner_id == fresh.runner_id:
                 return last
             return _HostLaunchAttempt(runner_id=fresh.runner_id)
+        if recovery_sessions is not None and (
+            fresh.host_id != conv.host_id
+            or fresh.workspace != conv.workspace
+            or fresh.agent_id != conv.agent_id
+        ):
+            return _HostLaunchAttempt(
+                runner_id=fresh.runner_id or "", error_code="recovery_cancelled"
+            )
         attempt = await _launch_runner_on_host_locked(
-            fresh, conversation_store, host_registry, host_conn
+            fresh,
+            conversation_store,
+            host_registry,
+            host_conn,
+            recovery_sessions=recovery_sessions,
         )
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
@@ -5636,6 +5652,8 @@ async def _launch_runner_on_host_locked(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    *,
+    recovery_sessions: Sequence[Conversation] | None = None,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
@@ -5645,11 +5663,21 @@ async def _launch_runner_on_host_locked(
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
-    await asyncio.to_thread(
-        conversation_store.replace_runner_id,
-        conv.id,
-        new_runner_id,
-    )
+    if recovery_sessions is not None:
+        from omnigent.server.runner_recovery import prepare_recovery_bindings
+
+        if not await prepare_recovery_bindings(
+            conv, new_runner_id, recovery_sessions, conversation_store
+        ):
+            return _HostLaunchAttempt(
+                runner_id=conv.runner_id or "", error_code="recovery_cancelled"
+            )
+    else:
+        await asyncio.to_thread(
+            conversation_store.replace_runner_id,
+            conv.id,
+            new_runner_id,
+        )
     if superseded_runner_id and conv.host_id is not None:
         # The old runner is unbound as of the replace above; reap it so it
         # doesn't idle on the host forever (tunnel still authenticating,
