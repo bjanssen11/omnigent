@@ -28,11 +28,11 @@ import hmac
 import secrets
 from typing import cast
 
-from sqlalchemy import and_, delete, or_, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlDeviceGrant, current_workspace_id
+from omnigent.db.db_models import SqlDeviceGrant, SqlUser, current_workspace_id
 from omnigent.db.enum_codecs import decode_device_grant_status, encode_device_grant_status
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -74,6 +74,7 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         expires_at=row.expires_at,
         approved_at=row.approved_at,
         last_polled_at=row.last_polled_at,
+        account_generation=row.account_generation,
     )
 
 
@@ -186,7 +187,13 @@ class DeviceGrantStore:
         user_code = secrets.token_urlsafe(16)
 
         def write(session: Session) -> DeviceGrant:
+            generation = session.scalar(
+                select(SqlUser.account_generation).filter_by(
+                    workspace_id=current_workspace_id(), id=user_id
+                )
+            )
             row = SqlDeviceGrant(
+                account_generation=generation,
                 id=grant_id,
                 device_code_hash=device_code_hash,
                 user_code=user_code,
@@ -277,6 +284,11 @@ class DeviceGrantStore:
         """
 
         def write(session: Session) -> DeviceGrant | None:
+            generation = session.scalar(
+                select(SqlUser.account_generation).filter_by(
+                    workspace_id=current_workspace_id(), id=user_id
+                )
+            )
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -292,6 +304,7 @@ class DeviceGrantStore:
                     .values(
                         status=encode_device_grant_status("approved"),
                         user_id=user_id,
+                        account_generation=generation,
                         approved_at=now_epoch_seconds,
                     )
                 ),

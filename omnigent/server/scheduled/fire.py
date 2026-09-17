@@ -52,6 +52,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
+from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
@@ -300,7 +301,8 @@ async def _run_fire(
 
         scheduled_at = int(time.time())
         try:
-            await _run_fire_for_task(deps, task, dispatch, preflight, scheduled_at)
+            with account_authority_scope(task.user_id, task.account_generation):
+                await _run_fire_for_task(deps, task, dispatch, preflight, scheduled_at)
         except Exception:
             _logger.exception("scheduled fire: task %s failed", task.id)
 

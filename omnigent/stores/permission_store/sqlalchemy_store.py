@@ -105,6 +105,7 @@ def _to_account(row: SqlUser) -> Account:
         created_at=row.created_at,
         last_login_at=row.last_login_at,
         has_password=row.password_hash is not None,
+        account_generation=row.account_generation,
     )
 
 
@@ -443,6 +444,12 @@ class SqlAlchemyPermissionStore(PermissionStore):
             session.execute(stmt)
 
         run_write_transaction(self._session_immediate, "ensure_user", write)
+
+    def get_user(self, user_id: str) -> Account | None:
+        """Read the target identity without creating it. See base class."""
+        with self._session("read_target_account") as session:
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            return _to_account(row) if row is not None else None
 
     def list_users(self, *, limit: int = 1000) -> list[Account]:
         """List every real user row. See base class for contract."""

@@ -30,6 +30,7 @@ from typing import Any, Protocol
 from cachetools import TTLCache
 
 from omnigent._platform import normalize_interactive_shells
+from omnigent.db.account_authority import account_generation
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.host.frames import HostHelloFrame, HostSkillsResultFrame
 
@@ -270,6 +271,7 @@ class HostConnection:
     outbound_queue: asyncio.Queue[str | None]
     connected_at: float
     last_frame_at: float
+    account_generation: str | None = None
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -392,6 +394,7 @@ class HostRegistry:
             ws=ws,
             hello=hello,
             owner=owner,
+            account_generation=account_generation(owner) if owner else None,
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,

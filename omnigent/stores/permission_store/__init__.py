@@ -153,6 +153,11 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
+    def get_user(self, user_id: str) -> Account | None:
+        """Read the target account and generation before an operation on another user."""
+        ...
+
+    @abstractmethod
     def list_users(self, *, limit: int = 1000) -> list[Account]:
         """Return every real user row, for the admin user list.
 

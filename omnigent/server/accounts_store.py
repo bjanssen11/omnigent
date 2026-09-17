@@ -29,6 +29,7 @@ Schema:
 from __future__ import annotations
 
 import time
+import uuid
 from typing import cast
 
 from sqlalchemy import and_, delete, exists, select, update
@@ -67,6 +68,7 @@ def _to_account(row: SqlUser) -> Account:
         created_at=row.created_at,
         last_login_at=row.last_login_at,
         has_password=row.password_hash is not None,
+        account_generation=row.account_generation,
     )
 
 
@@ -80,6 +82,7 @@ def _to_account_token(row: SqlAccountToken) -> AccountToken:
         created_at=row.created_at,
         expires_at=row.expires_at,
         invited_is_admin=row.invited_is_admin,
+        account_generation=row.account_generation,
     )
 
 
@@ -152,6 +155,7 @@ class SqlAlchemyAccountStore:
                 id=user_id,
                 is_admin=is_admin,
                 password_hash=password_hash,
+                account_generation=uuid.uuid4().hex,
                 created_at=now,
             )
             session.add(row)
@@ -306,6 +310,14 @@ class SqlAlchemyAccountStore:
 
         return run_write_transaction(self._session_immediate, "delete_user", write)
 
+    def login_snapshot(self, user_id: str) -> tuple[str | None, str | None]:
+        """Read the password and generation together before password verification."""
+        with self._session("authenticate_account") as session:
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            if row is None:
+                return None, None
+            return row.password_hash, row.account_generation
+
     def get_password_hash(self, user_id: str) -> str | None:
         """Fetch a user's password hash for verification.
 
@@ -390,7 +402,13 @@ class SqlAlchemyAccountStore:
             raise ValueError(f"unknown token kind {kind!r}")
 
         def write(session: Session) -> AccountToken:
+            generation = session.scalar(
+                select(SqlUser.account_generation).filter_by(
+                    workspace_id=current_workspace_id(), id=user_id
+                )
+            )
             row = SqlAccountToken(
+                account_generation=generation,
                 id=token_id,
                 kind=encode_account_token_kind(kind),
                 user_id=user_id,

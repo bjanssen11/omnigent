@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
+    SqlUser,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
@@ -98,6 +99,7 @@ class Host:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
+    account_generation: str | None = None
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -171,6 +173,7 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_id=row.sandbox_id,
         terminating_sandbox_id=row.terminating_sandbox_id,
         deleted_at=row.deleted_at,
+        account_generation=row.account_generation,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
     )
 
@@ -283,6 +286,11 @@ class HostStore:
         )
 
         def write(session: Session) -> Host:
+            generation = session.scalar(
+                select(SqlUser.account_generation).filter_by(
+                    workspace_id=current_workspace_id(), id=user_id
+                )
+            )
             if managed_token is not None:
                 result = cast(
                     CursorResult[tuple[object]],
@@ -330,6 +338,7 @@ class HostStore:
                 # Known host_id (same user_id, or reown opted in): update
                 # user_id/name in case they changed, then refresh status and timestamp.
                 row.user_id = user_id
+                row.account_generation = generation
                 row.name = name
                 row.status = encode_host_status("online")
                 row.updated_at = now
@@ -347,6 +356,7 @@ class HostStore:
                     host_id=host_id,
                     name=name,
                     user_id=user_id,
+                    generation=generation,
                     now=now,
                     configured_harnesses_json=harnesses_json,
                 )
@@ -377,6 +387,7 @@ class HostStore:
 
             # Genuinely new host: plain INSERT.
             row = SqlHost(
+                account_generation=generation,
                 user_id=user_id,
                 name=name,
                 host_id=host_id,
@@ -423,6 +434,7 @@ class HostStore:
         # Preserve durable fields from the outgoing row before deletion.
         created_at = row.created_at
         user_id = row.user_id
+        generation = row.account_generation
         name = row.name
         token_hash = row.token_hash
         token_expires_at = row.token_expires_at
@@ -459,6 +471,7 @@ class HostStore:
         session.flush()
 
         new_row = SqlHost(
+            account_generation=generation,
             workspace_id=current_workspace_id(),
             host_id=new_host_id,
             user_id=user_id,
@@ -496,6 +509,7 @@ class HostStore:
         host_id: str,
         name: str,
         user_id: str,
+        generation: str | None,
         now: int,
         configured_harnesses_json: str | None = None,
     ) -> Host | None:
@@ -544,6 +558,7 @@ class HostStore:
             )
             .values(
                 user_id=user_id,
+                account_generation=generation,
                 name=name,
                 status=encode_host_status("online"),
                 updated_at=now,
@@ -557,6 +572,7 @@ class HostStore:
             status="online",
             created_at=created_at,
             updated_at=now,
+            account_generation=generation,
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
@@ -869,7 +885,13 @@ class HostStore:
         token_hash = hash_host_launch_token(token)
 
         def write(session: Session) -> Host:
+            generation = session.scalar(
+                select(SqlUser.account_generation).filter_by(
+                    workspace_id=current_workspace_id(), id=user_id
+                )
+            )
             row = SqlHost(
+                account_generation=generation,
                 user_id=user_id,
                 name=name,
                 host_id=host_id,

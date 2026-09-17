@@ -197,6 +197,7 @@ def mint_delegated_token(
     client_id: str,
     jti: str,
     scope: str | None = DELEGATED_SCOPE,
+    account_generation: str | None = None,
 ) -> str:
     """Mint a grant-derived or client-credential access token.
 
@@ -248,6 +249,8 @@ def mint_delegated_token(
         "jti": jti,
         "act": {"client_id": client_id},
     }
+    if account_generation is not None:
+        payload["account_generation"] = account_generation
     if grant_id is not None:
         payload["grant_id"] = grant_id
     if scope is not None:
@@ -428,6 +431,7 @@ def create_oauth_token_router(
             _logger.debug("oauth/token: opportunistic grant purge failed", exc_info=True)
 
     def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+        grant = device_grant_store.get_by_id(grant_id)
         # A first-party login grant renews with the SAME authority as the
         # session JWT it replaces (scope=None); a third-party device grant
         # stays restricted to the delegated allowlist.
@@ -437,6 +441,7 @@ def create_oauth_token_router(
             cookie_secret,
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
+            account_generation=grant.account_generation if grant else None,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
@@ -657,11 +662,13 @@ def create_device_auth_router(
     _last_purge = {"at": 0.0}
 
     def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+        grant = device_grant_store.get_by_id(grant_id)
         return mint_delegated_token(
             user_id,
             cookie_secret,
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
+            account_generation=grant.account_generation if grant else None,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),

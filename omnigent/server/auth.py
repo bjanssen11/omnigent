@@ -472,7 +472,7 @@ class UnifiedAuthProvider(AuthProvider):
             if header_strip_prefix is not None
             else resolve_auth_header_strip_prefix()
         )
-        self._cookie_cache: dict[str, tuple[str, float]] = {}
+        self._cookie_cache: dict[str, tuple[str, float, str | None]] = {}
         # Set by create_app when a device-grant store is wired. Returns
         # True if a grant_id has been revoked (or is unknown → fail
         # closed). Consulted only for delegated tokens (those carrying a
@@ -522,6 +522,9 @@ class UnifiedAuthProvider(AuthProvider):
             handshake (both are ``HTTPConnection``).
         :returns: Authenticated user ID, or ``None`` (→ 401).
         """
+        from omnigent.db.account_authority import clear_account_authority
+
+        clear_account_authority()
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
@@ -549,6 +552,7 @@ class UnifiedAuthProvider(AuthProvider):
         cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
         if cookie_config is None:
             return None
+        from omnigent.db.account_authority import account_generation
         from omnigent.server.oidc import mint_session_token
 
         return mint_session_token(
@@ -556,6 +560,7 @@ class UnifiedAuthProvider(AuthProvider):
             cookie_config.cookie_secret,
             ttl_seconds,
             self._source,
+            account_generation=account_generation(user_id),
         )
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
@@ -599,6 +604,10 @@ class UnifiedAuthProvider(AuthProvider):
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
         cached = self._cookie_cache.get(cache_key)
         if cached is not None and cached[1] > time.monotonic():
+            if cached[2] is not None:
+                from omnigent.db.account_authority import bind_account_authority
+
+                bind_account_authority(cached[0], cached[2])
             return cached[0]
 
         try:
@@ -619,6 +628,13 @@ class UnifiedAuthProvider(AuthProvider):
         # request-scoped check below, and a token carrying either is never
         # served from the plain user-id cache — the cache is token-keyed, so
         # a hit on one path would replay past both checks on every other.
+        generation = payload.get("account_generation") if self._source == "accounts" else None
+        if isinstance(generation, str):
+            from omnigent.db.account_authority import bind_account_authority
+
+            bind_account_authority(user_id, generation)
+        else:
+            generation = None
         grant_id = payload.get("grant_id")
         scope = payload.get("scope")
         if grant_id is not None or scope is not None:
@@ -648,6 +664,7 @@ class UnifiedAuthProvider(AuthProvider):
             self._cookie_cache[cache_key] = (
                 user_id,
                 time.monotonic() + remaining,
+                generation,
             )
 
         return user_id

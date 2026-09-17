@@ -25,6 +25,7 @@ import jwt
 from fastapi import APIRouter, Request
 from starlette.responses import RedirectResponse
 
+from omnigent.db.account_authority import account_generation
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 
@@ -154,6 +155,7 @@ def create_connection_router(
                 "exp": int(time.time()) + _STATE_TTL_S,
                 **extra_claims,
             }
+            payload["account_generation"] = account_generation(user_id)
             return jwt.encode(payload, key, algorithm=_STATE_ALG)
 
         start = hooks.begin(request, build_state)

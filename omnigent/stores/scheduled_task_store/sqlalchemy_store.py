@@ -12,6 +12,7 @@ from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
     SqlScheduledTask,
     SqlScheduledTaskRun,
+    SqlUser,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import (
@@ -48,6 +49,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         name=row.name,
         prompt=row.prompt,
         user_id=row.user_id,
+        account_generation=row.account_generation,
         agent_id=row.agent_id,
         timezone=row.timezone,
         created_at=row.created_at,
@@ -146,7 +148,13 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         created_at = now_epoch()
 
         def write(session: Session) -> ScheduledTask:
+            generation = session.scalar(
+                select(SqlUser.account_generation).filter_by(
+                    workspace_id=current_workspace_id(), id=user_id
+                )
+            )
             row = SqlScheduledTask(
+                account_generation=generation,
                 id=scheduled_task_id,
                 name=name,
                 prompt=prompt,
