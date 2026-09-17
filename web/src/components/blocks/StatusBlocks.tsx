@@ -598,8 +598,8 @@ export function RoutingDecisionCard({
   agent,
   routing,
 }: RoutingDecisionCardProps) {
-  const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource, taskDescription } =
-    routing ?? {};
+  const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource } = routing ?? {};
+  const taskDescription = routing?.taskDescription?.trim();
   const short = shortModelName(model);
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
@@ -684,9 +684,7 @@ export function RoutingDecisionCard({
       </div>
       <div className="flex items-center gap-2 text-sm">
         {taskDescription ? (
-          // The human name of the work this decision governed — what tells a
-          // fan-out's chips apart when the header badge names one shared
-          // subagent type for all of them.
+          // Name the work even when sibling spawns share a type and rationale.
           <span
             className="min-w-0 truncate text-foreground"
             data-testid="routing-decision-task"

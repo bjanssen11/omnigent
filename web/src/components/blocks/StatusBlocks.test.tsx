@@ -603,9 +603,7 @@ describe("routing decision — harness / scope / raw pick", () => {
     }
   });
 
-  // A fan-out's spawns often share one subagent type, so the type badge alone
-  // leaves the chips identical; the task label is what ties each decision to
-  // the work it governed.
+  // A shared type or rationale cannot identify the work a decision governs.
   it("card: names the task the decision governed, in place of the shared type row", () => {
     render(
       <RoutingDecisionCard
@@ -621,21 +619,26 @@ describe("routing decision — harness / scope / raw pick", () => {
     expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(
       "subagent: general-purpose",
     );
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"task_description": "Research auth flows"/)).toBeInTheDocument();
   });
 
-  it("card: an unlabeled spawn keeps the agent row label", () => {
-    render(
-      <RoutingDecisionCard
-        model="databricks-claude-sonnet-4-6"
-        applied={false}
-        rationale="x"
-        agent="general-purpose"
-        routing={{ scope: "native_subagent" }}
-      />,
-    );
-    expect(screen.queryByTestId("routing-decision-task")).toBeNull();
-    expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("general-purpose");
-  });
+  it.each([undefined, "", " \t\n"])(
+    "card: an unlabeled spawn (%j) keeps the agent row label",
+    (taskDescription) => {
+      render(
+        <RoutingDecisionCard
+          model="databricks-claude-sonnet-4-6"
+          applied={false}
+          rationale="x"
+          agent="general-purpose"
+          routing={{ scope: "native_subagent", taskDescription }}
+        />,
+      );
+      expect(screen.queryByTestId("routing-decision-task")).toBeNull();
+      expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("general-purpose");
+    },
+  );
 
   // The router's vocabulary pick may have had no endpoint and been mapped to a
   // servable id — that must be visible. When it resolves to the same short

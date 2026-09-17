@@ -784,7 +784,7 @@ async def test_task_name_is_capped_at_parse_time() -> None:
 def test_task_description_is_parsed_and_capped() -> None:
     """The spawn's human label is agent-authored, so it is bounded like ``task_name``."""
     parsed = SubagentRouteRequest.from_payload(
-        {"harness": "claude-native", "task_description": "Research auth flows"}
+        {"harness": "claude-native", "task_description": "  Research auth flows\n"}
     )
     assert parsed.task_description == "Research auth flows"
     capped = SubagentRouteRequest.from_payload(
@@ -792,10 +792,15 @@ def test_task_description_is_parsed_and_capped() -> None:
     )
     assert capped.task_description is not None
     assert len(capped.task_description) == 200
-    # A blank or absent label is no label at all, not an empty one.
-    blank = SubagentRouteRequest.from_payload({"harness": "codex", "task_description": ""})
-    assert blank.task_description is None
     assert SubagentRouteRequest.from_payload({"harness": "codex"}).task_description is None
+
+
+@pytest.mark.parametrize("description", ["", " \t\n", None, 7])
+def test_invalid_task_description_keeps_the_unlabeled_fallback(description: Any) -> None:
+    req = SubagentRouteRequest.from_payload(
+        {"harness": "claude-native", "task_description": description}
+    )
+    assert req.task_description is None
 
 
 # ── Decision persistence ────────────────────────────────────────────

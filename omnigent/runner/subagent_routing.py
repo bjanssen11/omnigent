@@ -361,8 +361,8 @@ class SubagentRouteRequest:
             # Agent-authored like task_name, so bounded the same way before
             # it is stored or rendered.
             task_description=(
-                task_description[:_TASK_NAME_CAP]
-                if isinstance(task_description, str) and task_description
+                task_description.strip()[:_TASK_NAME_CAP].rstrip() or None
+                if isinstance(task_description, str)
                 else None
             ),
             prompt=prompt if isinstance(prompt, str) and prompt else None,

@@ -123,11 +123,7 @@ HOOK_TIMEOUT_S = REQUEST_TIMEOUT_S + HOOK_TIMEOUT_HEADROOM_S
 # ``agent_name``.
 DEFAULT_TASK_KEYS: tuple[str, ...] = ("subagent_type",)
 
-# ``tool_input`` keys carrying the spawn's human task label, in preference
-# order. Claude's ``Task`` sends a short ``description`` ("Research auth
-# flows") that tells one fan-out spawn from its same-typed siblings; codex's
-# ``spawn_agent`` has no equivalent key (its per-spawn identity is already
-# the ``task_name``), so the field stays absent there.
+# Claude's Agent/Task description labels the work; Codex uses task_name.
 DEFAULT_DESCRIPTION_KEYS: tuple[str, ...] = ("description",)
 
 # Flags every harness hook entrypoint accepts. None is required: a hook
