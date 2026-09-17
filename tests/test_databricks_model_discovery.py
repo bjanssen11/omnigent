@@ -5,7 +5,12 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.models.databricks_model_discovery import discover_databricks_claude_catalog
+from omnigent.models.databricks_model_discovery import (
+    discover_databricks_claude_catalog,
+    resolve_model_services_parent,
+)
+
+_PARENT_ENV_VAR = "OMNIGENT_DATABRICKS_MODEL_SERVICES_PARENT"
 
 # One-shot stubs for the two discovery endpoints: ``(status, json_payload)``,
 # with a ``None`` payload meaning "no body" (a bare error response).
@@ -371,3 +376,22 @@ def test_select_servable_model_matches_legacy_spelling() -> None:
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
     # A model the workspace does not serve is left for the caller to pass through.
     assert select_servable_model("databricks-gpt-9-9", servable) is None
+
+
+def test_resolve_model_services_parent_defaults_to_system_ai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(_PARENT_ENV_VAR, raising=False)
+    assert resolve_model_services_parent() == "schemas/system.ai"
+
+
+def test_resolve_model_services_parent_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_PARENT_ENV_VAR, "schemas/eng_dev.ai_gateway")
+    assert resolve_model_services_parent() == "schemas/eng_dev.ai_gateway"
+
+
+def test_resolve_model_services_parent_override_beats_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_PARENT_ENV_VAR, "schemas/from_env")
+    assert resolve_model_services_parent("schemas/from_config") == "schemas/from_config"
