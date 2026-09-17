@@ -1394,6 +1394,43 @@ def fetch_databricks_model_service_entries(
                 "the model list may be incomplete",
                 _MODEL_SERVICES_MAX_PAGES,
             )
+    bedrock_metadata: dict[str, ModelMetadata] | None = None
+
+    def routing_target_metadata(targets: tuple[str, ...]) -> ModelMetadata | None:
+        """Return conservative limits for the service's Bedrock route targets."""
+        nonlocal bedrock_metadata
+        if not targets:
+            return None
+        if bedrock_metadata is None:
+            try:
+                bedrock_metadata = {
+                    entry.id.lower(): entry.metadata for entry in catalog_model_entries("bedrock")
+                }
+            except Exception:  # noqa: BLE001 — catalog enrichment is best-effort
+                _logger.info(
+                    "could not load Bedrock metadata for model-service routes", exc_info=True
+                )
+                bedrock_metadata = {}
+        matched = [
+            bedrock_metadata[target.lower()]
+            for target in targets
+            if target.lower() in bedrock_metadata
+        ]
+        context_windows = [
+            metadata.context_window for metadata in matched if metadata.context_window
+        ]
+        output_limits = [
+            metadata.max_output_tokens for metadata in matched if metadata.max_output_tokens
+        ]
+        if not context_windows and not output_limits:
+            return None
+        # A weighted route can change destination between requests. Advertise
+        # only the limits every live destination can honor.
+        return ModelMetadata(
+            context_window=min(context_windows) if context_windows else None,
+            max_output_tokens=min(output_limits) if output_limits else None,
+        )
+
     models: list[ModelEntry] = []
     for service in services:
         if not isinstance(service, dict):
@@ -1408,11 +1445,11 @@ def fetch_databricks_model_service_entries(
         )
         if not name:
             continue
+        detail: object = service
         api_types = service.get("supported_api_types")
-        if not (isinstance(api_types, list) and api_types):
-            # The list endpoint omits supported_api_types for MPS-backed
-            # model-services (e.g. a gateway schema), so fetch it per-service or
-            # the entry is dropped below for having no wire API.
+        # Gateway-schema list entries omit both API capabilities and routing
+        # targets. Fetch their complete service record to recover both.
+        if not (isinstance(api_types, list) and api_types) or not name.startswith("system.ai."):
             try:
                 with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as svc_client:
                     svc_resp = svc_client.get(
@@ -1420,9 +1457,26 @@ def fetch_databricks_model_service_entries(
                         headers={"Authorization": f"Bearer {token}"},
                     )
                     svc_resp.raise_for_status()
-                    api_types = svc_resp.json().get("supported_api_types")
+                    detail = svc_resp.json()
+                    if isinstance(detail, dict):
+                        api_types = detail.get("supported_api_types", api_types)
             except httpx.HTTPError:
-                api_types = None
+                detail = service
+        targets: list[str] = []
+        routing = detail.get("config", {}).get("routing", {}) if isinstance(detail, dict) else {}
+        destinations = routing.get("destinations", []) if isinstance(routing, dict) else []
+        for destination in destinations if isinstance(destinations, list) else []:
+            if not isinstance(destination, dict) or destination.get("is_deleted") is True:
+                continue
+            traffic_percentage = destination.get("traffic_percentage")
+            if isinstance(traffic_percentage, (int, float)) and traffic_percentage <= 0:
+                continue
+            config = destination.get("external_model_config")
+            target = config.get("target") if isinstance(config, dict) else None
+            target_model = target.get("model") if isinstance(target, dict) else None
+            if isinstance(target_model, str) and target_model:
+                targets.append(target_model)
+        target_metadata = routing_target_metadata(tuple(targets))
         normalized_api_types = {
             api_type.lower()
             for api_type in (api_types if isinstance(api_types, list) else [])
@@ -1443,7 +1497,15 @@ def fetch_databricks_model_service_entries(
             ModelEntry(
                 id=name,
                 family=model_family_token(name),
-                metadata=ModelMetadata(wire_apis=frozenset(wire_apis)),
+                metadata=ModelMetadata(
+                    context_window=(
+                        target_metadata.context_window if target_metadata is not None else None
+                    ),
+                    max_output_tokens=(
+                        target_metadata.max_output_tokens if target_metadata is not None else None
+                    ),
+                    wire_apis=frozenset(wire_apis),
+                ),
             )
         )
     return tuple(models)
