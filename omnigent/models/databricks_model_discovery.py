@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import warnings
 from collections.abc import Iterable
@@ -19,10 +20,27 @@ _ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
 _MODEL_SERVICE_PREFIX = "model-services/"
 _SYSTEM_MODEL_PREFIX = "system.ai."
 _MODEL_SERVICES_MAX_RESULTS = 1000
-_MODEL_SERVICES_PARENT = "schemas/system.ai"
+_DEFAULT_MODEL_SERVICES_PARENT = "schemas/system.ai"
+_MODEL_SERVICES_PARENT_ENV_VAR = "OMNIGENT_DATABRICKS_MODEL_SERVICES_PARENT"
 _PAGE_SIZE = 100
 _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
+
+
+def resolve_model_services_parent(override: str | None = None) -> str:
+    """Unity Catalog parent to list Databricks model-services under.
+
+    Priority: an explicit ``override`` (from provider config), then the
+    ``OMNIGENT_DATABRICKS_MODEL_SERVICES_PARENT`` env var, then the default
+    ``schemas/system.ai``. A workspace whose gateway model-services live in a
+    non-``system.ai`` schema opts in without changing stock behaviour.
+    """
+    if override and override.strip():
+        return override.strip()
+    env = os.environ.get(_MODEL_SERVICES_PARENT_ENV_VAR, "").strip()
+    if env:
+        return env
+    return _DEFAULT_MODEL_SERVICES_PARENT
 
 
 #: Catalog spellings the same endpoint can be served under. Ordered by
@@ -162,7 +180,7 @@ def _list_model_service_ids(
     for _ in range(_MAX_PAGES):
         params: dict[str, str] = {
             "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
-            "parent": _MODEL_SERVICES_PARENT,
+            "parent": resolve_model_services_parent(),
         }
         if page_token is not None:
             params["page_token"] = page_token

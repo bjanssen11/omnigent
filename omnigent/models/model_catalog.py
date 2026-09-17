@@ -47,6 +47,7 @@ from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
+from omnigent.models.databricks_model_discovery import resolve_model_services_parent
 from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -101,12 +102,9 @@ _LLM_NAME_TOKENS = ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi")
 # Chat-capable endpoint tasks ("llm/v1/chat"); embeddings/rerankers don't match.
 _LLM_TASK_TOKENS = ("chat", "completion")
 
-# DATABRICKS-PATCH(model-services-scoped-listing): scope + page the Unity
-# Catalog model-services listing. Mirrors
-# ``databricks_model_discovery._MODEL_SERVICES_PARENT`` /
-# ``_MODEL_SERVICES_MAX_RESULTS`` — including the parameter *name*, so both
-# callers of this endpoint ask for a page size the API actually honors.
-_MODEL_SERVICES_PARENT = "schemas/system.ai"
+# Scope + page the Unity Catalog model-services listing. The parent schema
+# comes from the shared resolver in databricks_model_discovery so both callers
+# stay in sync and honour the same override.
 _MODEL_SERVICES_MAX_RESULTS = 100
 _MODEL_SERVICES_MAX_PAGES = 100
 
@@ -1329,6 +1327,7 @@ def fetch_databricks_model_service_entries(
     token: str,
     *,
     transport: httpx.BaseTransport | None = None,
+    model_services_parent: str | None = None,
 ) -> tuple[ModelEntry, ...]:
     """Fetch normalized Unity Catalog model-service metadata.
 
@@ -1355,7 +1354,7 @@ def fetch_databricks_model_service_entries(
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
         for _ in range(_MODEL_SERVICES_MAX_PAGES):
             params = {
-                "parent": _MODEL_SERVICES_PARENT,
+                "parent": resolve_model_services_parent(model_services_parent),
                 "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
             }
             if page_token is not None:
@@ -1410,6 +1409,20 @@ def fetch_databricks_model_service_entries(
         if not name:
             continue
         api_types = service.get("supported_api_types")
+        if not (isinstance(api_types, list) and api_types):
+            # The list endpoint omits supported_api_types for MPS-backed
+            # model-services (e.g. a gateway schema), so fetch it per-service or
+            # the entry is dropped below for having no wire API.
+            try:
+                with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as svc_client:
+                    svc_resp = svc_client.get(
+                        f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/{raw_name}",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    svc_resp.raise_for_status()
+                    api_types = svc_resp.json().get("supported_api_types")
+            except httpx.HTTPError:
+                api_types = None
         normalized_api_types = {
             api_type.lower()
             for api_type in (api_types if isinstance(api_types, list) else [])

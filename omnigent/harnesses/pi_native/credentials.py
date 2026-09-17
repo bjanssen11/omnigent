@@ -628,7 +628,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     else:
         try:
             claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
-                creds.host, creds.token
+                creds.host, creds.token, model_services_parent=entry.model_services_parent
             )
         except Exception:  # noqa: BLE001 — network failure must not break launch
             _LOGGER.info(
@@ -831,6 +831,8 @@ def _clamp_entries_to_output_caps(
 def _fetch_pi_model_lists(
     workspace_url: str,
     token: str,
+    *,
+    model_services_parent: str | None = None,
 ) -> _PiModelLists:
     """Fetch live model lists from the Unity Catalog model-services API.
 
@@ -856,7 +858,9 @@ def _fetch_pi_model_lists(
         Pi model entry dicts ready to write into ``models.json``.
     """
     try:
-        models = model_catalog.fetch_databricks_model_service_entries(workspace_url, token)
+        models = model_catalog.fetch_databricks_model_service_entries(
+            workspace_url, token, model_services_parent=model_services_parent
+        )
     except Exception:  # noqa: BLE001 — HTTP/network failure → empty
         _LOGGER.warning(
             "pi-native: could not fetch Databricks model list; "
