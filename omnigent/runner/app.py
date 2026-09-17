@@ -3364,12 +3364,12 @@ def create_runner_app(
         runner log) and attaches the live pane snapshot as a ``Last captured
         terminal output:`` block, which the web UI renders as diagnostics.
         """
-        cause = str(exc).strip()
-        message = (
-            f"Harness stream connection error: {cause}"
-            if cause
-            else "Harness stream connection error."
-        )
+        # httpx raises several transport errors with no message at all
+        # (``ReadError()``), which left the whole diagnostic as the bare
+        # sentence. Fall back to the exception type so the message always names
+        # which transport failure ended the stream.
+        cause = str(exc).strip() or type(exc).__name__
+        message = f"Harness stream connection error: {cause}"
         pane = _live_terminal_pane_snapshot(conv_id)
         if pane:
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
@@ -9217,9 +9217,13 @@ def create_runner_app(
                 yield _response_failed_event(_error, source="llm")
 
             except (httpx.HTTPError, RuntimeError) as exc:
+                # Name the type as well as the text: the messageless httpx
+                # errors otherwise log a trailing colon and nothing, so one
+                # signature covered every transport cause.
                 _logger.exception(
-                    "proxy stream connection error for %s: %s",
+                    "proxy stream connection error for %s: %s: %s",
                     conv_id,
+                    type(exc).__name__,
                     exc,
                     extra={
                         "session_id": conv_id,
@@ -9227,6 +9231,7 @@ def create_runner_app(
                         "attributes": {
                             "harness": harness_name,
                             "response_id": _response_id,
+                            "exception_type": type(exc).__name__,
                         },
                     },
                 )
