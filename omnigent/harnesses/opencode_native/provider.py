@@ -223,6 +223,7 @@ def resolve_config_gateway_providers(
         KEY_KIND,
         LOCAL_KIND,
         OPENAI_FAMILY,
+        FamilyConfig,
         default_provider_for_harness,
         load_config,
     )
@@ -244,11 +245,10 @@ def resolve_config_gateway_providers(
     override = _strip_model_suffix(model_override) if model_override else None
     providers: dict[str, object] = {}
     auth_commands: dict[str, str] = {}
-    # Pin the default on anthropic when present (opencode/pi both prefer the
-    # Anthropic surface), else openai. The override, when given, pins on that
-    # same family and is added to its models map verbatim.
-    pinned: str | None = None
 
+    # Resolve the driveable families up front so an override can pin the
+    # family that actually lists it (its wire protocol must match the model).
+    families: list[tuple[str, str, FamilyConfig]] = []
     for family_name, npm in (
         (ANTHROPIC_FAMILY, _AI_SDK_ANTHROPIC),
         (OPENAI_FAMILY, _AI_SDK_OPENAI_COMPATIBLE),
@@ -263,20 +263,38 @@ def resolve_config_gateway_providers(
         # (``@ai-sdk/openai-compatible``); a Responses-wire family is skipped.
         if family_name == OPENAI_FAMILY and family.wire_api != CHAT_WIRE_API:
             continue
+        families.append((family_name, npm, family))
 
+    def _lists_override(family_name: str, family: FamilyConfig) -> bool:
+        candidates = (entry.family_default_model(family_name), *family.models.values())
+        return any(c and _strip_model_suffix(c) == override for c in candidates)
+
+    # The override pins on the family that lists it (default or any tier);
+    # an unlisted override falls back to the first present family
+    # (anthropic preferred, matching pi).
+    override_family: str | None = None
+    if override and families:
+        override_family = next(
+            (name for name, _, fam in families if _lists_override(name, fam)),
+            families[0][0],
+        )
+
+    # Without an override, pin the default on anthropic when present
+    # (opencode/pi both prefer the Anthropic surface), else openai.
+    pinned: str | None = None
+
+    for family_name, npm, family in families:
         provider_id = _config_gateway_provider_id(entry.name, family_name)
         default_model = entry.family_default_model(family_name)
         model_ids: list[str] = []
-        # The override pins the default; attribute it to the first present
-        # family (anthropic preferred) so it lands in exactly one provider.
-        if override and pinned is None:
+        if override and family_name == override_family:
             _append_unique_model(model_ids, override)
             pinned = f"{provider_id}/{override}"
-        # Pin the family default (unless an override already pinned) so the
-        # default selection is the configured default, not a tier.
+        # Pin the family default (unless the override pins) so the default
+        # selection is the configured default, not a tier.
         if default_model:
             _append_unique_model(model_ids, default_model)
-            if pinned is None:
+            if pinned is None and override_family is None:
                 pinned = f"{provider_id}/{_strip_model_suffix(default_model)}"
         # Enumerate every configured tier (high/med/low/…) so opencode's picker
         # lists them all; de-duped against the default/override.
@@ -298,7 +316,7 @@ def resolve_config_gateway_providers(
             "options": options,
             "models": {mid: {"name": mid} for mid in model_ids},
         }
-        if pinned is None:
+        if pinned is None and override_family is None:
             pinned = f"{provider_id}/{model_ids[0]}"
 
     if not providers or pinned is None:

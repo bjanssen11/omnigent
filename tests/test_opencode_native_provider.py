@@ -984,6 +984,36 @@ def test_config_gateway_model_override_verbatim_and_pinned(
     assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-opus"
 
 
+def test_config_gateway_override_pins_the_family_that_lists_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An override the openai family lists pins that family, not anthropic."""
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
+
+    resolution = resolve_config_gateway_providers(model_override="eng_dev.ai_gateway.omni-gpt")
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gateway-openai/eng_dev.ai_gateway.omni-gpt"
+    providers = resolution.config["provider"]
+    # The GPT id must not leak into the Anthropic Messages surface's models.
+    assert "eng_dev.ai_gateway.omni-gpt" not in providers["gateway-anthropic"]["models"]
+    assert "eng_dev.ai_gateway.omni-claude" in providers["gateway-anthropic"]["models"]
+
+
+def test_config_gateway_unlisted_override_falls_back_to_first_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An override no family lists pins the first family (anthropic preferred)."""
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
+
+    resolution = resolve_config_gateway_providers(model_override="an-id-no-family-lists")
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gateway-anthropic/an-id-no-family-lists"
+    anthropic_models = resolution.config["provider"]["gateway-anthropic"]["models"]
+    assert "an-id-no-family-lists" in anthropic_models
+
+
 def test_config_gateway_skips_openai_responses_wire(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
