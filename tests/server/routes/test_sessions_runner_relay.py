@@ -808,12 +808,7 @@ async def test_relay_outage_log_reports_its_shape_and_failed_outcome(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A mid-turn drop records how the outage looked and that it failed the turn.
-
-    "Runner disconnected unexpectedly." is the widest server-side failure
-    message there is, and on its own it cannot say whether the tunnel flapped
-    for the whole grace window or dropped once and never answered.
-    """
+    """A mid-turn drop records its retry count, duration, and failed outcome."""
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
@@ -910,6 +905,60 @@ async def test_relay_outage_log_names_a_user_stop(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_outage_duration_excludes_healthy_stream_time(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each outage starts at transport loss and resets after a long-lived retry."""
+    from omnigent.server.routes._sessions import orchestration
+
+    now = 100.0
+    durations = iter([3600.0, 0.0, 30.0, 0.0])
+    calls = 0
+
+    async def relay_once(*args: object) -> None:
+        nonlocal now, calls
+        now += next(durations)
+        calls += 1
+        raise orchestration._RelayTransportLost(intentional=calls == 4)
+
+    async def paced_retry(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    async def persist_status(*args: object) -> None:
+        pass
+
+    local_asyncio = SimpleNamespace(
+        **{name: getattr(asyncio, name) for name in dir(asyncio) if not name.startswith("__")}
+    )
+    local_asyncio.get_running_loop = lambda: SimpleNamespace(time=lambda: now)
+    local_asyncio.sleep = paced_retry
+    monkeypatch.setattr(orchestration, "asyncio", local_asyncio)
+    monkeypatch.setattr(orchestration, "_relay_runner_stream_once", relay_once)
+    monkeypatch.setattr(orchestration, "_persist_session_status_error_labels", persist_status)
+    monkeypatch.setattr(orchestration, "_publish_status", lambda *args: None)
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 10.0)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 1.0)
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+        await orchestration._relay_runner_stream(
+            "11111111111111111111111111111111",
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+        )
+
+    retries = _outage_records(caplog, "relay_transport_retry")
+    assert [record.attributes["outage_s"] for record in retries] == [0.0, 1.0, 0.0]
+    assert [record.attributes["attempt"] for record in retries] == [1, 2, 1]
+    assert [record.attributes["streamed_s"] for record in retries] == [3600.0, 0.0, 30.0]
+    resolved = _outage_records(caplog, "relay_outage_resolved")
+    assert len(resolved) == 1
+    assert resolved[0].attributes["outage_s"] == 1.0
+    assert resolved[0].attributes["attempts"] == 2
+    assert resolved[0].attributes["outcome"] == "stopped_by_user"
 
 
 @pytest.mark.asyncio

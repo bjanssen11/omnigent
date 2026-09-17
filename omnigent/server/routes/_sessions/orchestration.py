@@ -6274,15 +6274,9 @@ async def _relay_runner_stream(
         ready heartbeat; see :func:`_relay_runner_stream_once`.
     """
     loop = asyncio.get_running_loop()
-    # Set on the first loss of every outage, alongside the counters below, and
-    # always before it is read — the loop only compares it inside the except
-    # branch that assigns it.
+    # The first loss initializes the deadline and outage counters together.
     deadline: float = 0.0
-    # Shape of the current outage, for the give-up log: how many reconnects it
-    # took and when the tunnel first dropped. A tunnel that flapped for the
-    # whole grace window and one that dropped once and never answered are
-    # different faults behind the same message. Both reset together when a new
-    # outage begins, so the two never describe different spans.
+    # Measure from transport loss; the healthy stream duration is separate.
     attempts = 0
     outage_started: float | None = None
     while True:
@@ -6298,12 +6292,9 @@ async def _relay_runner_stream(
         except _RelayTransportLost as lost:
             now = loop.time()
             streamed_s = now - started
-            # An attempt that streamed longer than the grace was a live tunnel
-            # dropping anew: a fresh outage, so it gets a fresh window and its
-            # own counts. One condition drives all three — a second spelling of
-            # it would drift from the window it is supposed to match.
+            # A long-lived retry gets a fresh grace window and outage counters.
             if outage_started is None or streamed_s > RUNNER_DISCONNECT_GRACE_S:
-                outage_started = started
+                outage_started = now
                 attempts = 0
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
             attempts += 1
@@ -6410,11 +6401,7 @@ async def _relay_runner_stream(
                     disconnect_error,
                     conversation_store,
                 )
-            # One record per resolved outage. The four outcomes above are
-            # otherwise only distinguishable by matching four different message
-            # texts (and the stopped-by-user case logged nothing at all), so
-            # "how often does a lost tunnel actually break a turn" could not be
-            # asked of these logs.
+            # Record the terminal outcome when this relay stops retrying.
             _logger.info(
                 "Relay: runner outage resolved for session=%s as %s (%d attempt(s) over %.1fs)",
                 session_id,
