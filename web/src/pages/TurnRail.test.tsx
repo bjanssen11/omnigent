@@ -134,10 +134,13 @@ describe("TurnRail", () => {
     );
     const rail = container.querySelector<HTMLElement>(".turn-rail-fade")!;
     rail.scrollBy = vi.fn(() => {
-      // A smooth alignment passes through the near-top zone before reaching its target.
+      // A smooth alignment passes through the near-top zone before reaching its
+      // target, then an upward re-alignment crosses back through it.
       rail.scrollTop = 20;
       fireEvent.scroll(rail);
       rail.scrollTop = 120;
+      fireEvent.scroll(rail);
+      rail.scrollTop = 20;
       fireEvent.scroll(rail);
     });
     emitIntersection(observers[0]!, screen.getByLabelText("Jump to: prompt number 59"), {
