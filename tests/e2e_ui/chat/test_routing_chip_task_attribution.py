@@ -1,25 +1,65 @@
 """Task labels survive the hook, routing relay, live transcript, and reload.
 
 The Claude binary is omitted: realistic Agent inputs go through the real hook
-payload builder and server route. Similar tasks must remain attributable even
-when their routing rationales overlap.
+payload builder, runner loopback endpoint, and server relay. Similar tasks must
+remain attributable even when their routing rationales overlap.
 """
 
 from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import httpx
 from playwright.sync_api import Page, expect
 
 from omnigent.inner.hook_scripts.subagent_router import build_route_request
+from omnigent.runner.subagent_routing import make_server_relay_resolver, start_subagent_router
 from tests.e2e_ui.conftest import seed_committed_turn
 
 _PARENT_MODEL = "databricks-claude-sonnet-4-6"
 _TASKS = ("Review auth.py", "Review sessions.py", "Review tokens.py")
 
 
+async def _route_spawns(base_url: str, session_id: str, bridge_dir: Path) -> None:
+    """Send hook payloads through the runner's real loopback and server hops."""
+    async with httpx.AsyncClient(base_url=base_url) as server_client:
+        router = start_subagent_router(
+            bridge_dir=bridge_dir,
+            session_id=session_id,
+            resolver=make_server_relay_resolver(server_client),
+            loop=asyncio.get_running_loop(),
+        )
+        try:
+            async with httpx.AsyncClient() as hook_client:
+                for description in _TASKS:
+                    body = build_route_request(
+                        {
+                            "subagent_type": "general-purpose",
+                            "description": description,
+                            "prompt": (
+                                f"{description} for correctness. Report findings without editing."
+                            ),
+                        },
+                        harness="claude-native",
+                        parent_model=_PARENT_MODEL,
+                    )
+                    hook = await hook_client.post(
+                        f"{router.url}/v1/sessions/{session_id}/route-subagent",
+                        headers={"Authorization": f"Bearer {router.token}"},
+                        json=body,
+                        timeout=15.0,
+                    )
+                    hook.raise_for_status()
+        finally:
+            router.close()
+
+
 def test_fanout_routing_chips_are_individually_attributable(
     page: Page,
     seeded_session: tuple[str, str],
+    tmp_path: Path,
 ) -> None:
     """Identify three similar tasks in live chips and persisted raw verdicts."""
     base_url, session_id = seeded_session
@@ -41,18 +81,11 @@ def test_fanout_routing_chips_are_individually_attributable(
         page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_test_id("composer-workspace-controls")).to_be_visible()
 
-    for description in _TASKS:
-        body = build_route_request(
-            {
-                "subagent_type": "general-purpose",
-                "description": description,
-                "prompt": f"{description} for correctness. Report findings without editing.",
-            },
-            harness="claude-native",
-            parent_model=_PARENT_MODEL,
+    # Playwright owns the main thread's event loop.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(asyncio.run, _route_spawns(base_url, session_id, tmp_path)).result(
+            timeout=60
         )
-        hook = httpx.post(f"{session_url}/hooks/route-subagent", json=body, timeout=15.0)
-        hook.raise_for_status()
 
     cards = page.get_by_test_id("routing-decision-card")
     expect(cards).to_have_count(3, timeout=15_000)

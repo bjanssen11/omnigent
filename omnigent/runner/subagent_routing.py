@@ -1212,6 +1212,7 @@ def make_server_relay_resolver(
         body = {
             "harness": req.harness,
             "task_name": req.task_name,
+            "task_description": req.task_description,
             "prompt": req.prompt,
             "fork": req.fork,
             "parent_model": req.parent_model,
