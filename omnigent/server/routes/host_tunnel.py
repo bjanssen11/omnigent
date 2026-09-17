@@ -83,7 +83,7 @@ def create_host_tunnel_router(
     on_host_connect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
-    on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
+    on_runner_exited: Callable[[str, str, str], Awaitable[bool]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
 ) -> APIRouter:
@@ -108,7 +108,9 @@ def create_host_tunnel_router(
         Used for reconnect reconciliation.
     :param on_runner_exited: Optional async callback fired when a host
         reports one of its spawned runners died unexpectedly
-        (``host.runner_exited``). Receives ``(runner_id, error)``.
+        (``host.runner_exited``). Receives ``(host_id, runner_id, error)``
+        and returns whether the report is authorized. Without this callback,
+        exit reports are ignored, including their cached diagnostics.
         The server wires this to mark the runner's session(s) failed
         and push the cause to the open view — the only failure signal
         for a runner that crashed before connecting its tunnel (so the
@@ -492,7 +494,7 @@ async def _receive_loop(
     host_store: HostStore,
     host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
-    on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
+    on_runner_exited: Callable[[str, str, str], Awaitable[bool]] | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
 ) -> None:
     """Receive host frames and route results to pending futures.
@@ -507,8 +509,8 @@ async def _receive_loop(
         persisted).
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
-    :param on_runner_exited: Callback fired with ``(runner_id, error)``
-        when a ``host.runner_exited`` frame arrives; ``None`` skips it.
+    :param on_runner_exited: Callback fired with ``(host_id, runner_id, error)``
+        when a ``host.runner_exited`` frame arrives; ``None`` rejects the report.
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
     """
@@ -600,6 +602,10 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostRunnerExitedFrame):
+            if on_runner_exited is None or not await on_runner_exited(
+                conn.host_id, frame.runner_id, frame.error
+            ):
+                continue
             # One-way report: a runner this host spawned died unexpectedly. Stash
             # the cause so the runner status endpoint can answer "offline, and
             # here is why" to the client still waiting for the runner to connect.
@@ -623,12 +629,6 @@ async def _receive_loop(
             )
             if runner_exit_reports is not None:
                 runner_exit_reports.record(frame.runner_id, frame.error, conn.owner)
-            if on_runner_exited is not None:
-                # Mark the runner's session(s) failed and push the cause
-                # to the open view. A runner that crashed before
-                # connecting its tunnel has no runner-tunnel disconnect
-                # event, so this report is the only failure signal.
-                await on_runner_exited(frame.runner_id, frame.error)
             continue
 
         if isinstance(frame, HostRunnerStatusResultFrame):

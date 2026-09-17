@@ -27,6 +27,12 @@ RECOVERY_COOLDOWN_S = 60
 RECOVERY_RESULT_GRACE_S = 60
 
 
+def reporting_host_owns_runner(host_id: str, affected: Sequence[Conversation]) -> bool:
+    """Only the authenticated host owning the runner's roots may report its exit."""
+    host_ids = {conv.host_id for conv in affected if conv.host_id is not None}
+    return host_ids == {host_id}
+
+
 def is_parent_owned_subagent(conv: Conversation) -> bool:
     """Identify vendor subagent mirrors, which have no independent session runtime."""
     from omnigent.harness_plugins import native_agents
@@ -472,6 +478,7 @@ class HostRunnerRecovery:
                 return
             # Recheck with the original supervisor: a reconnect or explicit
             # stop can overtake the crash report while it is being delivered.
+            # A host reconnect can forget a dead handle; unknown still requires Retry.
             if await _query_host_runner_status(host, self._hosts, runner_id) != "dead":
                 return
             fresh = await asyncio.to_thread(self._store.get_conversation, root.id)

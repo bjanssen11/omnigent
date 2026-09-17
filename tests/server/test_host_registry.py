@@ -13,6 +13,37 @@ from omnigent.host.frames import HostHelloFrame
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
 
+@pytest.mark.asyncio
+async def test_exit_diagnostic_requires_authorization_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from starlette.websockets import WebSocketDisconnect
+
+    from omnigent.host.frames import HostRunnerExitedFrame
+    from omnigent.server.routes import host_tunnel
+
+    ws = MagicMock()
+    ws.receive = AsyncMock(
+        side_effect=[
+            {"type": "websocket.receive", "text": "test event"},
+            {"type": "websocket.disconnect", "code": 1000},
+        ]
+    )
+    monkeypatch.setattr(
+        host_tunnel,
+        "decode_host_frame",
+        lambda _: HostRunnerExitedFrame(runner_id="test-runner", error="test exit"),
+    )
+    reports = RunnerExitReports()
+    with pytest.raises(WebSocketDisconnect):
+        await host_tunnel._receive_loop(
+            ws, MagicMock(), "test-host", MagicMock(), MagicMock(), reports, None, None
+        )
+    assert reports.get_visible("test-runner", None) is None
+
+
 @dataclass
 class FakeWebSocket:
     """Minimal WebSocket fake for registry tests.

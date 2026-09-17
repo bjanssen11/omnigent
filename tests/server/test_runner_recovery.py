@@ -865,3 +865,17 @@ async def test_concurrent_resume_can_reuse_already_cleared_stop(group):
     await recovery.clear_observed_recovery_stop(parent, store)
     assert not recovery.recovery_is_stopped(parent)
     assert store.rows[parent.id].labels[recovery.RECOVERY_STOPPED_LABEL] == ""
+
+
+@pytest.mark.parametrize("shape", ["matching", "different_host", "no_root", "mixed_roots"])
+def test_runner_exit_requires_recorded_host_identity(group, shape):
+    parent, child, _ = group
+    rows = [parent, child]
+    reporter = parent.host_id
+    if shape == "different_host":
+        reporter = "different-host"
+    elif shape == "no_root":
+        rows = [child]
+    elif shape == "mixed_roots":
+        rows.append(_conv("other-root", host_id="different-host"))
+    assert recovery.reporting_host_owns_runner(reporter, rows) is (shape == "matching")

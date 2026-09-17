@@ -1414,8 +1414,14 @@ async def test_runner_exited_report_surfaces_in_runner_status(
     host_store = HostStore(db_uri)
     reports = RunnerExitReports()
     app = FastAPI()
+
+    async def accept_report(host_id: str, runner_id: str, error: str) -> bool:
+        return runner_id == "runner_dead"
+
     app.include_router(
-        create_host_tunnel_router(registry, host_store, runner_exit_reports=reports),
+        create_host_tunnel_router(
+            registry, host_store, runner_exit_reports=reports, on_runner_exited=accept_report
+        ),
         prefix="/v1",
     )
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -1457,12 +1463,14 @@ async def test_runner_exited_report_surfaces_in_runner_status(
     assert body["error"] == daemon_error
 
 
+@pytest.mark.parametrize("authorized", [True, False])
 async def test_runner_exited_invokes_callback_with_runner_and_error(
     db_uri: str,
+    authorized: bool,
 ) -> None:
     """
     A ``host.runner_exited`` frame fires the ``on_runner_exited``
-    callback with ``(runner_id, error)``.
+    callback with ``(host_id, runner_id, error)``.
 
     This callback is how the server marks the crashed runner's
     session(s) failed and pushes the cause to the open view (the
@@ -1472,17 +1480,22 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
     bug this fixes.
     """
     from omnigent.host.frames import HostRunnerExitedFrame
+    from omnigent.server.host_registry import RunnerExitReports
 
     registry = HostRegistry()
     host_store = HostStore(db_uri)
-    received: list[tuple[str, str]] = []
+    received: list[tuple[str, str, str]] = []
+    reports = RunnerExitReports()
 
-    async def _record(runner_id: str, error: str) -> None:
-        received.append((runner_id, error))
+    async def _record(host_id: str, runner_id: str, error: str) -> bool:
+        received.append((host_id, runner_id, error))
+        return authorized
 
     app = FastAPI()
     app.include_router(
-        create_host_tunnel_router(registry, host_store, on_runner_exited=_record),
+        create_host_tunnel_router(
+            registry, host_store, on_runner_exited=_record, runner_exit_reports=reports
+        ),
         prefix="/v1",
     )
 
@@ -1500,4 +1513,7 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
             await asyncio.sleep(0.01)
 
     # The callback got the exact runner id and error string off the frame.
-    assert received == [("runner_x", "exited with code 1")]
+    assert len(received) == 1
+    assert received[0][1:] == ("runner_x", "exited with code 1")
+    assert registry.get(received[0][0]) is not None
+    assert (reports.get_visible("runner_x", None) is not None) is authorized

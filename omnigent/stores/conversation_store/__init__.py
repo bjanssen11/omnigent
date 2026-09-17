@@ -1005,7 +1005,10 @@ class ConversationStore(ABC):
     def compare_and_set_label(
         self, conversation_id: str, key: str, expected_value: str, value: str
     ) -> bool:
-        """Replace an existing label only if its value still matches the observation."""
+        """Replace a label only if it matches the exact persisted value observed.
+
+        Read ``expected_value`` from the store; writes may truncate input values.
+        """
         ...
 
     @abstractmethod

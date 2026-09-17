@@ -3041,7 +3041,7 @@ def create_app(
 
         task.add_done_callback(_clear_grace_slot)
 
-    async def _on_runner_exited(runner_id: str, error: str) -> None:
+    async def _on_runner_exited(reporting_host_id: str, runner_id: str, error: str) -> bool:
         """Mark a crashed runner's session(s) failed and push the cause.
 
         Fired by the host tunnel when a daemon reports
@@ -3055,20 +3055,26 @@ def create_app(
         sub-agent is not, since its work finished on a runner that was
         already live.
 
+        :param reporting_host_id: Authenticated host identity from the tunnel.
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
+        from omnigent.server.runner_recovery import reporting_host_owns_runner
         from omnigent.server.schemas import ErrorDetail
 
-        # The crash report is authoritative and carries the richer cause;
-        # cancel any pending disconnect-grace timer so it can't re-run the
-        # disconnect reconciliation on top of it.
-        _cancel_disconnect_grace(runner_id)
         affected = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        if not reporting_host_owns_runner(reporting_host_id, affected):
+            _logger.warning(
+                "Ignoring exit report for runner %s from unbound host %s",
+                runner_id,
+                reporting_host_id,
+            )
+            return False
+        _cancel_disconnect_grace(runner_id)
         _logger.warning(
             "Runner %s reported crashed; reconciling %d bound session(s): %s",
             runner_id,
@@ -3083,6 +3089,7 @@ def create_app(
             fail_idle_top_level=True,
         )
         host_runner_recovery.schedule(runner_id, affected, interrupted)
+        return True
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
