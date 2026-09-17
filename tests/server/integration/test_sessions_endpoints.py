@@ -9666,6 +9666,8 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
 
 async def test_retry_session_ensures_dead_required_native_terminal_once(
     client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A live runner still recreates its required native terminal."""
@@ -9678,32 +9680,48 @@ async def test_retry_session_ensures_dead_required_native_terminal_once(
     session = await _create_session(client, agent["id"], initial_message="Keep this once")
     before = await client.get(f"/v1/sessions/{session['id']}")
     before_items = before.json()["items"]
-    runner_client = object()
-    initialize = AsyncMock(return_value=False)
-    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.replace_runner_id(session["id"], "native-runner")
+    initialization_requests = []
+
+    def initialized(request: httpx.Request) -> httpx.Response:
+        initialization_requests.append(request)
+        return httpx.Response(
+            201, json={"session_init_protocol_version": 2, "terminal_ready": True}
+        )
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(initialized), base_url="http://runner"
+    )
+    # The terminal was ready at init time, then exited without a tunnel disconnect.
+    await app.state.runner_session_initializer.initialize(conv, runner_client, timeout=10)
     ensure_terminal = AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None))
     relay_ready = AsyncMock(return_value=None)
     monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner_client))
     monkeypatch.setattr(routes_events, "_ensure_native_terminal_ready", ensure_terminal)
     monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", relay_ready)
 
-    response = await client.post(
-        f"/v1/sessions/{session['id']}/events",
-        json={"type": "retry_session", "data": {}},
-    )
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "retry_session", "data": {}},
+        )
 
-    assert response.status_code == 202, response.text
-    initialize.assert_awaited_once()
-    assert response.json() == {
-        "queued": False,
-        "recovered": True,
-        "recovery": "native_terminal_ready",
-    }
-    ensure_terminal.assert_awaited_once()
-    assert ensure_terminal.await_args.kwargs["persist_resource_event"] is False
-    relay_ready.assert_awaited_once()
-    after = await client.get(f"/v1/sessions/{session['id']}")
-    assert after.json()["items"] == before_items
+        assert response.status_code == 202, response.text
+        assert len(initialization_requests) == 1, "Retry should hit the real readiness cache"
+        assert response.json() == {
+            "queued": False,
+            "recovered": True,
+            "recovery": "native_terminal_ready",
+        }
+        ensure_terminal.assert_awaited_once()
+        assert ensure_terminal.await_args.kwargs["persist_resource_event"] is False
+        relay_ready.assert_awaited_once()
+        after = await client.get(f"/v1/sessions/{session['id']}")
+        assert after.json()["items"] == before_items
+
+    finally:
+        await runner_client.aclose()
 
 
 async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(

@@ -371,7 +371,8 @@ async def _recover_retry_session(
     )
 
     if _is_native_terminal_session(conv):
-        if not terminal_ready_from_init:
+        # A cached init response cannot prove that a connected runner's pane still exists.
+        if was_connected or not terminal_ready_from_init:
             terminal_outcome = await _ensure_native_terminal_ready(
                 runner_client,
                 session_id,

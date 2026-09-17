@@ -375,3 +375,53 @@ async def test_message_handshake_does_not_wait_for_child_initialization(
             await asyncio.wait_for(restored.wait(), timeout=5)
     assert requests == [parent.id, row.id]
     assert store.get_conversation(row.id).runner_id == parent.runner_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_owner", ["owner", "other", None])
+@pytest.mark.parametrize("same_binding", [False, True])
+async def test_restoration_respects_runner_ownership(
+    recovery_tree: Any,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    child_owner: str | None,
+    same_binding: bool,
+) -> None:
+    """A child's direct owner must match the destination runner's owner."""
+    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    store, parent, child, relay, _, initializer = recovery_tree
+    row = child()
+    nested = child(owner=row)
+    if same_binding:
+        store.replace_runner_id(row.id, "new")
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for user in ("owner", "other"):
+        permissions.ensure_user(user)
+    permissions.grant("owner", parent.id, LEVEL_OWNER)
+    permissions.grant("other", parent.id, LEVEL_READ)
+    if child_owner is not None:
+        permissions.grant(child_owner, row.id, LEVEL_OWNER)
+    monkeypatch.setattr(
+        "omnigent.runtime.get_runner_router",
+        lambda: Mock(runner_is_online=lambda rid: rid == "new", runner_owner=lambda _: "owner"),
+    )
+    initialized = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        initialized.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        await restore_active_children(parent, client, store, initializer)
+    if child_owner == "other":
+        assert initialized == []
+        assert store.get_conversation(row.id).runner_id == ("new" if same_binding else "old")
+        assert store.get_conversation(nested.id).runner_id == "old"
+        relay.assert_not_called()
+    else:
+        assert initialized == [row.id, nested.id]
+        assert store.get_conversation(nested.id).runner_id == "new"

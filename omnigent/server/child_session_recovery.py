@@ -111,6 +111,17 @@ async def restore_active_children(
     if parent.runner_id is None or not _restorable(parent):
         return
     router = get_runner_router()
+    runner_owner = router.runner_owner(parent.runner_id) if router is not None else None
+
+    async def ownership_allows(row: Conversation) -> bool:
+        if runner_owner is None:
+            return True
+        session_owner = await asyncio.to_thread(store.get_session_owner, row.id)
+        # Internal children without a direct grant inherit from their restored ancestor.
+        return session_owner is None or session_owner == runner_owner
+
+    if not await ownership_allows(parent):
+        return
     # Include idle ancestors only when needed to host an interrupted descendant.
     tree: dict[str, Conversation] = {parent.id: parent}
     frontier = [parent.id]
@@ -166,6 +177,8 @@ async def restore_active_children(
                 or not _restorable(child)
                 or (snapshot.id in active and not _interrupted(child))
             ):
+                continue
+            if not await ownership_allows(child):
                 continue
             try:
                 if child.runner_id != parent.runner_id:
