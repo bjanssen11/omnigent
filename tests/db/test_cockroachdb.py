@@ -153,15 +153,9 @@ def test_account_generation_backfill_resumes_after_schema_commit(db_uri) -> None
     assert "account_generation" in {c["name"] for c in inspect(engine).get_columns("users")}
 
     _initialize_or_verify_schema(engine, db_uri)
-    with engine.connect() as connection:
-        account = connection.execute(
-            text("SELECT account_generation FROM users WHERE id = 'migration-user'")
-        ).one()
+    account = accounts.get_user("migration-user")
     assert account is not None and len(account.account_generation) == 32
     assert accounts.get_password_hash("migration-user") == "existing-password-hash"
-    with engine.connect() as connection:
-        grant = connection.execute(
-            text("SELECT account_generation FROM device_grants WHERE id = 'migration-grant'")
-        ).one()
+    grant = grants.authorize_access("migration-grant")
     assert grant is not None and grant.account_generation == account.account_generation
     assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)

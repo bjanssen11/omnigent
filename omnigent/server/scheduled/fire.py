@@ -334,6 +334,24 @@ async def _run_fire_for_task(
             )
             return
 
+        if await _owner_is_deleted(deps, task):
+            _logger.warning(
+                "scheduled fire: task %s owner %r no longer exists — disabling task",
+                task.id,
+                task.user_id,
+            )
+            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
+            await _record_run(
+                deps,
+                task,
+                None,
+                scheduled_at,
+                status="failed",
+                error=f"owner {task.user_id!r} no longer exists; task disabled",
+                error_code="owner_deleted",
+            )
+            return
+
         # Resolve the effective launch target. An unset ``host_id`` means "you
         # didn't pin WHICH host", not "run hostless": resolve the owner's live
         # host at fire time. An unset ``workspace`` (research / summaries /
@@ -481,6 +499,18 @@ async def _run_fire_for_task(
         _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
     except Exception:
         _logger.exception("scheduled fire: task %s failed", task.id)
+
+
+async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
+    """True when the task names an owner whose user row is gone.
+
+    A NULL owner (single-user / OSS) always resolves to
+    :data:`RESERVED_USER_LOCAL` and is never considered deleted; without a
+    permission store there is no account to check against.
+    """
+    if task.user_id is None or deps.permission_store is None:
+        return False
+    return not await asyncio.to_thread(deps.permission_store.user_exists, task.user_id)
 
 
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
@@ -791,14 +821,18 @@ async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str
     """Write the LEVEL_OWNER grant so the run is visible to its owner.
 
     A NULL ``user_id`` (single-user / OSS) resolves to
-    :data:`RESERVED_USER_LOCAL`. When ``permission_store`` is ``None`` (no auth
-    configured) this is a no-op — the session is still accessible because auth
-    is disabled system-wide.
+    :data:`RESERVED_USER_LOCAL`, whose row is created on demand. A real owner's
+    row is never (re)created here — a deleted account must stay deleted. When
+    ``permission_store`` is ``None`` (no auth configured) this is a no-op — the
+    session is still accessible because auth is disabled system-wide.
     """
     if deps.permission_store is None:
         return
-    owner = task.user_id or RESERVED_USER_LOCAL
-    await asyncio.to_thread(deps.permission_store.ensure_user, owner)
+    if task.user_id is None:
+        await asyncio.to_thread(deps.permission_store.ensure_user, RESERVED_USER_LOCAL)
+        owner = RESERVED_USER_LOCAL
+    else:
+        owner = task.user_id
     await asyncio.to_thread(deps.permission_store.grant, owner, conversation_id, LEVEL_OWNER)
 
 

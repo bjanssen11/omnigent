@@ -1592,6 +1592,8 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    if host_store is not None:
+        host_registry.launch_authorizer = host_store.admit_launch
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
@@ -3249,6 +3251,20 @@ def create_app(
             if cached_sandbox is not None and cached_sandbox.stage == "failed":
                 _publish_sandbox_status(conv.id, "ready")
 
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    runner_account_store = (
+        account_store
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        else None
+    )
+
+    def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
+        assert runner_account_store is not None and auth_provider is not None
+        return runner_account_store.with_runner_authority(
+            runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
+        )
+
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
 
@@ -3261,6 +3277,11 @@ def create_app(
         :returns: The session owner's user id, or ``None`` when no session
             is bound to this runner (the handshake is then refused).
         """
+        if runner_account_store is not None:
+            try:
+                return runner_account_store.with_runner_authority(runner_id, lambda owner: owner)
+            except OmnigentError:
+                return None
         for conv in conversation_store.list_conversations_by_runner_id(runner_id):
             owner = conversation_store.get_session_owner(conv.id)
             if owner is not None:
@@ -3277,6 +3298,9 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            mint_managed_runner_token=(
+                _mint_managed_runner_token if runner_account_store is not None else None
+            ),
         ),
         prefix="/v1",
         tags=["runners"],
@@ -3415,6 +3439,9 @@ def create_app(
                 create_accounts_auth_router,
             )
 
+            # A deleted account's still-signed session JWTs must stop
+            # authenticating; every request checks the generation and tombstone.
+            auth_provider.set_account_check(account_store.accepts_generation)
             app.include_router(
                 create_accounts_auth_router(
                     auth_provider,
@@ -3422,6 +3449,7 @@ def create_app(
                     admin_list,
                     permission_store,
                     device_grant_store,
+                    scheduled_task_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],

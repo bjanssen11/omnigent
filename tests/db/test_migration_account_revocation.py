@@ -109,16 +109,10 @@ def test_mysql_account_migration_resumes_after_committed_column(db_uri, column):
     assert _get_current_db_revision(engine) == "hh1b2c3d4e5f"
     assert column in {c["name"] for c in sa.inspect(engine).get_columns("users")}
     _initialize_or_verify_schema(engine, db_uri)
-    with engine.connect() as connection:
-        account = connection.execute(
-            sa.text("SELECT account_generation FROM users WHERE id = 'migration-user'")
-        ).one()
+    account = accounts.get_user("migration-user")
     assert account is not None and len(account.account_generation) == 32
     assert accounts.get_password_hash("migration-user") == "original-password-hash"
-    with engine.connect() as connection:
-        grant = connection.execute(
-            sa.text("SELECT account_generation FROM device_grants WHERE id = 'migration-grant'")
-        ).one()
+    grant = grants.authorize_access("migration-grant")
     assert grant is not None and grant.account_generation == account.account_generation
     with engine.connect() as connection:
         assert (

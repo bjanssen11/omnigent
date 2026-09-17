@@ -158,6 +158,15 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
+    def user_exists(self, user_id: str) -> bool:
+        """Check whether a user row exists, without creating it.
+
+        :param user_id: The user identifier, e.g. ``"alice"``.
+        :returns: ``True`` if a row exists for the user.
+        """
+        ...
+
+    @abstractmethod
     def list_users(self, *, limit: int = 1000) -> list[Account]:
         """Return every real user row, for the admin user list.
 
