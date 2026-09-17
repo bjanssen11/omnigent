@@ -4935,7 +4935,7 @@ async def test_native_child_completion_clears_only_disconnect_errors(
     assert response.status_code == 202, response.text
     fresh = store.get_conversation(child.id)
     assert fresh is not None
-    assert fresh.labels[RECOVERY_MODE_LABEL] == "replacement:parent"
+    assert fresh.labels.get(RECOVERY_MODE_LABEL) == ("replacement:parent" if mirrored else None)
     error = sessions_module._last_task_error_from_labels(fresh.labels)
     if mirrored and error_code != "native_turn_error":
         assert sessions_module._session_status_cache[child.id] == "idle"
@@ -11990,3 +11990,66 @@ async def test_stale_resume_does_not_clear_newer_stop(
     fresh = store.get_conversation(sid)
     assert fresh is not None and fresh.labels[RECOVERY_STOPPED_LABEL] == "true:newer"
     assert not store.list_items(sid).data
+
+
+async def test_stop_after_recovery_rebind_targets_replacement_and_blocks_replay(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import runner_recovery as recovery
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    store = get_conversation_store()
+    store.replace_runner_id(sid, "old-runner")
+    sessions._session_status_cache[sid] = "running"
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_access = routes_events._require_access
+
+    async def pause_after_read(*args, **kwargs):
+        result = await original_access(*args, **kwargs)
+        entered.set()
+        await release.wait()
+        return result
+
+    requests: list[httpx.Request] = []
+
+    def receive_stop(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(receive_stop), base_url="http://replacement"
+    ) as replacement:
+
+        async def resolve_current(*_):
+            row = store.get_conversation(sid)
+            assert row is not None and row.runner_id == "replacement"
+            return replacement
+
+        monkeypatch.setattr(routes_events, "_require_access", pause_after_read)
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_current)
+        stopping = asyncio.create_task(
+            client.post(f"/v1/sessions/{sid}/events", json={"type": "stop_session", "data": {}})
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            snapshot = store.get_conversation(sid)
+            assert snapshot is not None
+            assert await recovery.prepare_recovery_bindings(
+                snapshot, "replacement", [snapshot], store
+            )
+        finally:
+            release.set()
+        response = await stopping
+
+    assert response.status_code == 202, response.text
+    assert len(requests) == 1
+    assert json.loads(requests[0].content) == {"type": "stop_session"}
+    stopped = store.get_conversation(sid)
+    assert stopped is not None and recovery.recovery_is_stopped(stopped)
+    assert not await recovery.may_initialize_session(stopped, store)
+    assert not await recovery.prepare_recovery_bindings(stopped, "later", [stopped], store)

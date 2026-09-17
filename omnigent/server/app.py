@@ -3069,9 +3069,11 @@ def create_app(
         )
         if not reporting_host_owns_runner(reporting_host_id, affected):
             _logger.warning(
-                "Ignoring exit report for runner %s from unbound host %s",
+                "Ignoring exit report for runner %s from host %s: "
+                "expected only that host's bindings, found %s",
                 runner_id,
                 reporting_host_id,
+                sorted({conv.host_id for conv in affected if conv.host_id is not None}),
             )
             return False
         _cancel_disconnect_grace(runner_id)
