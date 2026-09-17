@@ -1948,3 +1948,66 @@ def test_missing_api_types_fetched_per_service() -> None:
     )
 
     assert [entry.id for entry in entries] == ["eng_dev.ai_gateway.omni-claude"]
+
+
+def test_gateway_model_service_inherits_limits_from_routing_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway alias advertises the limits of its live Bedrock destination."""
+    target = "us.anthropic.claude-opus-4-8"
+    monkeypatch.setattr(
+        model_catalog,
+        "catalog_model_entries",
+        lambda provider: (
+            (
+                ModelEntry(
+                    id=target,
+                    family="claude",
+                    metadata=ModelMetadata(context_window=1_000_000, max_output_tokens=128_000),
+                ),
+            )
+            if provider == "bedrock"
+            else ()
+        ),
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={
+                    "model_services": [
+                        {"name": "model-services/eng_dev.ai_gateway.omni-claude-high"}
+                    ]
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "supported_api_types": ["anthropic/v1/messages"],
+                "config": {
+                    "routing": {
+                        "destinations": [
+                            {
+                                "external_model_config": {"target": {"model": target}},
+                                "traffic_percentage": 100,
+                            }
+                        ]
+                    }
+                },
+            },
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert len(entries) == 1
+    assert entries[0].id == "eng_dev.ai_gateway.omni-claude-high"
+    assert entries[0].metadata.context_window == 1_000_000
+    assert entries[0].metadata.max_output_tokens == 128_000
