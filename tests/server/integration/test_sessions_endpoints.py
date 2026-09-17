@@ -9653,6 +9653,7 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
 
     assert response.status_code == 202, response.text
     initialize.assert_awaited_once()
+    assert initialize.await_args.kwargs["suppress_recovery_turn"] is True
     assert response.json() == {
         "queued": False,
         "recovered": False,

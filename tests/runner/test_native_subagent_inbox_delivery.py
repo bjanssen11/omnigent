@@ -847,13 +847,15 @@ async def test_routed_child_off_its_native_spec_still_delivers(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness_name", ["cursor-native", "claude-sdk"])
 @pytest.mark.parametrize("error_code", [None, "runner_disconnected", "runner_failed_to_start"])
 @pytest.mark.parametrize("previous_execution", ["new", "finished", "active"])
-async def test_recovered_native_child_continues_same_dispatch_before_delivering_result(
+async def test_recovered_child_continues_same_dispatch_before_delivering_result(
     _clean_subagent_registry: None,
     monkeypatch: pytest.MonkeyPatch,
     error_code: str | None,
     previous_execution: str,
+    harness_name: str,
 ) -> None:
     """Parent initialization keeps the child pending; child init resumes its task once."""
     from unittest.mock import AsyncMock
@@ -885,7 +887,7 @@ async def test_recovered_native_child_continues_same_dispatch_before_delivering_
             return AgentSpec(
                 spec_version=1,
                 name="worker",
-                executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+                executor=ExecutorSpec(type="omnigent", config={"harness": harness_name}),
             )
         return AgentSpec(spec_version=1, name="orchestrator")
 
@@ -937,14 +939,24 @@ async def test_recovered_native_child_continues_same_dispatch_before_delivering_
                     break
                 await asyncio.sleep(0.01)
             assert len(harness.posted_bodies) == 1, (
-                "native child must receive one continuation turn"
+                "interrupted child must receive one continuation turn"
             )
             assert "Continue the existing task" in str(harness.posted_bodies[0]["content"])
-        # Native completion is forwarded by the terminal, under the original child id.
-        await client.post(
-            f"/v1/sessions/{CHILD_SESSION_ID}/events",
-            json={"type": "external_session_status", "data": {"status": "idle", "output": "done"}},
-        )
+        if harness_name == "cursor-native" or previous_execution == "active":
+            # A surviving turn completes through its existing status forwarder.
+            await client.post(
+                f"/v1/sessions/{CHILD_SESSION_ID}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "done"},
+                },
+            )
+        else:
+            for _ in range(100):
+                if not inbox.empty():
+                    break
+                await asyncio.sleep(0.01)
+            assert "review complete: LGTM" in str(harness.posted_bodies[0]["content"])
         result = inbox.get_nowait()
         assert result["conversation_id"] == CHILD_SESSION_ID
         assert result["work_id"] == DISPATCH_ID

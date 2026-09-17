@@ -2013,7 +2013,7 @@ async def _recover_subagent_results_from_server(
         if not isinstance(child_id, str) or not isinstance(status, str):
             continue
         error = child.get("last_task_error")
-        interrupted = status in {"in_progress", "waiting"} or (
+        interrupted = status == "in_progress" or (
             status == "failed"
             and isinstance(error, dict)
             and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
@@ -4400,13 +4400,20 @@ def create_runner_app(
         _suppress_recovery = (
             init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
         )
+        recovery_id = (
+            init_context.envelope.recovery_id
+            if init_context.envelope is not None
+            and init_context.envelope.resume_interrupted_turn
+            and not _suppress_recovery
+            else None
+        )
         history: list[_JsonObject]
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
             history = []
         else:
             history = await _load_history_as_input(session_id)
-        if history:
+        if history and session_id not in _active_turns:
             _session_histories[session_id] = history
             last = history[-1]
             last_type = last.get("type")
@@ -4416,7 +4423,12 @@ def create_runner_app(
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
-            if needs_turn and not _suppress_recovery and session_id not in _active_turns:
+            if (
+                needs_turn
+                and recovery_id is None
+                and not _suppress_recovery
+                and session_id not in _active_turns
+            ):
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
@@ -4435,14 +4447,6 @@ def create_runner_app(
                 )
                 _background_tasks.add(_turn_task)
 
-        recovery_id = (
-            init_context.envelope.recovery_id
-            if is_native_harness(harness_name)
-            and init_context.envelope is not None
-            and init_context.envelope.resume_interrupted_turn
-            and not _suppress_recovery
-            else None
-        )
         if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
             session_id, set()
         ):
@@ -4450,7 +4454,8 @@ def create_runner_app(
             if session_id not in _active_turns and not resource_registry.session_turn_is_active(
                 session_id
             ):
-                _session_histories[session_id] = []
+                if is_native_harness(harness_name):
+                    _session_histories[session_id] = []
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 recovery_body: _JsonObject = {
@@ -4468,6 +4473,10 @@ def create_runner_app(
                         }
                     ],
                 }
+                if not is_native_harness(harness_name):
+                    _session_histories.setdefault(session_id, []).append(
+                        {"type": "message", "role": "user", "content": recovery_body["content"]}
+                    )
                 recovery_task = asyncio.create_task(
                     _run_turn_bg(recovery_body, session_id), name=f"turn-recover-{session_id}"
                 )

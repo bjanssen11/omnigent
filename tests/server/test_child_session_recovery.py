@@ -13,6 +13,7 @@ import pytest
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
 from omnigent.server.child_session_recovery import restore_active_children
+from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
@@ -21,7 +22,12 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 def recovery_tree(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[
-    SqlAlchemyConversationStore, Conversation, Callable[..., Conversation], Mock, AsyncMock
+    SqlAlchemyConversationStore,
+    Conversation,
+    Callable[..., Conversation],
+    Mock,
+    AsyncMock,
+    RunnerSessionInitializer,
 ]:
     from omnigent.server.routes import sessions
 
@@ -46,12 +52,13 @@ def recovery_tree(
         store.set_session_live_status(row.id, status)
         return store.get_conversation(row.id)  # type: ignore[return-value]
 
-    return store, parent, child, relay, recovered
+    initializer = RunnerSessionInitializer(Mock(get=lambda _: None), server_version="test")
+    return store, parent, child, relay, recovered, initializer
 
 
 @pytest.mark.asyncio
 async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) -> None:
-    store, parent, child, relay, recovered = recovery_tree
+    store, parent, child, relay, recovered, initializer = recovery_tree
     active = child()
     waiting = child("waiting")
     disconnected = child("failed")
@@ -76,7 +83,7 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(respond), base_url="http://runner"
     ) as client:
-        await restore_active_children(parent, client, store)
+        await restore_active_children(parent, client, store, initializer)
 
     by_id = {call["session_id"]: call["session_init"] for call in calls}
     assert set(by_id) == {active.id, waiting.id, disconnected.id, idle_ancestor.id, nested.id}
@@ -103,7 +110,7 @@ async def test_do_not_restore_excluded_children(
 ) -> None:
     from omnigent.server.routes._sessions.common import _intentional_stop_sessions
 
-    store, parent, child, relay, _ = recovery_tree
+    store, parent, child, relay, _, initializer = recovery_tree
     row = child()
     if exclusion == "closed":
         store.set_labels(row.id, {"omnigent.closed": "true"})
@@ -121,7 +128,7 @@ async def test_do_not_restore_excluded_children(
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(lambda _: pytest.fail("unexpected init"))
         ) as client:
-            await restore_active_children(parent, client, store)
+            await restore_active_children(parent, client, store, initializer)
         assert store.get_conversation(row.id).runner_id == "old"
         relay.assert_not_called()
     finally:
@@ -132,13 +139,13 @@ async def test_do_not_restore_excluded_children(
 async def test_mirror_rebinds_without_independent_terminal_or_success_status(
     recovery_tree: Any,
 ) -> None:
-    store, parent, child, relay, recovered = recovery_tree
+    store, parent, child, relay, recovered, initializer = recovery_tree
     row = child()
     store.set_labels(row.id, {"omnigent.wrapper": "codex-native-ui-subagent"})
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _: pytest.fail("mirror initialized"))
     ) as client:
-        await restore_active_children(parent, client, store)
+        await restore_active_children(parent, client, store, initializer)
     assert store.get_conversation(row.id).runner_id == "new"
     relay.assert_called_once()
     recovered.assert_not_awaited()
@@ -148,7 +155,7 @@ async def test_mirror_rebinds_without_independent_terminal_or_success_status(
 async def test_failed_child_init_does_not_recover_its_descendants_or_block_siblings(
     recovery_tree: Any,
 ) -> None:
-    store, parent, child, relay, recovered = recovery_tree
+    store, parent, child, relay, recovered, initializer = recovery_tree
     failed = child()
     nested = child(owner=failed)
     sibling = child()
@@ -162,7 +169,7 @@ async def test_failed_child_init_does_not_recover_its_descendants_or_block_sibli
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(respond), base_url="http://runner"
     ) as client:
-        await restore_active_children(parent, client, store)
+        await restore_active_children(parent, client, store, initializer)
     assert set(calls) == {failed.id, sibling.id}
     assert store.get_conversation(nested.id).runner_id == "old"
     assert relay.call_count == 1
@@ -173,7 +180,7 @@ async def test_failed_child_init_does_not_recover_its_descendants_or_block_sibli
 async def test_concurrent_rebind_is_preserved(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store, parent, child, relay, _ = recovery_tree
+    store, parent, child, relay, _, initializer = recovery_tree
     row = child()
     replace = store.replace_runner_id
 
@@ -185,7 +192,7 @@ async def test_concurrent_rebind_is_preserved(
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _: pytest.fail("stale init"))
     ) as client:
-        await restore_active_children(parent, client, store)
+        await restore_active_children(parent, client, store, initializer)
     assert store.get_conversation(row.id).runner_id == "manual"
     relay.assert_not_called()
 
@@ -196,7 +203,7 @@ async def test_child_finishing_after_scan_is_not_restored(
 ) -> None:
     from omnigent.server.routes._sessions.common import _session_status_cache
 
-    store, parent, child, relay, _ = recovery_tree
+    store, parent, child, relay, _, initializer = recovery_tree
     row = child()
     get = store.get_conversation
 
@@ -211,7 +218,7 @@ async def test_child_finishing_after_scan_is_not_restored(
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(lambda _: pytest.fail("finished child initialized"))
         ) as client:
-            await restore_active_children(parent, client, store)
+            await restore_active_children(parent, client, store, initializer)
         assert get(row.id).runner_id == "old"
         relay.assert_not_called()
     finally:
@@ -222,7 +229,7 @@ async def test_child_finishing_after_scan_is_not_restored(
 async def test_old_runner_reconnecting_during_scan_is_not_rebound(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    store, parent, child, relay, _ = recovery_tree
+    store, parent, child, relay, _, initializer = recovery_tree
     row = child()
     online = Mock(side_effect=[False, True])
     monkeypatch.setattr(
@@ -231,7 +238,7 @@ async def test_old_runner_reconnecting_during_scan_is_not_rebound(
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _: pytest.fail("live child initialized"))
     ) as client:
-        await restore_active_children(parent, client, store)
+        await restore_active_children(parent, client, store, initializer)
     assert store.get_conversation(row.id).runner_id == "old"
     relay.assert_not_called()
 
@@ -241,10 +248,9 @@ async def test_repeated_disconnects_and_return_to_used_runner_keep_child_pending
     recovery_tree: Any,
 ) -> None:
     from omnigent.server.routes import sessions
-    from omnigent.server.runner_session_init import RunnerSessionInitializer
     from omnigent.server.schemas import ErrorDetail
 
-    store, parent, child, _, recovered = recovery_tree
+    store, parent, child, _, recovered, initializer = recovery_tree
     row = child("failed")
     store.set_labels(
         row.id,
@@ -253,7 +259,6 @@ async def test_repeated_disconnects_and_return_to_used_runner_keep_child_pending
             "omnigent.last_task_error_message": "Disconnected",
         },
     )
-    initializer = RunnerSessionInitializer(Mock(get=lambda _: None), server_version="test")
     bodies = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -276,3 +281,55 @@ async def test_repeated_disconnects_and_return_to_used_runner_keep_child_pending
     assert [body["session_id"] for body in bodies] == [row.id] * 3
     assert len({body["session_init"]["recovery_id"] for body in bodies}) == 3
     recovered.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recovery_does_not_allocate_a_second_continuation(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from omnigent.server import child_session_recovery as recovery
+
+    store, parent, child, _, _, initializer = recovery_tree
+    row = child()
+    first_rebind = asyncio.Event()
+    release_rebind = asyncio.Event()
+    first_init_finished = asyncio.Event()
+    replacements = 0
+    requests = []
+
+    async def scheduled_store_call(call: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal replacements
+        if call == store.replace_runner_id:
+            replacements += 1
+            if replacements == 1:
+                first_rebind.set()
+                await release_rebind.wait()
+            else:
+                # Deliver the competing rebind only after the first continuation ended.
+                await first_init_finished.wait()
+        return call(*args, **kwargs)
+
+    # Control this module's store scheduling without changing asyncio globally.
+    monkeypatch.setattr(
+        recovery, "asyncio", SimpleNamespace(to_thread=scheduled_store_call, Lock=asyncio.Lock)
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        first_init_finished.set()
+        return httpx.Response(201)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        first = asyncio.create_task(restore_active_children(parent, client, store, initializer))
+        await first_rebind.wait()
+        second = asyncio.create_task(restore_active_children(parent, client, store, initializer))
+        await asyncio.sleep(0)
+        release_rebind.set()
+        await asyncio.gather(first, second)
+    assert store.get_conversation(row.id).runner_id == parent.runner_id
+    assert len(requests) == 1, [r["session_init"]["recovery_id"] for r in requests]

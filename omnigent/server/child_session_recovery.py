@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from weakref import WeakValueDictionary
 
 import httpx
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.harness_plugins import native_agents
-from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
 from omnigent.util.session_lifecycle import is_session_closed
-from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
+_child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
+    WeakValueDictionary
+)
 
 
 def is_parent_owned_subagent(conv: Conversation) -> bool:
@@ -69,7 +72,7 @@ async def restore_active_children(
     parent: Conversation,
     client: httpx.AsyncClient,
     store: ConversationStore,
-    initializer: RunnerSessionInitializer | None = None,
+    initializer: RunnerSessionInitializer,
 ) -> None:
     """Rebind and initialize interrupted descendants on their recovered parent's runner."""
     from omnigent.runtime import get_runner_router
@@ -113,40 +116,42 @@ async def restore_active_children(
     for snapshot in tree.values():
         if snapshot.id == parent.id or snapshot.id not in needed:
             continue
-        assert snapshot.parent_conversation_id is not None
-        owner = await asyncio.to_thread(store.get_conversation, snapshot.parent_conversation_id)
-        child = await asyncio.to_thread(store.get_conversation, snapshot.id)
-        if (
-            owner is None
-            or owner.id not in restored
-            or owner.runner_id != parent.runner_id
-            or not _restorable(owner)
-            or child is None
-            or child.runner_id is None
-            or child.runner_id != snapshot.runner_id
-            or child.parent_conversation_id != owner.id
-            or child.host_id is not None
-            or not _restorable(child)
-            or (snapshot.id in active and not _interrupted(child))
-        ):
-            continue
-        try:
-            if child.runner_id != parent.runner_id:
-                if router is not None and router.runner_is_online(child.runner_id):
-                    continue
-                child = await asyncio.to_thread(
-                    store.replace_runner_id,
-                    child.id,
-                    parent.runner_id,
-                    expected_runner_id=child.runner_id,
-                )
+        # Re-read and initialize under one lock so competing restores share readiness.
+        async with _child_recovery_locks.setdefault(snapshot.id, asyncio.Lock()):
+            assert snapshot.parent_conversation_id is not None
+            owner = await asyncio.to_thread(
+                store.get_conversation, snapshot.parent_conversation_id
+            )
+            child = await asyncio.to_thread(store.get_conversation, snapshot.id)
+            if (
+                owner is None
+                or owner.id not in restored
+                or owner.runner_id != parent.runner_id
+                or not _restorable(owner)
+                or child is None
+                or child.runner_id is None
+                or child.runner_id != snapshot.runner_id
+                or child.parent_conversation_id != owner.id
+                or child.host_id is not None
+                or not _restorable(child)
+                or (snapshot.id in active and not _interrupted(child))
+            ):
+                continue
+            try:
                 if child.runner_id != parent.runner_id:
-                    continue
-                if initializer is not None:
+                    if router is not None and router.runner_is_online(child.runner_id):
+                        continue
+                    child = await asyncio.to_thread(
+                        store.replace_runner_id,
+                        child.id,
+                        parent.runner_id,
+                        expected_runner_id=child.runner_id,
+                    )
+                    if child.runner_id != parent.runner_id:
+                        continue
                     initializer.invalidate_session(child.id)
-            mirrored = is_parent_owned_subagent(child)
-            if not mirrored:
-                if initializer is not None:
+                mirrored = is_parent_owned_subagent(child)
+                if not mirrored:
                     response = await initializer.initialize(
                         child,
                         client,
@@ -154,21 +159,10 @@ async def restore_active_children(
                         suppress_recovery_turn=not _interrupted(child),
                         resume_interrupted_turn=_interrupted(child),
                     )
-                else:
-                    response = await client.post(
-                        "/v1/sessions",
-                        json=build_runner_session_init_payload(
-                            child,
-                            server_version=VERSION,
-                            suppress_recovery_turn=not _interrupted(child),
-                            resume_interrupted_turn=_interrupted(child),
-                        ),
-                        timeout=10.0,
-                    )
-                response.raise_for_status()
-            _ensure_runner_relay(child.id, parent.runner_id, client, store)
-            # Only execution status can clear the interruption. Initialization
-            # may return before a native continuation emits its first running edge.
-            restored.add(child.id)
-        except (httpx.HTTPError, ConnectionError, ConversationNotFoundError):
-            _logger.warning("Failed to restore child session %s", snapshot.id, exc_info=True)
+                    response.raise_for_status()
+                _ensure_runner_relay(child.id, parent.runner_id, client, store)
+                # Only execution status can clear the interruption. Initialization
+                # may return before a native continuation emits its first running edge.
+                restored.add(child.id)
+            except (httpx.HTTPError, ConnectionError, ConversationNotFoundError):
+                _logger.warning("Failed to restore child session %s", snapshot.id, exc_info=True)

@@ -312,3 +312,70 @@ async def test_catch_up_turn_hides_browser_tools_without_renderer_evidence() -> 
 
     assert len(harness.posted_bodies) == 1, "catch-up scan did not start one harness turn"
     _assert_browser_tools_hidden(harness.posted_bodies[0])
+
+
+@pytest.mark.asyncio
+async def test_suppressed_reinitialization_preserves_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connected parent's Retry handshake must preserve its in-flight context."""
+    from omnigent.runner.app import _session_histories_ref
+
+    started, release = asyncio.Event(), asyncio.Event()
+    original = _ScriptedHarnessClient._StreamHandle.aiter_text
+
+    async def gated_stream(handle: Any) -> Any:
+        started.set()
+        await release.wait()
+        async for frame in original(handle):
+            yield frame
+
+    monkeypatch.setattr(_ScriptedHarnessClient._StreamHandle, "aiter_text", gated_stream)
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    async with _runner_client(app) as client:
+        payload = _session_init_payload(suppress_recovery_turn=True)
+        assert (await client.post("/v1/sessions", json=payload)).status_code == 201
+        forwarded = await client.post(
+            f"/v1/sessions/{SESSION_ID}/events",
+            json={
+                "type": "message",
+                "agent_id": AGENT_ID,
+                "content": [{"type": "input_text", "text": "new in-flight message"}],
+            },
+        )
+        assert forwarded.status_code == 202, forwarded.text
+        await asyncio.wait_for(started.wait(), timeout=5)
+        turn = app.state.active_turns[SESSION_ID]
+        history = _session_histories_ref[SESSION_ID]
+        assert "new in-flight message" in str(history)
+        try:
+            result = await client.post("/v1/sessions", json=payload)
+            assert result.status_code == 201
+            assert result.json()["status"] == "running"
+            assert app.state.active_turns[SESSION_ID] is turn
+            assert not turn.done()
+            assert _session_histories_ref[SESSION_ID] is history
+        finally:
+            release.set()
+            await asyncio.wait_for(turn, timeout=5)
+        assert len(harness.posted_bodies) == 1
+        assert (await client.get(f"/v1/sessions/{SESSION_ID}")).json()["status"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_explicit_recovery_deduplicates_history_heuristic() -> None:
+    """Retrying a continuation must not also replay a trailing user item."""
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    payload = _session_init_payload(suppress_recovery_turn=False)
+    payload["session_init"].update(resume_interrupted_turn=True, recovery_id="same-interruption")
+    async with _runner_client(app) as client:
+        for _ in range(2):
+            response = await client.post("/v1/sessions", json=payload)
+            assert response.status_code == 201
+            turn = app.state.active_turns.get(SESSION_ID)
+            if turn is not None:
+                await asyncio.wait_for(turn, timeout=5)
+    assert len(harness.posted_bodies) == 1
+    content = str(harness.posted_bodies[0]["content"])
+    assert "hello from history" in content
+    assert "Continue the existing task" in content

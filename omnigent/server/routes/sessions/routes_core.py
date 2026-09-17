@@ -2334,7 +2334,7 @@ def register_core_routes(
                                 conv,
                                 _runner_client,
                                 conversation_store,
-                                getattr(request.app.state, "runner_session_initializer", None),
+                                request.app.state.runner_session_initializer,
                             )
                             await _publish_runner_recovered_status(session_id, conversation_store)
                     except (httpx.HTTPError, ConnectionError):
