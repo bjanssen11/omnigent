@@ -891,6 +891,40 @@ def test_config_gateway_synthesizes_both_family_blocks(
     assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude"
 
 
+def test_config_gateway_enumerates_all_tier_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All configured tiers (high/med/low/default) land in the models map."""
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude-high
+        high: eng_dev.ai_gateway.omni-claude-high
+        med: eng_dev.ai_gateway.omni-claude-med
+        low: eng_dev.ai_gateway.omni-claude-low
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    models = resolution.config["provider"]["gateway-anthropic"]["models"]
+    # Every distinct tier id is offered (default == high is not duplicated).
+    assert set(models) == {
+        "eng_dev.ai_gateway.omni-claude-high",
+        "eng_dev.ai_gateway.omni-claude-med",
+        "eng_dev.ai_gateway.omni-claude-low",
+    }
+    # The pinned default is still the family default, not a tier.
+    assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high"
+
+
 def test_config_gateway_no_static_api_key_for_auth_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

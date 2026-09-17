@@ -184,6 +184,17 @@ def _strip_model_suffix(model_id: str) -> str:
     return re.sub(r"\[.*?\]$", "", model_id)
 
 
+def _append_unique_model(model_ids: list[str], model_id: str) -> None:
+    """Append *model_id* (suffix-stripped) to *model_ids* if not already present.
+
+    :param model_ids: The accumulating list of model ids.
+    :param model_id: A raw model id, possibly with a trailing ``[...]`` suffix.
+    """
+    stripped = _strip_model_suffix(model_id)
+    if stripped and stripped not in model_ids:
+        model_ids.append(stripped)
+
+
 def resolve_config_gateway_providers(
     model_override: str | None = None,
 ) -> ConfigGatewayResolution | None:
@@ -259,10 +270,18 @@ def resolve_config_gateway_providers(
         # The override pins the default; attribute it to the first present
         # family (anthropic preferred) so it lands in exactly one provider.
         if override and pinned is None:
-            model_ids.append(override)
+            _append_unique_model(model_ids, override)
             pinned = f"{provider_id}/{override}"
-        if default_model and default_model not in model_ids:
-            model_ids.append(_strip_model_suffix(default_model))
+        # Pin the family default (unless an override already pinned) so the
+        # default selection is the configured default, not a tier.
+        if default_model:
+            _append_unique_model(model_ids, default_model)
+            if pinned is None:
+                pinned = f"{provider_id}/{_strip_model_suffix(default_model)}"
+        # Enumerate every configured tier (high/med/low/…) so opencode's picker
+        # lists them all; de-duped against the default/override.
+        for tier_model in family.models.values():
+            _append_unique_model(model_ids, tier_model)
         if not model_ids:
             continue
 
