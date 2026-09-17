@@ -4450,6 +4450,8 @@ def create_runner_app(
         if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
             session_id, set()
         ):
+            # Active execution, including a newer message, takes precedence over
+            # automatic continuation. Initialization alone cannot consume it.
             _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
             if session_id not in _active_turns and not resource_registry.session_turn_is_active(
                 session_id

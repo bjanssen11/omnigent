@@ -849,7 +849,7 @@ async def test_routed_child_off_its_native_spec_still_delivers(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("harness_name", ["cursor-native", "claude-sdk"])
 @pytest.mark.parametrize("error_code", [None, "runner_disconnected", "runner_failed_to_start"])
-@pytest.mark.parametrize("previous_execution", ["new", "finished", "active"])
+@pytest.mark.parametrize("previous_execution", ["new", "finished", "active", "messaged"])
 async def test_recovered_child_continues_same_dispatch_before_delivering_result(
     _clean_subagent_registry: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -872,6 +872,17 @@ async def test_recovered_child_continues_same_dispatch_before_delivering_result(
             _sse({"type": "response.completed", "response": {"id": "resp_recovered"}}),
         ]
     )
+    started, release = asyncio.Event(), asyncio.Event()
+    if previous_execution == "messaged":
+        original = _ScriptedHarnessClient._StreamHandle.aiter_text
+
+        async def gated_stream(handle: Any) -> Any:
+            started.set()
+            await release.wait()
+            async for frame in original(handle):
+                yield frame
+
+        monkeypatch.setattr(_ScriptedHarnessClient._StreamHandle, "aiter_text", gated_stream)
     pm = _FakeProcessManager(harness)
     server = _RecoveryServerClient(
         [
@@ -922,17 +933,34 @@ async def test_recovered_child_continues_same_dispatch_before_delivering_result(
             server_version="test",
             resume_interrupted_turn=True,
         )
-        if previous_execution != "new":
+        if previous_execution in {"finished", "active"}:
             # Runner A retains its old turn epoch while this child ran on B.
             app.state.begin_turn_slot(CHILD_SESSION_ID)
             app.state.active_turns.pop(CHILD_SESSION_ID)
         if previous_execution == "active":
             resources.note_external_session_status(CHILD_SESSION_ID, "running")
+        if previous_execution == "messaged":
+            message = await client.post(
+                f"/v1/sessions/{CHILD_SESSION_ID}/events",
+                json={
+                    "type": "message",
+                    "agent_id": "ag_reviewer",
+                    "content": [{"type": "input_text", "text": "new user instruction"}],
+                },
+            )
+            assert message.status_code == 202, message.text
+            await asyncio.wait_for(started.wait(), timeout=5)
         for _ in range(2):
             result = await client.post("/v1/sessions", json=payload)
             assert result.status_code == 201
         if previous_execution == "active":
             assert not harness.posted_bodies, "a surviving native turn must not get another prompt"
+        elif previous_execution == "messaged":
+            assert len(harness.posted_bodies) == 1
+            content = str(harness.posted_bodies[0]["content"])
+            assert "new user instruction" in content
+            assert "Continue the existing task" not in content
+            release.set()
         else:
             for _ in range(100):
                 if harness.posted_bodies:
