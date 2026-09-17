@@ -1870,3 +1870,74 @@ async def test_patch_rebind_stamps_runner_liveness(
 
     _drain_session_live_state()
     assert _runner_last_seen(session_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["runner_disconnected", "runner_failed_to_start"])
+@pytest.mark.parametrize("child_runner", ["previous-runner", _RUNNER_ID])
+async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
+    tunnel_three_layer_stack: Any,
+    _isolated_session_status_cache: None,
+    error_code: str,
+    child_runner: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parent recovery resumes children regardless of binding or database row order."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.server.schemas import ErrorDetail
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+    parent_id = await _bind_failed_session(
+        ap_client, error_code="runner_disconnected", error_message="Disconnected"
+    )
+    store = get_conversation_store()
+    parent = store.get_conversation(parent_id)
+    assert parent is not None
+    child = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent_id,
+        agent_id=parent.agent_id,
+        runner_id=child_runner,
+        sub_agent_name="worker",
+    )
+    finished = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent_id,
+        agent_id=parent.agent_id,
+        runner_id=child_runner,
+        sub_agent_name="worker",
+    )
+    store.set_session_live_status(child.id, "failed")
+    store.set_session_live_status(finished.id, "idle")
+    sessions_routes._session_status_cache[child.id] = "failed"
+    await sessions_routes._persist_session_status_error_labels(
+        child.id, ErrorDetail(code=error_code, message="Disconnected"), store
+    )
+    list_bound = store.list_conversations_by_runner_id
+    monkeypatch.setattr(
+        store,
+        "list_conversations_by_runner_id",
+        lambda runner: sorted(list_bound(runner), key=lambda row: row.id == parent_id),
+    )
+    initializer = ap_app.state.runner_session_initializer
+    initialize = initializer.initialize
+    resumed = []
+
+    async def record_init(conv: Any, client: Any, **kwargs: Any) -> Any:
+        if kwargs.get("resume_interrupted_turn"):
+            resumed.append(conv.id)
+        return await initialize(conv, client, **kwargs)
+
+    monkeypatch.setattr(initializer, "initialize", record_init)
+    async with _reconnect_fires_connect_hook(
+        ap_app, fake_pm, wait_for_recover=parent_id
+    ) as recovered:
+        assert child.id in resumed
+        assert child.id in recovered
+        assert sessions_routes._session_status_cache[child.id] == "idle"
+        assert not store.get_conversation(child.id).labels.get("omnigent.last_task_error_code")
+        assert store.get_conversation(child.id).runner_id == _RUNNER_ID
+        assert store.get_conversation(finished.id).runner_id == child_runner

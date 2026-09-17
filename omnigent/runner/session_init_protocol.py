@@ -49,6 +49,8 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # message, so a recovery turn started from history would process it twice
     # (once from the recovery path, once from the buffered forward).
     suppress_recovery_turn: bool = False
+    # Resume an interrupted child task in its existing native session.
+    resume_interrupted_turn: bool = False
 
 
 def build_runner_session_init_payload(
@@ -56,6 +58,7 @@ def build_runner_session_init_payload(
     *,
     server_version: str,
     suppress_recovery_turn: bool = False,
+    resume_interrupted_turn: bool = False,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     if conversation.agent_id is None:
@@ -67,6 +70,7 @@ def build_runner_session_init_payload(
         agent_id=conversation.agent_id,
         sub_agent_name=conversation.sub_agent_name,
         suppress_recovery_turn=suppress_recovery_turn,
+        resume_interrupted_turn=resume_interrupted_turn,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,

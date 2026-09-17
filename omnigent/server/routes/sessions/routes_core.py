@@ -2326,6 +2326,16 @@ def register_core_routes(
                             timeout=10.0,
                         )
                         if runner_init_resp.status_code < 400:
+                            from omnigent.server.child_session_recovery import (
+                                restore_active_children,
+                            )
+
+                            await restore_active_children(
+                                conv,
+                                _runner_client,
+                                conversation_store,
+                                getattr(request.app.state, "runner_session_initializer", None),
+                            )
                             await _publish_runner_recovered_status(session_id, conversation_store)
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST

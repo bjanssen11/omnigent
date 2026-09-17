@@ -32,6 +32,7 @@ class RunnerSessionInitializer:
         *,
         timeout: float,
         suppress_recovery_turn: bool = False,
+        resume_interrupted_turn: bool = False,
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot."""
         runner_id = conversation.runner_id
@@ -59,6 +60,7 @@ class RunnerSessionInitializer:
                         conversation,
                         server_version=self._server_version,
                         suppress_recovery_turn=suppress_recovery_turn,
+                        resume_interrupted_turn=resume_interrupted_turn,
                     ),
                     timeout=timeout,
                 ),

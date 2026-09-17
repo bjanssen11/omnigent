@@ -844,3 +844,91 @@ async def test_routed_child_off_its_native_spec_still_delivers(
     )
     assert items[0]["status"] == "completed"
     assert items[0]["conversation_id"] == CHILD_SESSION_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", [None, "runner_disconnected", "runner_failed_to_start"])
+async def test_recovered_native_child_continues_same_dispatch_before_delivering_result(
+    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch, error_code: str
+) -> None:
+    """Parent initialization keeps the child pending; child init resumes its task once."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.entities import Conversation
+    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+    from tests.runner.conftest import _sse
+
+    monkeypatch.setattr(runner_app, "_launch_native_terminal", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner_app, "_resolve_native_spawn_env", AsyncMock(return_value={}))
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_recovered"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_recovered"}}),
+        ]
+    )
+    pm = _FakeProcessManager(harness)
+    server = _RecoveryServerClient(
+        [
+            _child_summary(
+                current_task_status="failed" if error_code else "in_progress",
+                last_task_error={"code": error_code, "message": "runner lost"},
+            )
+        ]
+    )
+
+    async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        if agent_id == "ag_reviewer":
+            return AgentSpec(
+                spec_version=1,
+                name="worker",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
+            )
+        return AgentSpec(spec_version=1, name="orchestrator")
+
+    app = create_runner_app(
+        process_manager=pm,
+        spec_resolver=resolve,
+        server_client=server,  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        parent = await client.post(
+            "/v1/sessions", json={"session_id": PARENT_SESSION_ID, "agent_id": "ag_orchestrator"}
+        )
+        assert parent.status_code == 201, parent.text
+        inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+        entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+        assert entry is not None and entry.work_id == DISPATCH_ID
+        assert entry.status not in {"failed", "completed", "cancelled"}
+        assert inbox.empty(), "runner crash was delivered as a finished child result"
+        child = Conversation(
+            id=CHILD_SESSION_ID,
+            agent_id="ag_reviewer",
+            runner_id="replacement",
+            root_conversation_id=PARENT_SESSION_ID,
+            parent_conversation_id=PARENT_SESSION_ID,
+            created_at=0,
+            updated_at=0,
+        )
+        payload = build_runner_session_init_payload(
+            child,
+            server_version="test",
+            resume_interrupted_turn=True,
+        )
+        for _ in range(2):
+            result = await client.post("/v1/sessions", json=payload)
+            assert result.status_code == 201
+        for _ in range(100):
+            if harness.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+        assert len(harness.posted_bodies) == 1, "native child must receive one continuation turn"
+        assert "Continue the existing task" in str(harness.posted_bodies[0]["content"])
+        # Native completion is forwarded by the terminal, under the original child id.
+        await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={"type": "external_session_status", "data": {"status": "idle", "output": "done"}},
+        )
+        result = inbox.get_nowait()
+        assert result["conversation_id"] == CHILD_SESSION_ID
+        assert result["work_id"] == DISPATCH_ID
+        assert result["status"] == "completed"

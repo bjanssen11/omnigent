@@ -2012,7 +2012,13 @@ async def _recover_subagent_results_from_server(
         status = child.get("current_task_status")
         if not isinstance(child_id, str) or not isinstance(status, str):
             continue
-        if status not in _SUBAGENT_TERMINAL_STATUSES:
+        error = child.get("last_task_error")
+        interrupted = status in {"in_progress", "waiting"} or (
+            status == "failed"
+            and isinstance(error, dict)
+            and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
+        )
+        if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
         if (
             get_subagent_work(child_id) is not None
@@ -2028,7 +2034,7 @@ async def _recover_subagent_results_from_server(
             error = child.get("last_task_error")
             message = error.get("message") if isinstance(error, dict) else None
             output = message if isinstance(message, str) else None
-        else:
+        elif not interrupted:
             output = await _fetch_latest_assistant_text(server_client, child_id)
         entry = register_subagent_work(
             parent_session_id=parent_id,
@@ -2037,6 +2043,10 @@ async def _recover_subagent_results_from_server(
             title=str(child.get("session_name") or ""),
             work_id=dispatch_id,
         )
+        if interrupted:
+            # A lost runner is not a completed child dispatch. Its replacement
+            # restores this same child, whose eventual result uses the same receipt.
+            continue
         ack = mark_subagent_work_terminal(child_id, status=status, output=output)
         if ack.delivered_now:
             schedule_wake(entry)
@@ -4421,6 +4431,39 @@ def create_runner_app(
                     _background_tasks.discard,
                 )
                 _background_tasks.add(_turn_task)
+
+        if (
+            is_native_harness(harness_name)
+            and init_context.envelope is not None
+            and init_context.envelope.resume_interrupted_turn
+            and session_id not in _turn_bind_epoch
+            and not _suppress_recovery
+            and session_id not in _active_turns
+        ):
+            _session_histories[session_id] = []
+            _begin_turn_slot(session_id)
+            _publish_turn_status(session_id, "running")
+            recovery_body: _JsonObject = {
+                "agent_id": agent_id,
+                "model": body.get("model", agent_id),
+                "browser_renderer_available": False,
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Your runner was interrupted while this task was active. "
+                            "Continue the existing task from its current state. "
+                            "Check any interrupted operation's outcome before repeating it."
+                        ),
+                    }
+                ],
+            }
+            recovery_task = asyncio.create_task(
+                _run_turn_bg(recovery_body, session_id), name=f"turn-recover-{session_id}"
+            )
+            _active_turns[session_id] = recovery_task
+            recovery_task.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(recovery_task)
 
         status = "running" if session_id in _active_turns else "idle"
         return JSONResponse(

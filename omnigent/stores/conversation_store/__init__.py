@@ -1386,7 +1386,9 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def replace_runner_id(self, conversation_id: str, runner_id: str) -> Conversation:
+    def replace_runner_id(
+        self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None
+    ) -> Conversation:
         """
         Replace ``conversations.runner_id`` for a conversation.
 
@@ -1404,6 +1406,8 @@ class ConversationStore(ABC):
         :param runner_id: Runner identifier to bind to,
             e.g. ``"runner_abc123"``. Online-ness is validated
             by the route before calling the store.
+        :param expected_runner_id: Update only while the old binding matches; otherwise
+            return the current conversation unchanged. None means unconditional.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
