@@ -92,7 +92,7 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
     ids = list(by_id)
     assert ids.index(idle_ancestor.id) < ids.index(nested.id)
     assert relay.call_count == 5
-    assert recovered.await_count == 1
+    recovered.assert_not_awaited()
     assert all(store.get_conversation(row.id).runner_id == "old" for row in untouched)
 
 
@@ -216,3 +216,63 @@ async def test_child_finishing_after_scan_is_not_restored(
         relay.assert_not_called()
     finally:
         _session_status_cache.pop(row.id, None)
+
+
+@pytest.mark.asyncio
+async def test_old_runner_reconnecting_during_scan_is_not_rebound(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, parent, child, relay, _ = recovery_tree
+    row = child()
+    online = Mock(side_effect=[False, True])
+    monkeypatch.setattr(
+        "omnigent.runtime.get_runner_router", lambda: Mock(runner_is_online=online)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: pytest.fail("live child initialized"))
+    ) as client:
+        await restore_active_children(parent, client, store)
+    assert store.get_conversation(row.id).runner_id == "old"
+    relay.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_repeated_disconnects_and_return_to_used_runner_keep_child_pending(
+    recovery_tree: Any,
+) -> None:
+    from omnigent.server.routes import sessions
+    from omnigent.server.runner_session_init import RunnerSessionInitializer
+    from omnigent.server.schemas import ErrorDetail
+
+    store, parent, child, _, recovered = recovery_tree
+    row = child("failed")
+    store.set_labels(
+        row.id,
+        {
+            "omnigent.last_task_error_code": "runner_disconnected",
+            "omnigent.last_task_error_message": "Disconnected",
+        },
+    )
+    initializer = RunnerSessionInitializer(Mock(get=lambda _: None), server_version="test")
+    bodies = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(201)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        for runner_id in ("A", "B", "A"):
+            parent = store.replace_runner_id(parent.id, runner_id)
+            await restore_active_children(parent, client, store, initializer)
+            await restore_active_children(parent, client, store, initializer)
+            fresh = store.get_conversation(row.id)
+            assert fresh.live_status == "failed", "initialization must not imply task completion"
+            await sessions._mark_runner_sessions_offline(
+                [fresh], ErrorDetail(code="runner_disconnected", message="Disconnected"), store
+            )
+            assert store.get_conversation(row.id).labels["omnigent.last_task_error_code"]
+    assert [body["session_id"] for body in bodies] == [row.id] * 3
+    assert len({body["session_init"]["recovery_id"] for body in bodies}) == 3
+    recovered.assert_not_awaited()

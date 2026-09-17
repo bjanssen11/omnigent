@@ -73,10 +73,7 @@ async def restore_active_children(
 ) -> None:
     """Rebind and initialize interrupted descendants on their recovered parent's runner."""
     from omnigent.runtime import get_runner_router
-    from omnigent.server.routes.sessions import (
-        _ensure_runner_relay,
-        _publish_runner_recovered_status,
-    )
+    from omnigent.server.routes.sessions import _ensure_runner_relay
 
     if parent.runner_id is None or not _restorable(parent):
         return
@@ -125,6 +122,7 @@ async def restore_active_children(
             or owner.runner_id != parent.runner_id
             or not _restorable(owner)
             or child is None
+            or child.runner_id is None
             or child.runner_id != snapshot.runner_id
             or child.parent_conversation_id != owner.id
             or child.host_id is not None
@@ -134,6 +132,8 @@ async def restore_active_children(
             continue
         try:
             if child.runner_id != parent.runner_id:
+                if router is not None and router.runner_is_online(child.runner_id):
+                    continue
                 child = await asyncio.to_thread(
                     store.replace_runner_id,
                     child.id,
@@ -142,6 +142,8 @@ async def restore_active_children(
                 )
                 if child.runner_id != parent.runner_id:
                     continue
+                if initializer is not None:
+                    initializer.invalidate_session(child.id)
             mirrored = is_parent_owned_subagent(child)
             if not mirrored:
                 if initializer is not None:
@@ -165,16 +167,8 @@ async def restore_active_children(
                     )
                 response.raise_for_status()
             _ensure_runner_relay(child.id, parent.runner_id, client, store)
-            if not mirrored:
-                from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
-
-                fresh = await asyncio.to_thread(store.get_conversation, child.id)
-                error = _last_task_error_from_labels(fresh.labels) if fresh is not None else None
-                if error and error.get("code") in {
-                    "runner_disconnected",
-                    "runner_failed_to_start",
-                }:
-                    await _publish_runner_recovered_status(child.id, store)
+            # Only execution status can clear the interruption. Initialization
+            # may return before a native continuation emits its first running edge.
             restored.add(child.id)
         except (httpx.HTTPError, ConnectionError, ConversationNotFoundError):
             _logger.warning("Failed to restore child session %s", snapshot.id, exc_info=True)

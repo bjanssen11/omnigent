@@ -3203,7 +3203,9 @@ def create_app(
                     "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
                     conv.id,
                 )
-            elif not is_parent_owned_subagent(conv):
+            elif not is_parent_owned_subagent(conv) and not (
+                conv.parent_conversation_id in bound_ids and conv.host_id is None
+            ):
                 try:
                     init_response = await runner_session_initializer.initialize(
                         conv,
@@ -3249,7 +3251,9 @@ def create_app(
             # is reachable again. The helper self-guards: it only clears a
             # session whose persisted failure is ``runner_disconnected``, so
             # a genuine task failure survives the reconnect untouched.
-            if not is_parent_owned_subagent(conv):
+            if not is_parent_owned_subagent(conv) and not (
+                conv.parent_conversation_id in bound_ids and conv.host_id is None
+            ):
                 await _publish_runner_recovered_status(
                     conv.id, conversation_store, require_disconnect_code=True
                 )

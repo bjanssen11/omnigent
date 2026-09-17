@@ -566,6 +566,11 @@ class SessionResourceRegistry:
                 extra={"session_id": runner_primary_session_id()},
             )
 
+    def session_turn_is_active(self, session_id: str) -> bool:
+        """Whether the native terminal has unfinished work, including between status edges."""
+        with self._lock:
+            return self._last_session_status.get(session_id) in {"running", "waiting"}
+
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
 

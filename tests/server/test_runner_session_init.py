@@ -214,3 +214,25 @@ def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) ->
     metadata = _claude_launch_metadata_from_envelope(envelope)
     assert metadata.fork_carry_history is True
     assert metadata.fork_source_external_id == "src-claude-sid"
+
+
+@pytest.mark.asyncio
+async def test_recovery_has_own_readiness_and_stable_identity_across_failed_posts() -> None:
+    registry, client = _Registry(), _Client()
+    client.release.set()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conv = _conversation()
+    await initializer.initialize(conv, client, timeout=10)  # type: ignore[arg-type]
+    client.status_code = 500
+    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    first_id = client.calls[-1]["session_init"]["recovery_id"]
+    client.status_code = 201
+    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    assert len(client.calls) == 3
+    assert first_id and client.calls[-1]["session_init"]["recovery_id"] == first_id
+    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    assert len(client.calls) == 3
+    # A later binding back to this live runner starts a distinct recovery.
+    initializer.invalidate_session(conv.id)
+    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    assert client.calls[-1]["session_init"]["recovery_id"] != first_id

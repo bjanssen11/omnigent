@@ -9641,6 +9641,8 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     before = await client.get(f"/v1/sessions/{session['id']}")
     before_items = before.json()["items"]
     runner_client = object()
+    initialize = AsyncMock(return_value=False)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
     get_runner = AsyncMock(return_value=runner_client)
     monkeypatch.setattr(routes_events, "_get_runner_client", get_runner)
 
@@ -9650,6 +9652,7 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     )
 
     assert response.status_code == 202, response.text
+    initialize.assert_awaited_once()
     assert response.json() == {
         "queued": False,
         "recovered": False,
@@ -9675,6 +9678,8 @@ async def test_retry_session_ensures_dead_required_native_terminal_once(
     before = await client.get(f"/v1/sessions/{session['id']}")
     before_items = before.json()["items"]
     runner_client = object()
+    initialize = AsyncMock(return_value=False)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
     ensure_terminal = AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None))
     relay_ready = AsyncMock(return_value=None)
     monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner_client))
@@ -9687,6 +9692,7 @@ async def test_retry_session_ensures_dead_required_native_terminal_once(
     )
 
     assert response.status_code == 202, response.text
+    initialize.assert_awaited_once()
     assert response.json() == {
         "queued": False,
         "recovered": True,

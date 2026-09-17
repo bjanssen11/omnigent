@@ -42,6 +42,7 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -1084,6 +1085,9 @@ async def _reconnect_fires_connect_hook(
         def raise_for_status(self) -> None:
             return None
 
+        def json(self) -> dict[str, object]:
+            return {}
+
     class _StubClient:
         async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
             return _StubResponse()
@@ -1875,11 +1879,13 @@ async def test_patch_rebind_stamps_runner_liveness(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_code", ["runner_disconnected", "runner_failed_to_start"])
 @pytest.mark.parametrize("child_runner", ["previous-runner", _RUNNER_ID])
+@pytest.mark.parametrize("fail_first", [None, "parent", "child"])
 async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
     tunnel_three_layer_stack: Any,
     _isolated_session_status_cache: None,
     error_code: str,
     child_runner: str,
+    fail_first: str | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Parent recovery resumes children regardless of binding or database row order."""
@@ -1925,8 +1931,17 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
     initializer = ap_app.state.runner_session_initializer
     initialize = initializer.initialize
     resumed = []
+    calls = []
+    failed_once = False
+    retry_client = None
 
     async def record_init(conv: Any, client: Any, **kwargs: Any) -> Any:
+        nonlocal failed_once, retry_client
+        retry_client = client
+        calls.append((conv.id, bool(kwargs.get("resume_interrupted_turn"))))
+        if not failed_once and conv.id == {"parent": parent_id, "child": child.id}.get(fail_first):
+            failed_once = True
+            return httpx.Response(500, request=httpx.Request("POST", "http://runner/v1/sessions"))
         if kwargs.get("resume_interrupted_turn"):
             resumed.append(conv.id)
         return await initialize(conv, client, **kwargs)
@@ -1935,9 +1950,28 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
     async with _reconnect_fires_connect_hook(
         ap_app, fake_pm, wait_for_recover=parent_id
     ) as recovered:
+        if fail_first:
+            assert failed_once
+            assert child.id not in resumed
+            assert (child.id, False) not in calls
+            assert sessions_routes._session_status_cache[child.id] == "failed"
+            # Retry while the parent runner is already connected must restore children.
+            from omnigent.server.routes.sessions import routes_events
+
+            monkeypatch.setattr(
+                routes_events, "_get_runner_client", AsyncMock(return_value=retry_client)
+            )
+            response = await ap_client.post(
+                f"/v1/sessions/{parent_id}/events",
+                json={"type": "retry_session", "data": {}},
+            )
+            assert response.status_code == 202, response.text
         assert child.id in resumed
-        assert child.id in recovered
-        assert sessions_routes._session_status_cache[child.id] == "idle"
-        assert not store.get_conversation(child.id).labels.get("omnigent.last_task_error_code")
+        assert child.id not in recovered
+        assert sessions_routes._session_status_cache[child.id] == "failed"
+        assert (
+            store.get_conversation(child.id).labels.get("omnigent.last_task_error_code")
+            == error_code
+        )
         assert store.get_conversation(child.id).runner_id == _RUNNER_ID
         assert store.get_conversation(finished.id).runner_id == child_runner

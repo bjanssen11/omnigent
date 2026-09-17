@@ -2893,7 +2893,10 @@ def create_runner_app(
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
-    _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
+    _session_init_tasks: dict[
+        tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
+    ] = {}
+    _recovery_turn_ids: dict[str, set[str]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -4432,38 +4435,45 @@ def create_runner_app(
                 )
                 _background_tasks.add(_turn_task)
 
-        if (
-            is_native_harness(harness_name)
+        recovery_id = (
+            init_context.envelope.recovery_id
+            if is_native_harness(harness_name)
             and init_context.envelope is not None
             and init_context.envelope.resume_interrupted_turn
-            and session_id not in _turn_bind_epoch
             and not _suppress_recovery
-            and session_id not in _active_turns
+            else None
+        )
+        if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
+            session_id, set()
         ):
-            _session_histories[session_id] = []
-            _begin_turn_slot(session_id)
-            _publish_turn_status(session_id, "running")
-            recovery_body: _JsonObject = {
-                "agent_id": agent_id,
-                "model": body.get("model", agent_id),
-                "browser_renderer_available": False,
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Your runner was interrupted while this task was active. "
-                            "Continue the existing task from its current state. "
-                            "Check any interrupted operation's outcome before repeating it."
-                        ),
-                    }
-                ],
-            }
-            recovery_task = asyncio.create_task(
-                _run_turn_bg(recovery_body, session_id), name=f"turn-recover-{session_id}"
-            )
-            _active_turns[session_id] = recovery_task
-            recovery_task.add_done_callback(_background_tasks.discard)
-            _background_tasks.add(recovery_task)
+            _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
+            if session_id not in _active_turns and not resource_registry.session_turn_is_active(
+                session_id
+            ):
+                _session_histories[session_id] = []
+                _begin_turn_slot(session_id)
+                _publish_turn_status(session_id, "running")
+                recovery_body: _JsonObject = {
+                    "agent_id": agent_id,
+                    "model": body.get("model", agent_id),
+                    "browser_renderer_available": False,
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Your runner was interrupted while this task was active. "
+                                "Continue the existing task from its current state. "
+                                "Check any interrupted operation's outcome before repeating it."
+                            ),
+                        }
+                    ],
+                }
+                recovery_task = asyncio.create_task(
+                    _run_turn_bg(recovery_body, session_id), name=f"turn-recover-{session_id}"
+                )
+                _active_turns[session_id] = recovery_task
+                recovery_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(recovery_task)
 
         status = "running" if session_id in _active_turns else "idle"
         return JSONResponse(
@@ -4504,10 +4514,15 @@ def create_runner_app(
         if not isinstance(session_id, str) or not isinstance(agent_id, str):
             return await _initialize_session(body)
         sub_agent_name = body.get("sub_agent_name")
+        try:
+            envelope = parse_runner_session_init_envelope(body)
+        except ValueError:
+            return await _initialize_session(body)
         key = (
             session_id,
             agent_id,
             sub_agent_name if isinstance(sub_agent_name, str) else None,
+            envelope.recovery_id if envelope is not None else None,
         )
         task = _session_init_tasks.get(key)
         if task is None:
@@ -4678,6 +4693,7 @@ def create_runner_app(
         _live_response_id.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
+        _recovery_turn_ids.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
         _native_pane_status.pop(session_id, None)

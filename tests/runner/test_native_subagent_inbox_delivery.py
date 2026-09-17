@@ -848,8 +848,12 @@ async def test_routed_child_off_its_native_spec_still_delivers(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_code", [None, "runner_disconnected", "runner_failed_to_start"])
+@pytest.mark.parametrize("previous_execution", ["new", "finished", "active"])
 async def test_recovered_native_child_continues_same_dispatch_before_delivering_result(
-    _clean_subagent_registry: None, monkeypatch: pytest.MonkeyPatch, error_code: str
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str | None,
+    previous_execution: str,
 ) -> None:
     """Parent initialization keeps the child pending; child init resumes its task once."""
     from unittest.mock import AsyncMock
@@ -885,7 +889,9 @@ async def test_recovered_native_child_continues_same_dispatch_before_delivering_
             )
         return AgentSpec(spec_version=1, name="orchestrator")
 
+    resources = runner_app.SessionResourceRegistry()
     app = create_runner_app(
+        resource_registry=resources,
         process_manager=pm,
         spec_resolver=resolve,
         server_client=server,  # type: ignore[arg-type]
@@ -914,15 +920,26 @@ async def test_recovered_native_child_continues_same_dispatch_before_delivering_
             server_version="test",
             resume_interrupted_turn=True,
         )
+        if previous_execution != "new":
+            # Runner A retains its old turn epoch while this child ran on B.
+            app.state.begin_turn_slot(CHILD_SESSION_ID)
+            app.state.active_turns.pop(CHILD_SESSION_ID)
+        if previous_execution == "active":
+            resources.note_external_session_status(CHILD_SESSION_ID, "running")
         for _ in range(2):
             result = await client.post("/v1/sessions", json=payload)
             assert result.status_code == 201
-        for _ in range(100):
-            if harness.posted_bodies:
-                break
-            await asyncio.sleep(0.01)
-        assert len(harness.posted_bodies) == 1, "native child must receive one continuation turn"
-        assert "Continue the existing task" in str(harness.posted_bodies[0]["content"])
+        if previous_execution == "active":
+            assert not harness.posted_bodies, "a surviving native turn must not get another prompt"
+        else:
+            for _ in range(100):
+                if harness.posted_bodies:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(harness.posted_bodies) == 1, (
+                "native child must receive one continuation turn"
+            )
+            assert "Continue the existing task" in str(harness.posted_bodies[0]["content"])
         # Native completion is forwarded by the terminal, under the original child id.
         await client.post(
             f"/v1/sessions/{CHILD_SESSION_ID}/events",
@@ -932,3 +949,8 @@ async def test_recovered_native_child_continues_same_dispatch_before_delivering_
         assert result["conversation_id"] == CHILD_SESSION_ID
         assert result["work_id"] == DISPATCH_ID
         assert result["status"] == "completed"
+        turn = app.state.active_turns.get(CHILD_SESSION_ID)
+        if turn is not None:
+            await turn
+        await client.post("/v1/sessions", json=payload)
+        assert len(harness.posted_bodies) == (0 if previous_execution == "active" else 1)
