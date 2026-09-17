@@ -5174,12 +5174,8 @@ def _format_terminal_failure_tail(pane: str) -> str:
     return f" Last terminal output:\n{tail}"
 
 
-# Text an interactive auth or consent step leaves on screen while it waits for
-# the user. Claude Code has not started yet, so its prompt cannot render and the
-# readiness gate times out — a step the user has to finish, not a harness fault.
-# Deliberately vendor-neutral: these are shapes any OAuth/MFA/consent CLI prints.
-# They classify 87% of the observed population; naming a specific corporate tool
-# would add a few points and does not belong in a general-purpose harness.
+# Generic auth and consent prompts can prevent the composer from rendering.
+# These markers describe the visible state, not the terminal's health.
 _PANE_AWAITING_USER_MARKERS: Final[tuple[str, ...]] = (
     "Logging in via SSO",
     "If the browser does not open automatically",
@@ -5210,8 +5206,7 @@ def _stalled_pane_state(pane: str, *, polls: int, empty_polls: int) -> str:
         return "awaiting-user-input"
     if not pane.strip():
         return "pane-never-rendered"
-    # Mostly-blank captures are a torn read under a busy repaint, not a pane
-    # that stayed empty; the session is alive and drawing.
+    # Separate intermittent empty captures from a pane that never rendered.
     if polls and empty_polls >= polls / 2:
         return "captures-mostly-empty"
     return "prompt-absent-from-pane"

@@ -8592,29 +8592,23 @@ def test_wait_for_claude_prompt_ready_fails_at_base_budget_when_pane_dead(
     assert "connecting to host" in message
 
 
-_DBCERT_PANE = (
-    "Running dbcert to obtain a new certificate, please follow its instructions.\n"
-    "dbcert: Logging in via SSO...\n"
-    "dbcert: If the browser does not open automatically, please open the following URL:\n"
-    "\thttps://example.okta.com/oauth2/v1/authorize?client_id=redacted\n"
+_LOGIN_PANE = (
+    "example-cli: Logging in via SSO...\n"
+    "If the browser does not open automatically, please open the following URL:\n"
+    "https://login.example.test/authorize?request=synthetic\n"
 )
 
 
 def test_stalled_pane_state_names_an_interactive_prompt() -> None:
-    """A pane parked on an auth step is the user's turn, not a harness fault.
-
-    Classified on vendor-neutral text — the SSO / browser-URL lines any OAuth
-    CLI prints — so no corporate tool name is baked into the harness.
-    """
-    assert "dbcert" not in "".join(claude_native_bridge._PANE_AWAITING_USER_MARKERS)
+    """Generic login text identifies an interactive readiness gate."""
     assert (
-        claude_native_bridge._stalled_pane_state(_DBCERT_PANE, polls=198, empty_polls=0)
+        claude_native_bridge._stalled_pane_state(_LOGIN_PANE, polls=100, empty_polls=0)
         == "awaiting-user-input"
     )
 
 
 def test_stalled_pane_state_separates_torn_reads_from_a_missing_prompt() -> None:
-    """Mostly-blank captures are a torn read; a drawn pane without the box is not."""
+    """Empty captures and missing composer frames have distinct labels."""
     assert (
         claude_native_bridge._stalled_pane_state(_BOOTING_PANE, polls=100, empty_polls=90)
         == "captures-mostly-empty"
@@ -8632,15 +8626,10 @@ def test_stalled_pane_state_separates_torn_reads_from_a_missing_prompt() -> None
 def test_wait_for_claude_prompt_ready_blames_the_interactive_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The timeout must tell the user to finish the prompt, not report a defect.
-
-    A terminal parked on a dbcert SSO login cannot render Claude's composer, so
-    the generic "did not become ready" reads as an omnigent failure when the
-    fix is one step in the terminal.
-    """
+    """The timeout points the user to the pending interactive prompt."""
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
-        lambda socket_path, tmux_target: _DBCERT_PANE,
+        lambda socket_path, tmux_target: _LOGIN_PANE,
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._claude_pane_alive",
@@ -8657,7 +8646,7 @@ def test_wait_for_claude_prompt_ready_blames_the_interactive_prompt(
     assert "state=awaiting-user-input" in message
     assert "Finish it in the terminal" in message
     # The pane tail still names which step.
-    assert "dbcert" in message
+    assert "example-cli" in message
 
 
 def test_wait_for_claude_prompt_ready_reports_its_state_slug(
