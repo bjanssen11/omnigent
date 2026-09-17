@@ -3868,6 +3868,10 @@ def create_runner_app(
             )
         session_id = cast(str, session_id)
         agent_id = cast(str, agent_id)
+        initial_turn_epoch = _turn_bind_epoch.get(session_id)
+        initially_active = session_id in _active_turns or resource_registry.session_turn_is_active(
+            session_id
+        )
 
         # Captured before init's first await: the legacy (no-envelope) context
         # load below probes the server's version over the network, so a reset
@@ -4413,7 +4417,8 @@ def create_runner_app(
             history = []
         else:
             history = await _load_history_as_input(session_id)
-        if history and session_id not in _active_turns:
+        execution_seen = initially_active or _turn_bind_epoch.get(session_id) != initial_turn_epoch
+        if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
             last = history[-1]
             last_type = last.get("type")
@@ -4453,8 +4458,10 @@ def create_runner_app(
             # Active execution, including a newer message, takes precedence over
             # automatic continuation. Initialization alone cannot consume it.
             _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
-            if session_id not in _active_turns and not resource_registry.session_turn_is_active(
-                session_id
+            if (
+                not execution_seen
+                and session_id not in _active_turns
+                and not resource_registry.session_turn_is_active(session_id)
             ):
                 if is_native_harness(harness_name):
                     _session_histories[session_id] = []

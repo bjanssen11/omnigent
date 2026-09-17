@@ -4251,11 +4251,17 @@ async def _ensure_runner_session_initialized(
         # via the same warning path rather than silently forwarding into a
         # half-initialized runner.
         resp.raise_for_status()
-        from omnigent.server.child_session_recovery import restore_active_children
+        from omnigent.server.child_session_recovery import (
+            restore_active_children,
+            schedule_child_restoration,
+        )
 
         # Legacy callers leave descendant restoration to the runner-connect hook.
         if initializer is not None:
-            await restore_active_children(conv, runner_client, conversation_store, initializer)
+            if suppress_recovery_turn and not require_success:
+                schedule_child_restoration(conv, runner_client, conversation_store, initializer)
+            else:
+                await restore_active_children(conv, runner_client, conversation_store, initializer)
         await _publish_runner_recovered_status(session_id, conversation_store)
         try:
             payload = resp.json()

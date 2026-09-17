@@ -20,6 +20,36 @@ _child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScoped
     WeakValueDictionary
 )
 
+_restoration_tasks: WorkspaceScopedCache[tuple[str, str | None], asyncio.Task[None]] = (
+    WorkspaceScopedCache()
+)
+
+
+def schedule_child_restoration(
+    parent: Conversation,
+    client: httpx.AsyncClient,
+    store: ConversationStore,
+    initializer: RunnerSessionInitializer,
+) -> None:
+    """Restore children after parent readiness without delaying its next message."""
+    key = (parent.id, parent.runner_id)
+    existing = _restoration_tasks.get(key)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(
+        restore_active_children(parent, client, store, initializer),
+        name=f"restore-children-{parent.id}",
+    )
+    _restoration_tasks[key] = task
+
+    def finished(done: asyncio.Task[None]) -> None:
+        if _restoration_tasks.get(key) is done:
+            _restoration_tasks.pop(key, None)
+        if not done.cancelled() and (error := done.exception()) is not None:
+            _logger.error("Failed to restore children of %s", parent.id, exc_info=error)
+
+    task.add_done_callback(finished)
+
 
 def is_parent_owned_subagent(conv: Conversation) -> bool:
     """Native mirrors belong to their parent's runtime, not a separate terminal."""

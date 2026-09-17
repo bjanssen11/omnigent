@@ -333,3 +333,45 @@ async def test_concurrent_recovery_does_not_allocate_a_second_continuation(
         await asyncio.gather(first, second)
     assert store.get_conversation(row.id).runner_id == parent.runner_id
     assert len(requests) == 1, [r["session_init"]["recovery_id"] for r in requests]
+
+
+@pytest.mark.asyncio
+async def test_message_handshake_does_not_wait_for_child_initialization(
+    recovery_tree: Any,
+) -> None:
+    """Parent messages can proceed while a slow child's restoration continues."""
+    import asyncio
+
+    from omnigent.server.routes import sessions
+
+    store, parent, child, relay, _, initializer = recovery_tree
+    row = child()
+    entered, release, restored = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    requests = []
+    relay.side_effect = lambda *_args: restored.set()
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        session_id = json.loads(request.content)["session_id"]
+        requests.append(session_id)
+        if session_id == row.id:
+            entered.set()
+            await release.wait()
+        return httpx.Response(201, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        handshake = asyncio.create_task(
+            sessions._ensure_runner_session_initialized(
+                parent.id, parent, client, store, initializer, suppress_recovery_turn=True
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert handshake.done(), "slow child initialization blocked the parent's message"
+        finally:
+            release.set()
+            await asyncio.wait_for(handshake, timeout=5)
+            await asyncio.wait_for(restored.wait(), timeout=5)
+    assert requests == [parent.id, row.id]
+    assert store.get_conversation(row.id).runner_id == parent.runner_id

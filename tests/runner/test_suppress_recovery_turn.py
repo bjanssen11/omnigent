@@ -379,3 +379,50 @@ async def test_explicit_recovery_deduplicates_history_heuristic() -> None:
     content = str(harness.posted_bodies[0]["content"])
     assert "hello from history" in content
     assert "Continue the existing task" in content
+
+
+@pytest.mark.asyncio
+async def test_newer_turn_finishing_during_initialization_supersedes_recovery() -> None:
+    """A completed newer turn must not be followed by a stale recovery prompt."""
+    from omnigent.runner.app import _session_histories_ref
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class PausedHistoryServer(_HistoryServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            response = await super().get(url, **kwargs)
+            if url.endswith(f"/{SESSION_ID}/items") and not entered.is_set():
+                entered.set()
+                await release.wait()
+            return response
+
+    app, _pm, harness = _build_sdk_app(PausedHistoryServer())
+    payload = _session_init_payload(suppress_recovery_turn=False)
+    payload["session_init"].update(resume_interrupted_turn=True, recovery_id="interrupted-task")
+    async with _runner_client(app) as client:
+        recovery = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        try:
+            response = await client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                params={"stream": "true"},
+                json={
+                    "type": "message",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "newer instruction"}],
+                },
+            )
+            assert response.status_code == 200, response.text
+            assert len(harness.posted_bodies) == 1
+            assert SESSION_ID not in app.state.active_turns
+            history = _session_histories_ref[SESSION_ID]
+        finally:
+            release.set()
+        assert (await recovery).status_code == 201
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+        assert len(harness.posted_bodies) == 1, "recovery repeated a completed newer turn"
+        assert _session_histories_ref[SESSION_ID] is history
+        await client.post("/v1/sessions", json=payload)
+        assert len(harness.posted_bodies) == 1
