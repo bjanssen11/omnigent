@@ -4585,14 +4585,8 @@ def _require_codex_approval_mode_forward(
         )
 
 
-# A failure detail can be the harness's whole last message: claude-native's
-# StopFailure edge posts none, so the reason falls back to the turn's persisted
-# assistant text, which may be pages of markdown — one measured at 17KB. Cap it
-# so a whole reply never lands in telemetry, well above the details a diagnosis
-# needs (a runner-exit reason carries an exit code, a host log path and a log
-# tail, measured at ~4KB). Newlines are left alone: the message is a column, and
-# 96% of details in the 600-2200 char band are multi-line tracebacks, log tails
-# and API error bodies whose structure is the readable part.
+# Bound fallback assistant text while preserving multiline tracebacks and
+# runner-exit diagnostics within the limit.
 _FAILURE_LOG_DETAIL_MAX_CHARS: Final[int] = 4500
 
 

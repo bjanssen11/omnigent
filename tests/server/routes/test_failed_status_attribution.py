@@ -140,13 +140,8 @@ def _failure_publish_calls(source: str) -> list[ast.Call]:
 def test_oversized_failure_detail_is_capped(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A whole assistant reply must not land in telemetry unbounded.
-
-    claude-native's ``StopFailure`` edge posts no detail, so the reason falls
-    back to the turn's persisted assistant text — measured at 17KB in the worst
-    observed case. The cap keeps that out while naming what was dropped.
-    """
-    reply = "Direct answer: **no**.\n\n## The crux\n" + "detail " * 2000
+    """Oversized fallback text is bounded and reports its omitted length."""
+    reply = "Synthetic failure detail\n\n" + "detail " * 2000
     record = _publish_failed(
         caplog,
         error=ErrorDetail(source="execution", code="native_turn_error", message=reply),
@@ -156,19 +151,14 @@ def test_oversized_failure_detail_is_capped(
     assert "code=native_turn_error" in message
     detail = message.split("): ", 1)[1]
     assert len(detail) < 4700, detail
-    assert detail.startswith("Direct answer: **no**.")
+    assert detail.startswith("Synthetic failure detail")
     assert "chars)" in detail
 
 
 def test_multiline_failure_detail_keeps_its_line_structure(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Do not flatten a traceback: its structure is the readable part.
-
-    96% of details in the 600-2200 character band are multi-line tracebacks,
-    log tails and API error bodies. ``message`` is a column, so newlines cost
-    nothing to store and collapsing them only makes a diagnosis harder to read.
-    """
+    """A multiline error within the limit retains its diagnostic structure."""
     trace = 'API Error: 400 {\n  "error": {\n    "code": 400,\n    "message": "bad"\n  }\n}'
     record = _publish_failed(
         caplog,
@@ -181,11 +171,7 @@ def test_multiline_failure_detail_keeps_its_line_structure(
 def test_runner_exit_reason_keeps_its_diagnostics(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A runner-exit reason carries an exit code, log path and tail — keep them.
-
-    Measured at ~4KB in production, and it is the whole diagnosis for a runner
-    that died, so the bound must not clip the path or the tail down to nothing.
-    """
+    """A runner-exit reason retains its exit code, log path, and traceback."""
     reason = (
         "runner process exited with code 1 "
         "(log on host: ~/.omnigent/logs/runner/runner-abc123-def456-7-8.log)\n"
