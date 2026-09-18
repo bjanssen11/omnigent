@@ -887,8 +887,8 @@ def _build_models_json(
 # parser only consumes that channel when the model entry declares
 # ``reasoning: true``; without it the stream carries no ``content`` and the
 # turn dies with "Stream ended without finish_reason".
-# Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
-# so they no longer need this flag.
+# Note: GLM, kimi, and inkling route via Responses only for system.ai.* ids;
+# non-system GLM aliases use the Chat Completions surface.
 def _pi_needs_responses_api(
     model: str,
     wire_apis: frozenset[ModelWireAPI] | None = None,
@@ -901,6 +901,12 @@ def _pi_needs_responses_api(
     which is the forward-compatible tool-capable surface.
     """
     lower = model.lower()
+    # Databricks serving-endpoint aliases such as databricks-glm-* and
+    # eng_dev.ai_gateway.glm-* are Chat Completions models. Keep this explicit
+    # override ahead of catalog metadata because the same backing model may
+    # advertise both wires while the alias is only routable on /chat/completions.
+    if "glm-" in lower and not lower.startswith("system.ai."):
+        return False
     if lower.startswith("system.ai.") and any(
         keyword in lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
     ):

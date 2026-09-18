@@ -13,7 +13,9 @@ if TYPE_CHECKING:
     from omnigent.models.model_catalog import ModelEntry
 
 # These system models omit the finish reason Pi requires on Chat Completions.
-# ``glm-`` avoids matching vendor-direct ids without a system.ai alias.
+# The keyword fallback is applied only to ``system.ai.*`` ids; vendor/direct
+# aliases such as ``databricks-glm-*`` and ``eng_dev.ai_gateway.glm-*`` use the
+# Chat Completions surface.
 SYSTEM_AI_RESPONSES_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "glm-")
 
 

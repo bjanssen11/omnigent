@@ -1720,6 +1720,39 @@ def test_cli_config_databricks_registers_gpt_provider(
     assert any(m["id"] == "databricks-gpt-5-4" for m in openai_entry["models"])
 
 
+def test_fetch_pi_model_lists_routes_non_system_glm_to_completions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-system GLM aliases use chat completions, not the Codex Responses wire."""
+    from omnigent.models.model_catalog import ModelEntry
+    from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
+
+    monkeypatch.setattr(
+        creds.model_catalog,
+        "fetch_databricks_model_service_entries",
+        lambda *_args, **_kwargs: (
+            ModelEntry(
+                id="eng_dev.ai_gateway.glm-4-7",
+                family="other",
+                metadata=ModelMetadata(
+                    wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT, ModelWireAPI.OPENAI_RESPONSES})
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(creds, "enrich_databricks_model_catalog", lambda models, _catalog: models)
+    monkeypatch.setattr(creds, "_clamp_entries_to_output_caps", lambda *_args, **_kwargs: None)
+
+    claude, responses, completions, gemini = creds._fetch_pi_model_lists(
+        "https://workspace.example.com", "token"
+    )
+
+    assert claude == []
+    assert responses == []
+    assert [entry["id"] for entry in completions] == ["eng_dev.ai_gateway.glm-4-7"]
+    assert gemini == []
+
+
 def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
     """_fetch_pi_model_lists uses Unity Catalog model-services API for model ids."""
     import json

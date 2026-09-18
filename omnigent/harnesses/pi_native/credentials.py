@@ -900,8 +900,23 @@ def _fetch_pi_model_lists(
         name = model.id
         name_lower = name.lower()
         entry: _PiModelEntry = pi_model_json_entry(model)
-        needs_responses = ModelWireAPI.OPENAI_RESPONSES in model.metadata.wire_apis or any(
-            keyword in name_lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
+        # The system.ai aliases are a special Databricks surface: some of them
+        # (including system.ai.glm-*) are exposed through the Responses gateway.
+        # Non-system aliases such as eng_dev.ai_gateway.glm-* and
+        # databricks-glm-* are served through /chat/completions, even when the
+        # catalog advertises a shared/Responses capability. Do not let the
+        # generic Responses capability or the legacy GLM keyword fallback route
+        # those aliases to /codex/v1.
+        is_system_ai = name_lower.startswith("system.ai.")
+        is_non_system_glm = "glm-" in name_lower and not is_system_ai
+        needs_responses = (
+            not is_non_system_glm
+            and (
+                ModelWireAPI.OPENAI_RESPONSES in model.metadata.wire_apis
+                or (is_system_ai and any(
+                    keyword in name_lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
+                ))
+            )
         )
         if "claude" in name_lower:
             claude.append(entry)
