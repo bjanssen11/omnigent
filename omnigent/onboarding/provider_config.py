@@ -1385,6 +1385,17 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     family = _HARNESS_FAMILY.get(harness)
     if family is not None:
         return get_default_provider(config, family)
+    # OpenCode can consume both Anthropic and OpenAI-compatible providers.
+    # Prefer the OpenAI default when present, then fall back to Anthropic;
+    # unlike pi, it must not inherit a Databricks profile when a configured
+    # gateway provider is available, or the native TUI falls back to its own
+    # free-model catalog.
+    if harness == "opencode":
+        for family_name in (OPENAI_FAMILY, ANTHROPIC_FAMILY):
+            provider = get_default_provider(config, family_name)
+            if provider is not None:
+                return provider
+        return None
     # Unmapped (e.g. pi): an explicit pi-scope default is authoritative.
     explicit = get_default_provider(config, PI_SURFACE)
     if explicit is not None:

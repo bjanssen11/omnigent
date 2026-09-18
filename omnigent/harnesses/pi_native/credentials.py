@@ -649,7 +649,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         )
     if completions_models:
         additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
-            api_key, f"{host}/serving-endpoints", completions_models, api_type="openai-completions"
+            api_key, f"{host}/ai-gateway/openai/v1", completions_models, api_type="openai-completions"
         )
     if gemini_models:
         additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
@@ -672,7 +672,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         credential_warning=credential_warning,
         databricks_surfaces={
             DatabricksPiSurface.RESPONSES: f"{host}/ai-gateway/codex/v1",
-            DatabricksPiSurface.COMPLETIONS: f"{host}/serving-endpoints",
+            DatabricksPiSurface.COMPLETIONS: f"{host}/ai-gateway/openai/v1",
             DatabricksPiSurface.MLFLOW: f"{host}/ai-gateway/mlflow/v1",
         },
     )
@@ -747,8 +747,8 @@ def _databricks_openai_provider(
     * ``"openai-responses"`` — AI Gateway codex surface
       (``/ai-gateway/codex/v1``). Required for newer GPT models (gpt-5.5,
       gpt-5.6-*) that reject function tool calls via ``/chat/completions``.
-    * ``"openai-completions"`` — workspace serving-endpoints surface. Works
-      for Kimi, Llama, GLM, Gemini, and older GPT models.
+    * ``"openai-completions"`` — Databricks OpenAI-compatible gateway surface.
+      Works for Kimi, Llama, GLM, Gemini, and older GPT models.
 
     ``authHeader`` sends ``Authorization: Bearer {token}`` (Databricks requires
     this; without it the OpenAI SDK uses ``api-key`` which is rejected).
@@ -1157,7 +1157,9 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         # Workspace-hosted gateway: build from workspace hostname.
         codex_gateway_url = f"https://{parsed_gateway.hostname}/ai-gateway/codex/v1"
     workspace_completions_url = (
-        real_workspace_url + "/serving-endpoints" if real_workspace_url else None
+        (
+        real_workspace_url + "/ai-gateway/openai/v1" if real_workspace_url else None
+    )
     )
     workspace_mlflow_url = (
         real_workspace_url + "/ai-gateway/mlflow/v1" if real_workspace_url else None

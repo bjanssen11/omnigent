@@ -115,6 +115,35 @@ def test_resolve_secret_env_ref_accepts_omnigent_prefixed_alias(
     assert resolve_secret("$ANTHROPIC_API_KEY") == "sk-ant-prefixed"
 
 
+def test_default_provider_for_opencode_uses_openai_family_default() -> None:
+    """OpenCode must resolve the configured gateway instead of falling back to free models."""
+    config = {
+        "providers": {
+            "databricks": {
+                "kind": "databricks",
+                "default": ["anthropic", "pi"],
+                "profile": "p1",
+            },
+            "gateway": {
+                "kind": "gateway",
+                "default": ["openai"],
+                "openai": {
+                    "base_url": "https://gateway.example/v1",
+                    "auth_command": "gateway-token",
+                    "wire_api": "chat",
+                    "models": {"default": "eng_dev.ai_gateway.omni-gpt-high"},
+                },
+            },
+        }
+    }
+
+    resolved = default_provider_for_harness(config, "opencode")
+
+    assert resolved is not None
+    assert resolved.name == "gateway"
+    assert resolved.kind == "gateway"
+
+
 def test_default_provider_for_pi_skips_subscription_defaults() -> None:
     """For the unmapped ``pi`` harness, a subscription default is skipped.
 

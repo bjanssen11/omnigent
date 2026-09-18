@@ -561,10 +561,10 @@ class TestBuildModelsJson(unittest.TestCase):
         )
         p = result["providers"]
         # The ucode ``openai`` value is the Codex Responses gateway; GPT and the
-        # catch-all re-route to serving-endpoints, claude keeps its gateway.
+        # catch-all use the OpenAI-compatible gateway surface, claude keeps its gateway.
         self.assertEqual(
             p["databricks"]["baseUrl"],
-            "https://host.example.com/serving-endpoints",
+            "https://host.example.com/ai-gateway/openai/v1",
         )
         self.assertEqual(
             p["databricks-anthropic"]["baseUrl"],
@@ -572,7 +572,7 @@ class TestBuildModelsJson(unittest.TestCase):
         )
         self.assertEqual(
             p["databricks-completions"]["baseUrl"],
-            "https://host.example.com/serving-endpoints",
+            "https://host.example.com/ai-gateway/openai/v1",
         )
 
     def test_ucode_codex_gateway_rerouted_off_responses_path(self):
@@ -586,7 +586,7 @@ class TestBuildModelsJson(unittest.TestCase):
         for name in ("databricks", "databricks-completions"):
             base_url = result["providers"][name]["baseUrl"]
             self.assertNotIn("/ai-gateway/codex", base_url)
-            self.assertEqual(base_url, "https://host.example.com/serving-endpoints")
+            self.assertEqual(base_url, "https://host.example.com/ai-gateway/openai/v1")
 
     def test_gemini_model_routed_to_mlflow_gateway(self):
         # Gemini uses /ai-gateway/mlflow/v1 — system.ai.* ids 404 at serving-endpoints
@@ -673,7 +673,7 @@ class TestBuildModelsJson(unittest.TestCase):
         chat = result["providers"]["databricks"]
         self.assertEqual(
             chat["baseUrl"],
-            "https://workspace.cloud.databricks.com/serving-endpoints",
+            "https://workspace.cloud.databricks.com/ai-gateway/openai/v1",
         )
         self.assertIn("databricks-gpt-next", [entry["id"] for entry in chat["models"]])
         self.assertEqual(

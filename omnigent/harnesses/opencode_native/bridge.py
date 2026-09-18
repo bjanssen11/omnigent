@@ -196,22 +196,18 @@ export const OmnigentPolicyPlugin = async () => ({
 _GATEWAY_AUTH_PLUGIN_FILE = "omnigent-gateway-auth.js"
 
 # Per-request bearer refresh for config-gateway providers whose family
-# authenticates with an ``auth_command``. opencode's ``auth.loader`` hook
-# (``@opencode-ai/plugin``) is invoked when opencode instantiates a provider and
-# its returned record is merged into the AI SDK factory options — so a loader
-# that runs the family's command and returns ``{apiKey, headers.Authorization}``
-# supplies a fresh Bearer without a static token in ``opencode.json``. The
-# per-provider commands arrive as ``OMNIGENT_OPENCODE_AUTH_COMMAND`` (JSON map of
-# provider id → shell command) stamped on the ``opencode serve`` process. One
-# plugin function is exported per provider id (opencode iterates a module's
-# function exports as plugins). The ``Authorization`` header overrides the AI SDK
-# Anthropic factory's default ``x-api-key`` (proven by ucode's shipping config).
-_GATEWAY_AUTH_PLUGIN_PROLOGUE = r"""
+# authenticates with an ``auth_command``. Uses the ``chat.headers`` hook from
+# ``@opencode-ai/plugin`` (the ``server`` export API) to inject a fresh
+# ``Authorization: Bearer`` on every request for providers whose id appears in
+# ``OMNIGENT_OPENCODE_AUTH_COMMAND``. The per-provider commands arrive as that
+# env var (JSON map of provider id → shell command) stamped on the opencode
+# serve process. The ``chat.headers`` hook handles all providers in one plugin
+# and overrides whatever the AI SDK factory would otherwise send.
+_GATEWAY_AUTH_PLUGIN = r"""
 // Omnigent gateway bearer refresh for opencode-native (generated; do not edit).
-// Registers an auth loader per synthesized gateway provider that mints a fresh
-// token via the family's auth_command, so short-lived gateway tokens refresh
-// per provider load instead of a static apiKey baked into opencode.json.
-const { execSync } = require("child_process");
+// Uses the @opencode-ai/plugin chat.headers hook to inject a fresh
+// Authorization: Bearer token per request for each configured gateway provider.
+import { execSync } from "node:child_process";
 let COMMANDS = {};
 try {
   COMMANDS = JSON.parse(process.env.OMNIGENT_OPENCODE_AUTH_COMMAND || "{}") || {};
@@ -219,44 +215,36 @@ try {
   COMMANDS = {};
 }
 
-function mintFor(providerId) {
+function mintToken(providerId) {
   const cmd = COMMANDS[providerId];
-  if (!cmd) return {};
-  let token = "";
+  if (!cmd) return null;
   try {
-    token = String(execSync(cmd, { encoding: "utf8", timeout: 15000 }) || "").trim();
+    const t = String(execSync(cmd, { encoding: "utf8", timeout: 15000 }) || "").trim();
+    return t || null;
   } catch (e) {
-    return {};
+    return null;
   }
-  if (!token) return {};
-  return { apiKey: token, headers: { Authorization: "Bearer " + token } };
 }
-"""
 
-_GATEWAY_AUTH_PLUGIN_EXPORT = (
-    "export const OmnigentGatewayAuth_{ident} = async () => ({{\n"
-    "  auth: {{\n"
-    "    provider: {provider_json},\n"
-    "    loader: async () => mintFor({provider_json}),\n"
-    '    methods: [{{ type: "api", label: "Omnigent gateway" }}],\n'
-    "  }},\n"
-    "}});\n"
-)
+export const server = async () => ({
+  "chat.headers": async (input, output) => {
+    const pid = input?.provider?.info?.id;
+    if (!pid || !Object.prototype.hasOwnProperty.call(COMMANDS, pid)) return;
+    const token = mintToken(pid);
+    if (token) output.headers["Authorization"] = "Bearer " + token;
+  },
+});
+"""
 
 
 def build_gateway_auth_plugin_js(provider_ids: Sequence[str]) -> str:
-    """Render the gateway-auth plugin source for *provider_ids*.
+    """Render the gateway-auth plugin source.
 
-    :param provider_ids: opencode provider ids that mint via an ``auth_command``.
-    :returns: JS module source with one auth-loader plugin export per provider.
+    :param provider_ids: Unused; provider ids are resolved at runtime from
+        ``OMNIGENT_OPENCODE_AUTH_COMMAND``. Kept for call-site compatibility.
+    :returns: JS module source using the ``@opencode-ai/plugin`` server API.
     """
-    parts = [_GATEWAY_AUTH_PLUGIN_PROLOGUE]
-    for provider_id in provider_ids:
-        ident = re.sub(r"[^A-Za-z0-9_]", "_", provider_id)
-        parts.append(
-            _GATEWAY_AUTH_PLUGIN_EXPORT.format(ident=ident, provider_json=json.dumps(provider_id))
-        )
-    return "\n".join(parts)
+    return _GATEWAY_AUTH_PLUGIN
 
 
 def write_opencode_gateway_auth_plugin(bridge_dir: Path, provider_ids: Sequence[str]) -> Path:

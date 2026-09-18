@@ -732,6 +732,7 @@ def _build_models_json(
     """
     h = host.rstrip("/")
     serving_endpoints_url = f"{h}/serving-endpoints"
+    openai_gateway_url = f"{h}/ai-gateway/openai/v1"
     codex_gateway_url = f"{h}/ai-gateway/codex/v1"
     mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
@@ -744,7 +745,10 @@ def _build_models_json(
     )
     # Databricks Codex URLs only accept Responses; Chat uses the workspace.
     if raw_openai_base_url and is_databricks_openai_gateway:
-        openai_base_url = serving_endpoints_url
+        # The workspace serving-endpoints route is not an OpenAI-compatible
+        # chat endpoint. GLM and other chat-wire model services must use the
+        # AI Gateway OpenAI surface; otherwise Pi receives a body-less 404.
+        openai_base_url = openai_gateway_url
     else:
         openai_base_url = raw_openai_base_url or serving_endpoints_url
     # For non-Databricks providers (e.g. OpenAI API key, LiteLLM) the
@@ -797,7 +801,7 @@ def _build_models_json(
                 "compat": _openai_responses_compat,
                 "models": provider_models["databricks-openai"],
             },
-            # Older GPT models → OpenAI Chat Completions at serving-endpoints.
+            # Older GPT/GLM models → OpenAI Chat Completions at the AI Gateway.
             "databricks": {
                 "baseUrl": openai_base_url,
                 "apiKey": token,
