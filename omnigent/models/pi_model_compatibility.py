@@ -7,7 +7,7 @@ from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
-from omnigent.models.model_metadata import ModelMetadata
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata
 
 if TYPE_CHECKING:
     from omnigent.models.model_catalog import ModelEntry
@@ -87,10 +87,34 @@ class PiModelEntry(TypedDict):
     id: str
     input: NotRequired[list[str]]
     reasoning: NotRequired[bool]
+    # Maps Pi's thinking levels to the wire effort value (or ``None`` to hide a
+    # level). Pi offers off/minimal/low/medium/high by default for a reasoning
+    # model but hides xhigh/max unless the map lists them, so this is required to
+    # expose those rungs — and to drop levels the gateway rejects (e.g. minimal).
+    thinkingLevelMap: NotRequired[dict[str, str | None]]
     # Omitted when the catalog reports no limit; Pi then applies its own
     # defaults (128000 / 16384).
     contextWindow: NotRequired[int]
     maxTokens: NotRequired[int]
+
+
+# Pi's thinking rungs above ``off`` that map to a reasoning effort. ``off`` is
+# left out of the map so Pi keeps offering it (a ``null`` there would hide it).
+_PI_EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _pi_thinking_level_map(efforts: frozenset[str]) -> dict[str, str | None]:
+    """Build Pi's ``thinkingLevelMap`` from a model's supported reasoning efforts.
+
+    Each supported effort maps to its own wire value; unsupported rungs map to
+    ``None`` (Pi hides them). This both exposes ``xhigh``/``max`` — which Pi
+    hides unless explicitly listed — and drops levels the gateway rejects (e.g.
+    ``minimal`` on the Bedrock OpenAI models).
+
+    :param efforts: The efforts the model accepts, e.g. ``{"low", "high", "max"}``.
+    :returns: A ``thinkingLevelMap`` for :class:`PiModelEntry`.
+    """
+    return {level: (level if level in efforts else None) for level in _PI_EFFORT_LEVELS}
 
 
 def pi_model_is_reasoning(model_id: str) -> bool:
@@ -125,10 +149,23 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["contextWindow"] = model.metadata.context_window
     if model.metadata.max_output_tokens is not None:
         entry["maxTokens"] = model.metadata.max_output_tokens
-    if pi_model_is_reasoning(model.id) or any(
-        fragment in model.id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS
+    # Prefer the catalog's own reasoning capability (set from the model-service's
+    # advertised wire — e.g. the OpenAI Responses surface for GPT-5.x). Fall back
+    # to id-fragment matching for catalog entries that carry no capability
+    # metadata (the offline/last-resort discovery path).
+    if (
+        model.metadata.supports(ModelCapability.REASONING) is True
+        or pi_model_is_reasoning(model.id)
+        or any(fragment in model.id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS)
     ):
         entry["reasoning"] = True
+        # When the catalog knows the model's effort ladder (set from the routing
+        # target for the OpenAI Responses models), emit a thinkingLevelMap so Pi
+        # exposes xhigh/max and hides the rejected minimal rung. Absent it, Pi
+        # keeps its default off/minimal/low/medium/high ladder.
+        reasoning_metadata = model.metadata.reasoning
+        if reasoning_metadata is not None and reasoning_metadata.efforts:
+            entry["thinkingLevelMap"] = _pi_thinking_level_map(reasoning_metadata.efforts)
     return entry
 
 
