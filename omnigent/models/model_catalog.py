@@ -53,6 +53,7 @@ from omnigent.models.model_metadata import (
     ModelCostTier,
     ModelIntent,
     ModelMetadata,
+    ModelReasoningMetadata,
     ModelWireAPI,
 )
 from omnigent.models.model_override import is_codex_compatible_model, model_family_mismatch
@@ -1322,6 +1323,33 @@ def _fetch_databricks_uc_listing(
     )
 
 
+# Reasoning-effort ceilings for the gateway's OpenAI Responses model-services,
+# keyed by the Bedrock routing-target family. The gateway does not advertise a
+# model's effort ladder and it is model-specific (verified 2026-09-21 against
+# the live gateway: OpenAI GPT-5.x reach ``max``, xAI Grok reaches ``xhigh``,
+# others cap at ``high``; every one rejects ``minimal``), so the ceiling is
+# derived from the routing target — the closest catalog signal available.
+_GPT_RESPONSES_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_XAI_RESPONSES_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+_DEFAULT_RESPONSES_EFFORTS = frozenset({"low", "medium", "high"})
+
+
+def _responses_reasoning_efforts(targets: list[str]) -> frozenset[str]:
+    """Return the reasoning efforts a Responses model accepts, by target family.
+
+    :param targets: The model-service's Bedrock routing targets, e.g.
+        ``["us.openai.gpt-5.6-luna"]``.
+    :returns: The accepted effort ladder (``minimal`` is always excluded — the
+        Bedrock gateway rejects it).
+    """
+    target = targets[0].lower() if targets else ""
+    if "openai" in target or "gpt" in target:
+        return _GPT_RESPONSES_EFFORTS
+    if "xai" in target or "grok" in target:
+        return _XAI_RESPONSES_EFFORTS
+    return _DEFAULT_RESPONSES_EFFORTS
+
+
 def fetch_databricks_model_service_entries(
     workspace_url: str,
     token: str,
@@ -1493,6 +1521,24 @@ def fetch_databricks_model_service_entries(
             wire_apis.add(ModelWireAPI.ANTHROPIC_MESSAGES)
         if not wire_apis:
             continue
+        # Catalog-driven reasoning capability: the gateway's reasoning-capable
+        # wires are the OpenAI Responses surface (GPT-5.x reasoning models expose
+        # it; reasoning_effort only takes effect there, not on chat/completions)
+        # and the Anthropic Messages surface (Claude extended thinking). Deriving
+        # the capability from the advertised wire keeps it catalog-driven instead
+        # of matching on model-id fragments.
+        supported_capabilities: set[ModelCapability] = set()
+        reasoning_metadata: ModelReasoningMetadata | None = None
+        if ModelWireAPI.OPENAI_RESPONSES in wire_apis:
+            supported_capabilities.add(ModelCapability.REASONING)
+            # The gateway doesn't advertise a model's reasoning-effort ladder and
+            # it is model-specific, so derive the ceiling from the routing target
+            # (also catalog data) — see _responses_reasoning_efforts.
+            reasoning_metadata = ModelReasoningMetadata(
+                efforts=_responses_reasoning_efforts(targets)
+            )
+        elif ModelWireAPI.ANTHROPIC_MESSAGES in wire_apis:
+            supported_capabilities.add(ModelCapability.REASONING)
         models.append(
             ModelEntry(
                 id=name,
@@ -1505,6 +1551,8 @@ def fetch_databricks_model_service_entries(
                         target_metadata.max_output_tokens if target_metadata is not None else None
                     ),
                     wire_apis=frozenset(wire_apis),
+                    supported_capabilities=frozenset(supported_capabilities),
+                    reasoning=reasoning_metadata,
                 ),
             )
         )

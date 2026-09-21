@@ -1916,6 +1916,103 @@ def test_model_services_parent_override_is_used() -> None:
     assert [entry.id for entry in entries] == ["eng_dev.ai_gateway.omni-gpt"]
 
 
+def test_responses_wire_marks_reasoning_capability() -> None:
+    """A model-service advertising the OpenAI Responses (or Anthropic Messages)
+    wire is marked reasoning-capable so pi advertises thinking levels; a
+    chat-completions-only service is not — the capability is derived from the
+    advertised wire, not from the model id."""
+    from omnigent.models import model_catalog
+    from omnigent.models.model_metadata import ModelCapability
+    from omnigent.models.pi_model_compatibility import pi_model_json_entry
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [
+                    _uc_service(
+                        "eng_dev.ai_gateway.omni-gpt-med",
+                        ["openai/v1/chat/completions", "openai/v1/responses"],
+                    ),
+                    _uc_service("eng_dev.ai_gateway.plain-chat", ["openai/v1/chat/completions"]),
+                ]
+            },
+            request=request,
+        )
+
+    entries = {
+        entry.id: entry
+        for entry in model_catalog.fetch_databricks_model_service_entries(
+            "https://workspace.example.com",
+            "token",
+            transport=httpx.MockTransport(_handler),
+            model_services_parent="schemas/eng_dev.ai_gateway",
+        )
+    }
+
+    gpt = entries["eng_dev.ai_gateway.omni-gpt-med"]
+    assert gpt.metadata.supports(ModelCapability.REASONING) is True
+    assert pi_model_json_entry(gpt).get("reasoning") is True
+
+    chat_only = entries["eng_dev.ai_gateway.plain-chat"]
+    assert chat_only.metadata.supports(ModelCapability.REASONING) is None
+    assert pi_model_json_entry(chat_only).get("reasoning") is None
+
+
+def test_responses_reasoning_effort_ceiling_by_target_family() -> None:
+    """The effort ladder is derived from the Bedrock routing target family."""
+    from omnigent.models.model_catalog import _responses_reasoning_efforts
+
+    assert "max" in _responses_reasoning_efforts(["us.openai.gpt-5.6-luna"])
+    grok = _responses_reasoning_efforts(["us.xai.grok-4.6"])
+    assert "xhigh" in grok and "max" not in grok
+    other = _responses_reasoning_efforts(["us.z-ai.glm-5"])
+    assert other == frozenset({"low", "medium", "high"})
+    # minimal is never offered — the Bedrock gateway rejects it.
+    for targets in (["us.openai.gpt-5.6-luna"], ["us.xai.grok-4.6"], ["us.z-ai.glm-5"]):
+        assert "minimal" not in _responses_reasoning_efforts(targets)
+
+
+def test_pi_thinking_level_map_exposes_and_hides_levels() -> None:
+    """pi_model_json_entry emits a thinkingLevelMap that exposes supported rungs
+    (incl. xhigh/max) and nulls out the rest so pi hides them."""
+    from omnigent.models.model_metadata import (
+        ModelCapability,
+        ModelMetadata,
+        ModelReasoningMetadata,
+    )
+    from omnigent.models.pi_model_compatibility import pi_model_json_entry
+
+    gpt = model_catalog.ModelEntry(
+        id="eng_dev.ai_gateway.omni-gpt-med",
+        family="gpt",
+        metadata=ModelMetadata(
+            supported_capabilities=frozenset({ModelCapability.REASONING}),
+            reasoning=ModelReasoningMetadata(
+                efforts=frozenset({"low", "medium", "high", "xhigh", "max"})
+            ),
+        ),
+    )
+    level_map = pi_model_json_entry(gpt)["thinkingLevelMap"]
+    assert level_map["max"] == "max"
+    assert level_map["xhigh"] == "xhigh"
+    assert level_map["minimal"] is None
+
+    grok = model_catalog.ModelEntry(
+        id="eng_dev.ai_gateway.grok-4-6",
+        family="grok",
+        metadata=ModelMetadata(
+            supported_capabilities=frozenset({ModelCapability.REASONING}),
+            reasoning=ModelReasoningMetadata(
+                efforts=frozenset({"low", "medium", "high", "xhigh"})
+            ),
+        ),
+    )
+    grok_map = pi_model_json_entry(grok)["thinkingLevelMap"]
+    assert grok_map["xhigh"] == "xhigh"
+    assert grok_map["max"] is None
+
+
 def test_missing_api_types_fetched_per_service() -> None:
     """A service whose list entry omits supported_api_types is fetched per-service.
 
