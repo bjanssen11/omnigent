@@ -649,7 +649,10 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         )
     if completions_models:
         additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
-            api_key, f"{host}/ai-gateway/openai/v1", completions_models, api_type="openai-completions"
+            api_key,
+            f"{host}/ai-gateway/openai/v1",
+            completions_models,
+            api_type="openai-completions",
         )
     if gemini_models:
         additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
@@ -909,13 +912,11 @@ def _fetch_pi_model_lists(
         # those aliases to /codex/v1.
         is_system_ai = name_lower.startswith("system.ai.")
         is_non_system_glm = "glm-" in name_lower and not is_system_ai
-        needs_responses = (
-            not is_non_system_glm
-            and (
-                ModelWireAPI.OPENAI_RESPONSES in model.metadata.wire_apis
-                or (is_system_ai and any(
-                    keyword in name_lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
-                ))
+        needs_responses = not is_non_system_glm and (
+            ModelWireAPI.OPENAI_RESPONSES in model.metadata.wire_apis
+            or (
+                is_system_ai
+                and any(keyword in name_lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS)
             )
         )
         if "claude" in name_lower:
@@ -1157,9 +1158,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         # Workspace-hosted gateway: build from workspace hostname.
         codex_gateway_url = f"https://{parsed_gateway.hostname}/ai-gateway/codex/v1"
     workspace_completions_url = (
-        (
         real_workspace_url + "/ai-gateway/openai/v1" if real_workspace_url else None
-    )
     )
     workspace_mlflow_url = (
         real_workspace_url + "/ai-gateway/mlflow/v1" if real_workspace_url else None

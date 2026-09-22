@@ -2512,7 +2512,7 @@ def test_databricks_builders_carry_reachable_surfaces(monkeypatch: pytest.Monkey
     assert provider is not None
     assert provider.databricks_surfaces == {
         creds.DatabricksPiSurface.RESPONSES: "https://wkspc.example.com/ai-gateway/codex/v1",
-        creds.DatabricksPiSurface.COMPLETIONS: "https://wkspc.example.com/serving-endpoints",
+        creds.DatabricksPiSurface.COMPLETIONS: "https://wkspc.example.com/ai-gateway/openai/v1",
         creds.DatabricksPiSurface.MLFLOW: "https://wkspc.example.com/ai-gateway/mlflow/v1",
     }
 

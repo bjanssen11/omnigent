@@ -925,17 +925,22 @@ providers:
     assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high"
 
 
-def test_config_gateway_no_static_api_key_for_auth_command(
+def test_config_gateway_auth_command_writes_placeholder_key_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An auth_command family must NOT get a static options.apiKey; the plugin injects it."""
+    """An auth_command family gets only the factory placeholder, never a minted token.
+
+    The AI SDK factories refuse to construct without an apiKey, so a fixed
+    placeholder is written; the real bearer is injected per request by the
+    gateway-auth plugin.
+    """
     _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
 
     resolution = resolve_config_gateway_providers()
 
     assert resolution is not None
     for block in resolution.config["provider"].values():
-        assert "apiKey" not in block["options"]
+        assert block["options"]["apiKey"] == "omnigent-gateway-auth-plugin"
     # Both families' commands are surfaced for the refresh plugin.
     assert resolution.auth_commands == {
         "gateway-anthropic": "databricks-token --host ws.example.com",
@@ -1059,24 +1064,23 @@ def test_config_gateway_returns_none_without_config(
     assert resolve_config_gateway_providers() is None
 
 
-def test_gateway_auth_plugin_registers_loader_per_provider() -> None:
-    """The generated plugin exports one auth loader per provider id, keyed correctly."""
-    js = build_gateway_auth_plugin_js(["gateway-anthropic", "gateway-openai"])
+def test_gateway_auth_plugin_injects_bearer_per_request() -> None:
+    """The generated plugin hooks chat.headers and reads the provider id it carries."""
+    js = build_gateway_auth_plugin_js()
 
     # Reads the per-provider command map from the stamped env.
     assert "OMNIGENT_OPENCODE_AUTH_COMMAND" in js
-    # Injects a Bearer header (overriding the anthropic factory's x-api-key).
-    assert 'Authorization: "Bearer " + token' in js
-    # One export per provider, each bound to its provider id.
-    assert 'provider: "gateway-anthropic"' in js
-    assert 'provider: "gateway-openai"' in js
-    assert "OmnigentGatewayAuth_gateway_anthropic" in js
-    assert "OmnigentGatewayAuth_gateway_openai" in js
+    # Injects the minted Bearer on every request via the chat.headers hook.
+    assert '"chat.headers"' in js
+    assert 'output.headers["Authorization"] = "Bearer " + token' in js
+    # The hook input's provider record exposes id directly; reading only a
+    # nested .info.id silently skips every provider (no bearer ever injected).
+    assert "input?.provider?.id" in js
 
 
 def test_write_gateway_auth_plugin_creates_file(tmp_path: Path) -> None:
     """The plugin writer materializes the JS module in the bridge dir."""
-    path = write_opencode_gateway_auth_plugin(tmp_path, ["gateway-anthropic"])
+    path = write_opencode_gateway_auth_plugin(tmp_path)
     assert path.exists()
     assert path.name == "omnigent-gateway-auth.js"
-    assert 'provider: "gateway-anthropic"' in path.read_text(encoding="utf-8")
+    assert '"chat.headers"' in path.read_text(encoding="utf-8")

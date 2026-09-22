@@ -44,6 +44,7 @@ _OPENAI_GATEWAY_PATH = "/ai-gateway/openai/v1"
 _ANTHROPIC_MODEL = "eng_dev.ai_gateway.omni-claude-fable-4"
 _OPENAI_MODEL = "eng_dev.ai_gateway.omni-gpt-5.5"
 _GATEWAY_API_KEY = "test-gateway-key"
+_MINTED_TOKEN = "minted-dynamic-token"
 _REPLY_TEXT = "GATEWAY-OK"
 
 _HOST_ONLINE_TIMEOUT_S = 60.0
@@ -118,7 +119,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
 
     log: _RequestLog  # set on the server class per instance
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - stdlib signature
+    def log_message(self, format: str, *args: object) -> None:
         pass
 
     def _record(self, body: bytes) -> None:
@@ -615,4 +616,46 @@ def test_opencode_native_routes_via_config_gateway_openai_surface(
     assert any(_OPENAI_MODEL.encode() in r.body for r in hits), (
         f"the config default gateway model id {_OPENAI_MODEL!r} was dropped: it appears in "
         f"no model call to the configured gateway. Bodies: {[r.body[:200] for r in hits]!r}"
+    )
+
+
+def test_opencode_native_config_gateway_auth_command_mints_bearer(
+    opencode_binary: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+    live_server: str,
+) -> None:
+    """A family with a dynamic ``auth_command`` must authenticate the turn.
+
+    No static ``api_key`` is configured, so no token can be baked into the
+    synthesized ``opencode.json``; the gateway-auth plugin must run the family's
+    command and send the minted ``Authorization: Bearer`` on the turn's model
+    call to the configured surface.
+    """
+    hits, gateway, session_id = _run_gateway_journey(
+        http_client,
+        tmp_path=tmp_path,
+        live_server=live_server,
+        families={
+            "anthropic": {
+                "base_url": _ANTHROPIC_GATEWAY_PATH,
+                "auth_command": f"printf {_MINTED_TOKEN}",
+                "models": {"default": _ANTHROPIC_MODEL},
+            }
+        },
+        model_override=_ANTHROPIC_MODEL,
+        surface_prefix=_ANTHROPIC_GATEWAY_PATH,
+    )
+    all_requests = gateway.log.all()
+    assert hits, (
+        "the auth_command family's turn never reached the configured Anthropic surface "
+        f"({_ANTHROPIC_GATEWAY_PATH}) within {_GATEWAY_HIT_TIMEOUT_S}s of the user turn. "
+        f"All gateway requests: {[(r.method, r.path) for r in all_requests]!r}. "
+        f"Session items:\n{_items_summary(http_client, session_id)}"
+    )
+    expected = f"Bearer {_MINTED_TOKEN}"
+    assert all(r.authorization == expected for r in hits), (
+        "the turn's model call did not carry the bearer minted by the family's "
+        f"auth_command: expected {expected!r}, saw "
+        f"{[(r.path, r.authorization) for r in hits]!r}"
     )

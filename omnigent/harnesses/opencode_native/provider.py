@@ -131,6 +131,9 @@ _AI_SDK_ANTHROPIC = "@ai-sdk/anthropic"
 # OpenAI Chat-Completions-compatible surface (e.g. the gateway's
 # ``/ai-gateway/openai/v1``) → the OpenAI-compatible factory.
 _AI_SDK_OPENAI_COMPATIBLE = "@ai-sdk/openai-compatible"
+# Factory-satisfying stand-in written for ``auth_command`` families, never sent
+# as a real credential; the gateway-auth plugin's per-request Bearer wins.
+_AUTH_PLUGIN_PLACEHOLDER_KEY = "omnigent-gateway-auth-plugin"
 
 
 @dataclass(frozen=True)
@@ -156,12 +159,6 @@ class ConfigGatewayResolution:
     config: dict[str, object]
     auth_commands: dict[str, str]
     model: str
-
-    @property
-    def provider_ids(self) -> tuple[str, ...]:
-        """:returns: The synthesized provider ids (for the auth plugin)."""
-        providers = self.config.get("provider")
-        return tuple(providers) if isinstance(providers, dict) else ()
 
 
 def _config_gateway_provider_id(entry_name: str, family: str) -> str:
@@ -307,8 +304,12 @@ def resolve_config_gateway_providers(
         # A static key (or $VAR / keychain, resolved by ``entry.family``) is
         # written inline; a dynamic ``auth_command`` is NOT — the gateway-auth
         # plugin injects a fresh Bearer per request instead (no stale token).
+        # The placeholder apiKey only satisfies the AI SDK factory, which
+        # refuses to construct without one; the gateway authenticates the
+        # injected Authorization header.
         if family.auth_command:
             auth_commands[provider_id] = family.auth_command
+            options["apiKey"] = _AUTH_PLUGIN_PLACEHOLDER_KEY
         elif family.api_key:
             options["apiKey"] = family.api_key
         providers[provider_id] = {

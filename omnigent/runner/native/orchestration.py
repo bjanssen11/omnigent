@@ -1486,9 +1486,7 @@ async def _auto_create_opencode_terminal(
         if config_gateway_auth_commands:
             # Register the per-request bearer-refresh plugin for the auth_command
             # families; the command map is threaded into the server env below.
-            auth_plugin = write_opencode_gateway_auth_plugin(
-                bridge_dir, config_gateway.provider_ids
-            )
+            auth_plugin = write_opencode_gateway_auth_plugin(bridge_dir)
             existing_plugins = config.get("plugin")
             config["plugin"] = (
                 [*existing_plugins] if isinstance(existing_plugins, list) else []

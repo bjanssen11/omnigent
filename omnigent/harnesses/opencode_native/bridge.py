@@ -27,11 +27,9 @@ import base64
 import hashlib
 import json
 import os
-import re
 import secrets
 import shutil
 import tempfile
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -228,7 +226,9 @@ function mintToken(providerId) {
 
 export const server = async () => ({
   "chat.headers": async (input, output) => {
-    const pid = input?.provider?.info?.id;
+    // The hook's input.provider is the provider info record (id is a direct
+    // field); older builds nested it under .info.
+    const pid = input?.provider?.id ?? input?.provider?.info?.id;
     if (!pid || !Object.prototype.hasOwnProperty.call(COMMANDS, pid)) return;
     const token = mintToken(pid);
     if (token) output.headers["Authorization"] = "Bearer " + token;
@@ -237,17 +237,17 @@ export const server = async () => ({
 """
 
 
-def build_gateway_auth_plugin_js(provider_ids: Sequence[str]) -> str:
+def build_gateway_auth_plugin_js() -> str:
     """Render the gateway-auth plugin source.
 
-    :param provider_ids: Unused; provider ids are resolved at runtime from
-        ``OMNIGENT_OPENCODE_AUTH_COMMAND``. Kept for call-site compatibility.
+    Provider ids are resolved at runtime from ``OMNIGENT_OPENCODE_AUTH_COMMAND``.
+
     :returns: JS module source using the ``@opencode-ai/plugin`` server API.
     """
     return _GATEWAY_AUTH_PLUGIN
 
 
-def write_opencode_gateway_auth_plugin(bridge_dir: Path, provider_ids: Sequence[str]) -> Path:
+def write_opencode_gateway_auth_plugin(bridge_dir: Path) -> Path:
     """Write the gateway-auth refresh plugin into *bridge_dir*; return its path.
 
     The runner registers the returned path in the synthesized ``opencode.json``
@@ -256,7 +256,6 @@ def write_opencode_gateway_auth_plugin(bridge_dir: Path, provider_ids: Sequence[
     without stale plugin files.
 
     :param bridge_dir: OpenCode-native bridge directory.
-    :param provider_ids: Provider ids whose family uses an ``auth_command``.
     :returns: The written plugin file path (absolute).
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -264,7 +263,7 @@ def write_opencode_gateway_auth_plugin(bridge_dir: Path, provider_ids: Sequence[
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_GATEWAY_AUTH_PLUGIN_FILE}.", dir=str(bridge_dir))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(build_gateway_auth_plugin_js(provider_ids))
+            handle.write(build_gateway_auth_plugin_js())
         os.replace(tmp_name, path)
     finally:
         if os.path.exists(tmp_name):
