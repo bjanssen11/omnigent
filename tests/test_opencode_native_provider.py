@@ -22,6 +22,7 @@ from omnigent.harnesses.opencode_native.provider import (
     build_opencode_model_default_config,
     build_opencode_omnigent_mcp_server,
     build_opencode_provider_config,
+    disable_autoloaded_free_providers,
     managed_connect_opencode_config,
     maybe_merge_user_provider_config,
     resolve_config_gateway_providers,
@@ -1106,6 +1107,39 @@ def test_derive_model_services_parent_and_host() -> None:
     # A bare (non-three-part) model id disables discovery.
     bare = [("openai", "npm", types.SimpleNamespace(models={"default": "gpt-4"}, base_url="x"))]
     assert _derive_model_services_parent(bare) is None
+
+
+def test_disable_autoloaded_free_providers_hides_opencode_zen() -> None:
+    """The helper sets opencode's ``disabled_providers`` to hide the free Zen tier."""
+    config: dict[str, object] = {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": {"gateway-anthropic": {"npm": "@ai-sdk/anthropic"}},
+        "model": "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high",
+    }
+    disable_autoloaded_free_providers(config)
+    assert config["disabled_providers"] == ["opencode"]
+    # It leaves the synthesized providers/model untouched.
+    assert "gateway-anthropic" in config["provider"]
+    assert config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high"
+
+
+def test_disable_autoloaded_free_providers_noop_on_empty() -> None:
+    """An empty config stays empty (nothing is written, so nothing to disable)."""
+    config: dict[str, object] = {}
+    disable_autoloaded_free_providers(config)
+    assert config == {}
+
+
+def test_disable_autoloaded_free_providers_survives_writer(tmp_path: Path) -> None:
+    """The disabled_providers key round-trips through the config writer."""
+    config = disable_autoloaded_free_providers(
+        build_opencode_model_default_config(
+            "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high"
+        )
+    )
+    path = write_opencode_provider_config(tmp_path, config)
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["disabled_providers"] == ["opencode"]
 
 
 def test_config_gateway_auth_command_writes_placeholder_key_only(

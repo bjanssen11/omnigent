@@ -1456,6 +1456,7 @@ async def _auto_create_opencode_terminal(
         build_opencode_model_default_config,
         build_opencode_omnigent_mcp_server,
         build_opencode_provider_config,
+        disable_autoloaded_free_providers,
         managed_connect_opencode_config,
         maybe_merge_user_provider_config,
         resolve_config_gateway_providers,
@@ -1631,6 +1632,11 @@ async def _auto_create_opencode_terminal(
     config = maybe_merge_user_provider_config(config)
 
     if config:
+        # Hide opencode's auto-loaded free "Zen" tier (e.g. ``opencode/big-pickle``)
+        # so only the configured gateway providers show in the picker. Covers every
+        # config branch above (config-gateway / databricks / managed-connect / model
+        # default) at the single write point.
+        disable_autoloaded_free_providers(config)
         write_opencode_provider_config(xdg_config_home_for_bridge_dir(bridge_dir), config)
 
     # The server runs with a per-session XDG_DATA_HOME, so copy the user's

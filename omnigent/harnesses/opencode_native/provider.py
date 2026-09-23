@@ -99,6 +99,31 @@ def build_opencode_model_default_config(model: str) -> dict[str, object]:
     return {"$schema": "https://opencode.ai/config.json", "model": model}
 
 
+# opencode auto-loads its own free "Zen" provider (models like
+# ``opencode/big-pickle``). omnigent routes only through the configured gateway,
+# so hide that auto-loaded free tier from the model picker via opencode's
+# ``disabled_providers`` config key (part of opencode's ``config.json`` schema).
+_OPENCODE_AUTOLOADED_FREE_PROVIDERS = ("opencode",)
+
+
+def disable_autoloaded_free_providers(config: dict[str, object]) -> dict[str, object]:
+    """Hide opencode's auto-loaded free providers (Zen / ``big-pickle``) from the picker.
+
+    Sets opencode's ``disabled_providers`` key so the built-in free tier opencode
+    loads automatically does not appear alongside the synthesized gateway
+    providers. A no-op on an empty config (nothing is written, so opencode falls
+    back to its global config, which this per-session file cannot override).
+    Mutates *config* in place and is idempotent.
+
+    :param config: The opencode config dict about to be written.
+    :returns: The same dict, for chaining.
+    """
+    if config:
+        config.setdefault("$schema", "https://opencode.ai/config.json")
+        config["disabled_providers"] = list(_OPENCODE_AUTOLOADED_FREE_PROVIDERS)
+    return config
+
+
 def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dict[str, object]:
     """
     Build the ``opencode.json`` declaring a custom OpenAI-compatible provider.
