@@ -157,9 +157,20 @@ _AI_SDK_ANTHROPIC = "@ai-sdk/anthropic"
 # OpenAI Chat-Completions-compatible surface (e.g. the gateway's
 # ``/ai-gateway/openai/v1``) → the OpenAI-compatible factory.
 _AI_SDK_OPENAI_COMPATIBLE = "@ai-sdk/openai-compatible"
+# OpenAI *Responses* surface: the real OpenAI factory drives ``{baseURL}/responses``
+# and carries ``reasoning_effort`` — the only OpenAI surface where gateway
+# reasoning takes effect (chat/completions ignores it and 400s with tools). Used
+# for the effort-capable model group.
+_AI_SDK_OPENAI = "@ai-sdk/openai"
 # Factory-satisfying stand-in written for ``auth_command`` families, never sent
 # as a real credential; the gateway-auth plugin's per-request Bearer wins.
 _AUTH_PLUGIN_PLACEHOLDER_KEY = "omnigent-gateway-auth-plugin"
+# Discovery-only provider group for effort-capable models routed over the OpenAI
+# Responses surface (GPT, Kimi). Kept distinct from the chat-completions
+# ``openai`` group so reasoning actually applies; GLM aliases stay on chat (the
+# catalog advertises Responses for them but the gateway 400s — see
+# :func:`_gateway_model_family`).
+_OPENAI_RESPONSES_GROUP = "openai-responses"
 
 
 @dataclass(frozen=True)
@@ -284,13 +295,24 @@ def _mint_gateway_discovery_token(families: list[tuple[str, str, FamilyConfig]])
 
 
 def _gateway_model_family(model: model_catalog.ModelEntry) -> str | None:
-    """Classify a discovered model-service into an opencode-driveable family.
+    """Classify a discovered model-service into an opencode provider group.
 
-    Mirrors pi's ``_fetch_pi_model_lists`` routing so both harnesses show the
-    same set: Claude → the Anthropic family; Gemini/Llama ``system.ai.*``
-    (mlflow-only) and pi-unsupported models → dropped (opencode drives only the
-    Anthropic + OpenAI-chat surfaces); everything else (GPT/Responses plus
-    GLM/Grok/completions) → the OpenAI-compatible family.
+    Groups mirror pi's ``_fetch_pi_model_lists`` routing so both harnesses agree:
+
+    * Claude → the Anthropic group.
+    * Effort-capable OpenAI-Responses model (GPT, Kimi) → the reasoning group
+      (:data:`_OPENAI_RESPONSES_GROUP`), driven via ``@ai-sdk/openai`` where
+      ``reasoning_effort`` takes effect.
+    * Everything else chat-capable (e.g. non-``system.ai`` GLM aliases) → the
+      OpenAI chat group.
+    * Gemini/Llama ``system.ai.*`` (mlflow-only) and pi-unsupported models →
+      dropped (opencode has no surface for them).
+
+    The Responses grouping uses pi's ``needs_responses`` rule, which excludes
+    non-``system.ai`` GLM aliases on purpose: the catalog advertises
+    ``openai/v1/responses`` for ``eng_dev.ai_gateway.glm-*`` but the gateway 400s
+    on it ("does not support the '/openai/v1/responses' API"), so those must stay
+    on chat completions.
     """
     from omnigent.models.model_metadata import ModelWireAPI
     from omnigent.models.pi_model_compatibility import (
@@ -313,7 +335,7 @@ def _gateway_model_family(model: model_catalog.ModelEntry) -> str | None:
         )
     )
     if needs_responses:
-        return OPENAI_FAMILY
+        return _OPENAI_RESPONSES_GROUP
     if is_system_ai:
         # Gemini/Llama system.ai ids serve only through the mlflow gateway,
         # which opencode has no family for; pi routes them to a separate surface.
@@ -359,12 +381,16 @@ def _discover_gateway_models(
             exc_info=True,
         )
         return {}
-    buckets: dict[str, list[str]] = {ANTHROPIC_FAMILY: [], OPENAI_FAMILY: []}
+    buckets: dict[str, list[str]] = {
+        ANTHROPIC_FAMILY: [],
+        OPENAI_FAMILY: [],
+        _OPENAI_RESPONSES_GROUP: [],
+    }
     for model in entries:
-        family_name = _gateway_model_family(model)
-        if family_name in buckets:
-            _append_unique_model(buckets[family_name], model.id)
-    return {family_name: ids for family_name, ids in buckets.items() if ids}
+        group = _gateway_model_family(model)
+        if group in buckets:
+            _append_unique_model(buckets[group], model.id)
+    return {group: ids for group, ids in buckets.items() if ids}
 
 
 def resolve_config_gateway_providers(
@@ -417,8 +443,7 @@ def resolve_config_gateway_providers(
     providers: dict[str, object] = {}
     auth_commands: dict[str, str] = {}
 
-    # Resolve the driveable families up front so an override can pin the
-    # family that actually lists it (its wire protocol must match the model).
+    # Resolve the driveable config families (anthropic + openai) up front.
     families: list[tuple[str, str, FamilyConfig]] = []
     for family_name, npm in (
         (ANTHROPIC_FAMILY, _AI_SDK_ANTHROPIC),
@@ -436,62 +461,124 @@ def resolve_config_gateway_providers(
             continue
         families.append((family_name, npm, family))
 
-    # Prefer the live Unity Catalog model-services the workspace serves
-    # (permission-filtered) over the static config tiers, matching pi. Empty
-    # when discovery is unavailable — the loop then keeps the configured tiers.
-    # Resolved before override routing so an override that only the live catalog
-    # lists still pins to the family whose wire protocol serves it.
+    families_by_name = {name: family for name, _npm, family in families}
+
+    # Live Unity Catalog discovery classifies the served models into three
+    # opencode groups (anthropic / openai-chat / openai-responses). Empty when
+    # discovery is unavailable — the openai family then keeps its static chat
+    # tiers and no Responses group is synthesized (per-model wire is unknown
+    # offline). Resolved before override routing so an override that only the
+    # live catalog lists still pins to the group whose surface serves it.
     discovered = _discover_gateway_models(families)
+    discovery_ok = bool(discovered)
 
-    def _lists_override(family_name: str, family: FamilyConfig) -> bool:
-        candidates = (
-            entry.family_default_model(family_name),
-            *family.models.values(),
-            *discovered.get(family_name, ()),
+    # Group specs: (group_key, provider_id, npm, source config family, reasoning).
+    # The openai config family feeds BOTH the chat block and — when discovery
+    # found effort-capable models — a Responses block on the same base URL.
+    group_specs: list[tuple[str, str, str, FamilyConfig, bool]] = []
+    if ANTHROPIC_FAMILY in families_by_name:
+        group_specs.append(
+            (
+                ANTHROPIC_FAMILY,
+                _config_gateway_provider_id(entry.name, ANTHROPIC_FAMILY),
+                _AI_SDK_ANTHROPIC,
+                families_by_name[ANTHROPIC_FAMILY],
+                False,
+            )
         )
-        return any(c and _strip_model_suffix(c) == override for c in candidates)
-
-    # The override pins on the family that lists it (default or any tier);
-    # an unlisted override falls back to the first present family
-    # (anthropic preferred, matching pi).
-    override_family: str | None = None
-    if override and families:
-        override_family = next(
-            (name for name, _, fam in families if _lists_override(name, fam)),
-            families[0][0],
+    if OPENAI_FAMILY in families_by_name:
+        openai_family = families_by_name[OPENAI_FAMILY]
+        group_specs.append(
+            (
+                OPENAI_FAMILY,
+                _config_gateway_provider_id(entry.name, OPENAI_FAMILY),
+                _AI_SDK_OPENAI_COMPATIBLE,
+                openai_family,
+                False,
+            )
         )
+        if discovered.get(_OPENAI_RESPONSES_GROUP):
+            group_specs.append(
+                (
+                    _OPENAI_RESPONSES_GROUP,
+                    _config_gateway_provider_id(entry.name, _OPENAI_RESPONSES_GROUP),
+                    _AI_SDK_OPENAI,
+                    openai_family,
+                    True,
+                )
+            )
 
-    # Without an override, pin the default on anthropic when present
-    # (opencode/pi both prefer the Anthropic surface), else openai.
-    pinned: str | None = None
+    # Both openai groups source the configured default from the openai family;
+    # each claims it only if it actually serves that id (so an omni-gpt default
+    # lands in the Responses group, not the chat one).
+    default_source = {
+        ANTHROPIC_FAMILY: ANTHROPIC_FAMILY,
+        OPENAI_FAMILY: OPENAI_FAMILY,
+        _OPENAI_RESPONSES_GROUP: OPENAI_FAMILY,
+    }
 
-    for family_name, npm, family in families:
-        provider_id = _config_gateway_provider_id(entry.name, family_name)
-        default_model = entry.family_default_model(family_name)
+    def _group_model_ids(group_key: str, family: FamilyConfig) -> list[str]:
+        if discovery_ok:
+            # A missing key means discovery found no models for that group (not a
+            # reason to fall back to stale static tiers).
+            return list(discovered.get(group_key, ()))
+        # Discovery unavailable: the config families keep their static tiers; the
+        # Responses group is discovery-only so it never reaches this fallback.
+        if group_key in (ANTHROPIC_FAMILY, OPENAI_FAMILY):
+            return list(family.models.values())
+        return []
+
+    # Which group an override pins to (the surface whose wire serves it); an
+    # unlisted override falls back to the first present group.
+    override_group: str | None = None
+    if override and group_specs:
+        for group_key, _pid, _npm, family, _reasoning in group_specs:
+            candidates = (
+                entry.family_default_model(default_source[group_key]),
+                *_group_model_ids(group_key, family),
+            )
+            if any(c and _strip_model_suffix(c) == override for c in candidates):
+                override_group = group_key
+                break
+        if override_group is None:
+            override_group = group_specs[0][0]
+
+    override_pin: str | None = None
+    anthropic_default_pin: str | None = None
+    openai_default_pin: str | None = None
+    first_model_pin: str | None = None
+
+    for group_key, provider_id, npm, family, reasoning in group_specs:
+        default_model = entry.family_default_model(default_source[group_key])
+        group_ids = _group_model_ids(group_key, family)
         model_ids: list[str] = []
-        if override and family_name == override_family:
+        if override and group_key == override_group:
             _append_unique_model(model_ids, override)
-            pinned = f"{provider_id}/{override}"
-        # Pin the family default (unless the override pins) so the default
-        # selection is the configured default, not a tier.
+            override_pin = f"{provider_id}/{override}"
+        # Prepend the config default only to the group that serves it, so the
+        # default selection is the configured default, not a tier.
         if default_model:
-            _append_unique_model(model_ids, default_model)
-            if pinned is None and override_family is None:
-                pinned = f"{provider_id}/{_strip_model_suffix(default_model)}"
-        # Enumerate the family's models so opencode's picker lists them all,
-        # de-duped against the default/override. Prefer the live-discovered
-        # model-services (current + permission-filtered) and fall back to the
-        # configured tiers when discovery is unavailable.
-        for tier_model in discovered.get(family_name) or family.models.values():
+            stripped_default = _strip_model_suffix(default_model)
+            served = {_strip_model_suffix(m) for m in group_ids}
+            if stripped_default in served or not group_ids:
+                _append_unique_model(model_ids, default_model)
+                pin = f"{provider_id}/{stripped_default}"
+                if group_key == ANTHROPIC_FAMILY:
+                    anthropic_default_pin = anthropic_default_pin or pin
+                else:
+                    openai_default_pin = openai_default_pin or pin
+        # Enumerate the group's models so opencode's picker lists them all,
+        # de-duped against the default/override.
+        for tier_model in group_ids:
             _append_unique_model(model_ids, tier_model)
         if not model_ids:
             continue
 
         # ``@ai-sdk/anthropic`` posts to ``{baseURL}/messages``, so its base must
         # carry the ``/v1`` the gateway's Anthropic surface expects
-        # (``/ai-gateway/anthropic/v1/messages``); the openai-compatible base
-        # already carries ``/v1`` in config. Append it when absent so a config
-        # base of ``.../ai-gateway/anthropic`` still resolves.
+        # (``/ai-gateway/anthropic/v1/messages``); the openai bases already carry
+        # ``/v1`` in config (``@ai-sdk/openai`` then posts to ``.../v1/responses``,
+        # ``@ai-sdk/openai-compatible`` to ``.../v1/chat/completions``).
         base_url = family.base_url
         if npm == _AI_SDK_ANTHROPIC and not base_url.rstrip("/").endswith("/v1"):
             base_url = base_url.rstrip("/") + "/v1"
@@ -507,15 +594,26 @@ def resolve_config_gateway_providers(
             options["apiKey"] = _AUTH_PLUGIN_PLACEHOLDER_KEY
         elif family.api_key:
             options["apiKey"] = family.api_key
-        providers[provider_id] = {
-            "npm": npm,
-            "options": options,
-            "models": {mid: {"name": mid} for mid in model_ids},
-        }
-        if pinned is None and override_family is None:
-            pinned = f"{provider_id}/{model_ids[0]}"
+        models_block: dict[str, object] = {}
+        for mid in model_ids:
+            model_entry: dict[str, object] = {"name": mid}
+            if reasoning:
+                # Mark the model reasoning-capable so opencode exposes its
+                # reasoning-effort control; it is served over the Responses
+                # surface (``@ai-sdk/openai``) where reasoning_effort applies.
+                model_entry["reasoning"] = True
+            models_block[mid] = model_entry
+        providers[provider_id] = {"npm": npm, "options": options, "models": models_block}
+        if first_model_pin is None:
+            first_model_pin = f"{provider_id}/{model_ids[0]}"
 
-    if not providers or pinned is None:
+    if not providers:
+        return None
+    # Pin preference: an override wins; else the Anthropic default (opencode/pi
+    # both prefer the Anthropic surface); else the openai default; else the first
+    # synthesized model.
+    pinned = override_pin or anthropic_default_pin or openai_default_pin or first_model_pin
+    if pinned is None:
         return None
 
     synthesized: dict[str, object] = {

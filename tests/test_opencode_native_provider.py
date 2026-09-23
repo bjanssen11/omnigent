@@ -975,14 +975,15 @@ providers:
 """
 
 
-def test_config_gateway_prefers_live_discovery_over_static_tiers(
+def test_config_gateway_groups_effort_capable_models_via_discovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Discovery replaces the static tiers, so revoked GLM/Grok drop out.
+    """Discovery groups effort-capable models into a Responses block, GLM into chat.
 
-    The static config still lists ``glm-4-7`` / ``grok-4-6``, but the workspace
-    model-services listing (permission-filtered) returns only Claude + GPT, so
-    the picker shows exactly what the gateway serves.
+    GPT + Kimi advertise the Responses wire → they land in the ``@ai-sdk/openai``
+    Responses block and are marked ``reasoning: true``. A GLM alias advertises
+    Responses too (a catalog bug) but the gateway 400s on it, so pi's rule keeps
+    it on the ``@ai-sdk/openai-compatible`` chat block, un-reasoned.
     """
     _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_WITH_REVOKED_YAML)
     monkeypatch.setattr(
@@ -995,9 +996,12 @@ def test_config_gateway_prefers_live_discovery_over_static_tiers(
         assert model_services_parent == "schemas/eng_dev.ai_gateway"
         return (
             _fake_model_service("eng_dev.ai_gateway.omni-claude-high"),
-            _fake_model_service("eng_dev.ai_gateway.omni-claude-med"),
             _fake_model_service("eng_dev.ai_gateway.omni-gpt-high", responses=True),
             _fake_model_service("eng_dev.ai_gateway.omni-gpt-med", responses=True),
+            _fake_model_service("eng_dev.ai_gateway.kimi-k3", responses=True),
+            # GLM advertises Responses in the catalog, but the gateway rejects it
+            # → must stay on the chat block despite the responses=True flag.
+            _fake_model_service("eng_dev.ai_gateway.glm-4-7", responses=True),
         )
 
     monkeypatch.setattr(
@@ -1008,18 +1012,29 @@ def test_config_gateway_prefers_live_discovery_over_static_tiers(
 
     assert resolution is not None
     providers = resolution.config["provider"]
-    assert set(providers["gateway-anthropic"]["models"]) == {
-        "eng_dev.ai_gateway.omni-claude-high",
-        "eng_dev.ai_gateway.omni-claude-med",
-    }
-    openai_models = set(providers["gateway-openai"]["models"])
-    assert openai_models == {
+    assert set(providers["gateway-anthropic"]["models"]) == {"eng_dev.ai_gateway.omni-claude-high"}
+
+    # Effort-capable GPT + Kimi → the @ai-sdk/openai Responses block, reasoning on.
+    responses = providers["gateway-openai-responses"]
+    assert responses["npm"] == "@ai-sdk/openai"
+    assert set(responses["models"]) == {
         "eng_dev.ai_gateway.omni-gpt-high",
         "eng_dev.ai_gateway.omni-gpt-med",
+        "eng_dev.ai_gateway.kimi-k3",
     }
-    # The revoked models are gone even though config.yaml still lists them.
-    assert "eng_dev.ai_gateway.glm-4-7" not in openai_models
-    assert "eng_dev.ai_gateway.grok-4-6" not in openai_models
+    assert all(m.get("reasoning") is True for m in responses["models"].values())
+    # Its auth_command is registered so the plugin mints a Bearer for it too.
+    assert "gateway-openai-responses" in resolution.auth_commands
+
+    # GLM stays on the chat block (no Responses), and is not marked reasoning.
+    chat = providers["gateway-openai"]
+    assert chat["npm"] == "@ai-sdk/openai-compatible"
+    assert set(chat["models"]) == {"eng_dev.ai_gateway.glm-4-7"}
+    assert "reasoning" not in chat["models"]["eng_dev.ai_gateway.glm-4-7"]
+
+    # The revoked grok never appears (discovery didn't return it).
+    all_ids = set().union(*(set(p["models"]) for p in providers.values()))
+    assert "eng_dev.ai_gateway.grok-4-6" not in all_ids
 
 
 def test_config_gateway_falls_back_to_static_when_discovery_unavailable(
@@ -1063,26 +1078,25 @@ def test_discovery_falls_back_to_static_when_listing_errors(
 
 
 def test_gateway_model_family_classification() -> None:
-    """Discovered model-services route to opencode's driveable families like pi."""
+    """Discovered model-services route to opencode's three groups like pi."""
     from omnigent.harnesses.opencode_native.provider import _gateway_model_family
 
-    # Claude → anthropic.
-    assert (
-        _gateway_model_family(_fake_model_service("eng_dev.ai_gateway.omni-claude-high"))
-        == "anthropic"
-    )
-    # GPT (Responses-wire), GLM, and Grok all → the OpenAI-compatible chat family.
-    assert (
-        _gateway_model_family(
-            _fake_model_service("eng_dev.ai_gateway.omni-gpt-high", responses=True)
-        )
-        == "openai"
-    )
-    assert _gateway_model_family(_fake_model_service("eng_dev.ai_gateway.glm-4-7")) == "openai"
-    assert _gateway_model_family(_fake_model_service("eng_dev.ai_gateway.grok-4-6")) == "openai"
+    def fam(model_id: str, *, responses: bool = False) -> str | None:
+        return _gateway_model_family(_fake_model_service(model_id, responses=responses))
+
+    # Claude → anthropic group.
+    assert fam("eng_dev.ai_gateway.omni-claude-high") == "anthropic"
+    # Effort-capable GPT + Kimi (Responses-wire) → the reasoning group.
+    assert fam("eng_dev.ai_gateway.omni-gpt-high", responses=True) == "openai-responses"
+    assert fam("eng_dev.ai_gateway.kimi-k3", responses=True) == "openai-responses"
+    # GLM aliases → the chat group even when the catalog (wrongly) advertises
+    # Responses, because the gateway 400s on GLM over /responses.
+    assert fam("eng_dev.ai_gateway.glm-4-7", responses=True) == "openai"
+    # A non-reasoning, chat-only model → the chat group.
+    assert fam("eng_dev.ai_gateway.grok-4-6") == "openai"
     # Gemini/Llama system.ai ids (mlflow-only) and pi-unsupported ids → dropped.
-    assert _gateway_model_family(_fake_model_service("system.ai.gemini-2-5-flash")) is None
-    assert _gateway_model_family(_fake_model_service("system.ai.llama-4")) is None
+    assert fam("system.ai.gemini-2-5-flash") is None
+    assert fam("system.ai.llama-4") is None
 
 
 def test_derive_model_services_parent_and_host() -> None:
