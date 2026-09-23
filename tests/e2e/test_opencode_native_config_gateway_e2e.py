@@ -18,6 +18,7 @@ import yaml
 
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.native.native_coding_agents import OPENCODE_NATIVE_AGENT_NAME
+from omnigent.onboarding.setup import CONFLICTING_ENV_VARS
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
 
@@ -331,9 +332,7 @@ def _spawn_host_daemon(*, tmp_path: Path, live_server: str, home: Path) -> subpr
         "GATEWAY_BASE_URL",
         "OMNIGENT_DATABRICKS_GATEWAY_MODEL",
         "DATABRICKS_CONFIG_FILE",
-        "DATABRICKS_CONFIG_PROFILE",
-        "DATABRICKS_HOST",
-        "DATABRICKS_TOKEN",
+        *CONFLICTING_ENV_VARS,
     ):
         env.pop(var, None)
     daemon_log = tmp_path / "host-daemon.log"
