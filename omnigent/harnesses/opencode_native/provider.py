@@ -343,9 +343,39 @@ def _gateway_model_family(model: model_catalog.ModelEntry) -> str | None:
     return OPENAI_FAMILY
 
 
+# Canonical reasoning-effort ladder (ascending), for clamping a requested effort
+# to a model's advertised ceiling.
+_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def _clamp_effort(requested: str, allowed: tuple[str, ...]) -> str | None:
+    """Clamp a requested canonical effort to a model's advertised ladder.
+
+    :param requested: A canonical effort (e.g. ``"max"``).
+    :param allowed: The model's advertised efforts (from discovery), any order.
+    :returns: ``requested`` when the model advertises it; else the highest
+        advertised level not exceeding it; else the lowest advertised level;
+        ``None`` when the model advertises no efforts.
+    """
+    allowed_set = {effort for effort in allowed if effort in _EFFORT_ORDER}
+    if not allowed_set:
+        return None
+    if requested in allowed_set:
+        return requested
+    req_idx = _EFFORT_ORDER.index(requested) if requested in _EFFORT_ORDER else len(_EFFORT_ORDER)
+    at_or_below = [
+        effort
+        for effort in _EFFORT_ORDER
+        if effort in allowed_set and _EFFORT_ORDER.index(effort) <= req_idx
+    ]
+    if at_or_below:
+        return at_or_below[-1]
+    return next(effort for effort in _EFFORT_ORDER if effort in allowed_set)
+
+
 def _discover_gateway_models(
     families: list[tuple[str, str, FamilyConfig]],
-) -> dict[str, list[str]]:
+) -> tuple[dict[str, list[str]], dict[str, tuple[str, ...]]]:
     """Live Unity Catalog model-service discovery for the gateway families.
 
     Returns ``{family_name: [model_id, ...]}`` for the model-services the
@@ -357,20 +387,25 @@ def _discover_gateway_models(
     hand-maintained config list.
 
     Best-effort: any failure (no parent derivable, no token, HTTP/auth error,
-    empty result) returns ``{}`` and the caller keeps the static config tiers,
-    so an offline launch or a config without a discoverable schema still works.
+    empty result) returns ``({}, {})`` and the caller keeps the static config
+    tiers, so an offline launch or a config without a discoverable schema still
+    works.
+
+    :returns: ``(groups, efforts)`` — the group→model-id map, and, for each
+        Responses-group model, its advertised reasoning-effort ladder (used to
+        clamp a requested effort to the model's ceiling).
     """
     from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 
     if not families:
-        return {}
+        return {}, {}
     parent = _derive_model_services_parent(families)
     host = _gateway_host_from_base_url(families[0][2].base_url)
     if not parent or not host:
-        return {}
+        return {}, {}
     token = _mint_gateway_discovery_token(families)
     if not token:
-        return {}
+        return {}, {}
     try:
         entries = model_catalog.fetch_databricks_model_service_entries(
             host, token, model_services_parent=parent
@@ -380,21 +415,29 @@ def _discover_gateway_models(
             "opencode gateway discovery: model-service listing failed; using config tiers.",
             exc_info=True,
         )
-        return {}
+        return {}, {}
     buckets: dict[str, list[str]] = {
         ANTHROPIC_FAMILY: [],
         OPENAI_FAMILY: [],
         _OPENAI_RESPONSES_GROUP: [],
     }
+    efforts: dict[str, tuple[str, ...]] = {}
     for model in entries:
         group = _gateway_model_family(model)
-        if group in buckets:
-            _append_unique_model(buckets[group], model.id)
-    return {group: ids for group, ids in buckets.items() if ids}
+        if group not in buckets:
+            continue
+        _append_unique_model(buckets[group], model.id)
+        if group == _OPENAI_RESPONSES_GROUP:
+            reasoning = model.metadata.reasoning
+            if reasoning is not None and reasoning.efforts:
+                efforts[_strip_model_suffix(model.id)] = tuple(reasoning.efforts)
+    groups = {group: ids for group, ids in buckets.items() if ids}
+    return groups, efforts
 
 
 def resolve_config_gateway_providers(
     model_override: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> ConfigGatewayResolution | None:
     """Resolve the ``~/.omnigent/config.yaml`` gateway provider for opencode.
 
@@ -411,6 +454,11 @@ def resolve_config_gateway_providers(
     :param model_override: A session model override (e.g. an
         ``eng_dev.ai_gateway.omni-*`` id), passed through **verbatim** (only a
         trailing ``[...]`` suffix is stripped). ``None`` uses the family default.
+    :param reasoning_effort: The session-level reasoning effort (canonical, e.g.
+        ``"max"``). Applied to the Responses group's models as ``reasoningEffort``
+        (clamped to each model's advertised ceiling), so opencode sends it on the
+        ``/responses`` call. ``None``/``default``/``none`` leaves it unset (the
+        model's own default). Ignored for chat and Anthropic groups.
     :returns: The resolution (provider blocks + pinned model + any auth
         commands), or ``None`` when no config-gateway provider applies.
     """
@@ -424,6 +472,15 @@ def resolve_config_gateway_providers(
         default_provider_for_harness,
         load_config,
     )
+    from omnigent.util.reasoning_effort import EFFORT_VALUES
+
+    effort: str | None = None
+    if reasoning_effort:
+        candidate = reasoning_effort.strip().lower()
+        # ``none`` disables reasoning, and clear sentinels (default/off/reset)
+        # are not in EFFORT_VALUES — either way, leave reasoningEffort unset.
+        if candidate in EFFORT_VALUES and candidate != "none":
+            effort = candidate
 
     try:
         config = load_config()
@@ -469,7 +526,7 @@ def resolve_config_gateway_providers(
     # tiers and no Responses group is synthesized (per-model wire is unknown
     # offline). Resolved before override routing so an override that only the
     # live catalog lists still pins to the group whose surface serves it.
-    discovered = _discover_gateway_models(families)
+    discovered, discovered_efforts = _discover_gateway_models(families)
     discovery_ok = bool(discovered)
 
     # Group specs: (group_key, provider_id, npm, source config family, reasoning).
@@ -602,6 +659,15 @@ def resolve_config_gateway_providers(
                 # reasoning-effort control; it is served over the Responses
                 # surface (``@ai-sdk/openai``) where reasoning_effort applies.
                 model_entry["reasoning"] = True
+                if effort is not None:
+                    # Clamp the session effort to the model's advertised ceiling
+                    # (gpt→max, kimi→high) and pass it through opencode's model
+                    # ``options`` to @ai-sdk/openai's ``/responses`` call.
+                    clamped = _clamp_effort(
+                        effort, discovered_efforts.get(_strip_model_suffix(mid), ())
+                    )
+                    if clamped is not None:
+                        model_entry["options"] = {"reasoningEffort": clamped}
             models_block[mid] = model_entry
         providers[provider_id] = {"npm": npm, "options": options, "models": models_block}
         if first_model_pin is None:

@@ -944,12 +944,18 @@ providers:
     assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high"
 
 
-def _fake_model_service(model_id: str, *, responses: bool = False) -> types.SimpleNamespace:
-    """A minimal stand-in for a discovered ``ModelEntry`` (id + wire_apis only)."""
+def _fake_model_service(
+    model_id: str, *, responses: bool = False, efforts: tuple[str, ...] = ()
+) -> types.SimpleNamespace:
+    """A minimal stand-in for a discovered ``ModelEntry`` (id + wire_apis + reasoning)."""
     from omnigent.models.model_metadata import ModelWireAPI
 
     wire_apis = frozenset({ModelWireAPI.OPENAI_RESPONSES}) if responses else frozenset()
-    return types.SimpleNamespace(id=model_id, metadata=types.SimpleNamespace(wire_apis=wire_apis))
+    reasoning = types.SimpleNamespace(efforts=tuple(efforts)) if efforts else None
+    return types.SimpleNamespace(
+        id=model_id,
+        metadata=types.SimpleNamespace(wire_apis=wire_apis, reasoning=reasoning),
+    )
 
 
 # A config whose static openai tiers include GLM/Grok (which the workspace no
@@ -1035,6 +1041,88 @@ def test_config_gateway_groups_effort_capable_models_via_discovery(
     # The revoked grok never appears (discovery didn't return it).
     all_ids = set().union(*(set(p["models"]) for p in providers.values()))
     assert "eng_dev.ai_gateway.grok-4-6" not in all_ids
+
+
+def test_config_gateway_applies_and_clamps_reasoning_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The session effort is written to Responses models, clamped per ceiling."""
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_WITH_REVOKED_YAML)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+        return (
+            _fake_model_service(
+                "eng_dev.ai_gateway.omni-gpt-high",
+                responses=True,
+                efforts=("low", "medium", "high", "xhigh", "max"),
+            ),
+            _fake_model_service(
+                "eng_dev.ai_gateway.kimi-k3",
+                responses=True,
+                efforts=("low", "medium", "high"),  # ceiling: high
+            ),
+        )
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries", _fake_fetch
+    )
+
+    resolution = resolve_config_gateway_providers(reasoning_effort="max")
+
+    assert resolution is not None
+    models = resolution.config["provider"]["gateway-openai-responses"]["models"]
+    # GPT advertises max → gets max; Kimi tops out at high → clamped.
+    assert models["eng_dev.ai_gateway.omni-gpt-high"]["options"]["reasoningEffort"] == "max"
+    assert models["eng_dev.ai_gateway.kimi-k3"]["options"]["reasoningEffort"] == "high"
+
+
+def test_config_gateway_omits_reasoning_effort_when_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No session effort (or a clear sentinel) leaves reasoningEffort unset."""
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_WITH_REVOKED_YAML)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+        return (
+            _fake_model_service(
+                "eng_dev.ai_gateway.omni-gpt-high", responses=True, efforts=("low", "high", "max")
+            ),
+        )
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries", _fake_fetch
+    )
+
+    for effort in (None, "default"):
+        resolution = resolve_config_gateway_providers(reasoning_effort=effort)
+        assert resolution is not None
+        model = resolution.config["provider"]["gateway-openai-responses"]["models"][
+            "eng_dev.ai_gateway.omni-gpt-high"
+        ]
+        # Still reasoning-capable, but no explicit effort forced.
+        assert model["reasoning"] is True
+        assert "options" not in model
+
+
+def test_clamp_effort_ladder() -> None:
+    """Effort clamps to the highest advertised level not exceeding the request."""
+    from omnigent.harnesses.opencode_native.provider import _clamp_effort
+
+    gpt = ("low", "medium", "high", "xhigh", "max")
+    kimi = ("low", "medium", "high")
+    assert _clamp_effort("max", gpt) == "max"  # advertised → exact
+    assert _clamp_effort("max", kimi) == "high"  # over ceiling → clamp down
+    assert _clamp_effort("medium", kimi) == "medium"  # advertised → exact
+    assert _clamp_effort("minimal", kimi) == "low"  # below all → lowest advertised
+    assert _clamp_effort("high", ()) is None  # no ladder → nothing to set
 
 
 def test_config_gateway_falls_back_to_static_when_discovery_unavailable(

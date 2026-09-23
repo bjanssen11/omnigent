@@ -1298,6 +1298,8 @@ class _OpenCodeNativeLaunchConfig:
         transcript should be seeded as a text preamble
         (``omnigent.fork.carry_history``); opencode has no native session to
         clone, so the runner rehydrates from the copied Omnigent transcript.
+    :param reasoning_effort: Persisted per-session reasoning effort (canonical,
+        e.g. ``"max"``), applied to the gateway Responses models, or ``None``.
     """
 
     workspace: Path
@@ -1306,6 +1308,7 @@ class _OpenCodeNativeLaunchConfig:
     model_override: str | None
     external_session_id: str | None
     fork_carry_history: bool = False
+    reasoning_effort: str | None = None
 
 
 async def _opencode_native_launch_config(
@@ -1361,6 +1364,7 @@ async def _opencode_native_launch_config(
     fork_carry_history = (
         isinstance(labels, dict) and labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
     )
+    reasoning_effort = snapshot.get("reasoning_effort")
     return _OpenCodeNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -1368,6 +1372,9 @@ async def _opencode_native_launch_config(
         model_override=model_override,
         external_session_id=external_session_id,
         fork_carry_history=fork_carry_history,
+        reasoning_effort=(
+            reasoning_effort if isinstance(reasoning_effort, str) and reasoning_effort else None
+        ),
     )
 
 
@@ -1478,7 +1485,9 @@ async def _auto_create_opencode_terminal(
     # surface (which ``resolve_databricks_gateway`` cannot reach — it only
     # accepts ``databricks-*`` serving-endpoint ids). ``None`` when no
     # config-gateway provider applies, so the databricks/managed paths still run.
-    config_gateway = resolve_config_gateway_providers(model_override=model_override)
+    config_gateway = resolve_config_gateway_providers(
+        model_override=model_override, reasoning_effort=launch_config.reasoning_effort
+    )
     gateway = None
     if config_gateway is not None:
         config = dict(config_gateway.config)
