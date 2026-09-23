@@ -40,6 +40,22 @@ def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_gateway_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable live gateway discovery by default.
+
+    Discovery mints a bearer by running the family ``auth_command`` and calls
+    the workspace model-services API. Tests that don't opt in should neither
+    shell out nor hit the network, so stub the token mint to ``None`` (which
+    makes discovery a no-op and the resolver keeps the static config tiers).
+    Discovery tests re-patch the mint + fetch to exercise the live path.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: None,
+    )
+
+
 def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
     block = build_opencode_omnigent_mcp_server(Path("/tmp/bridge-xyz"))
     assert set(block) == {"omnigent"}
@@ -875,7 +891,9 @@ def test_config_gateway_synthesizes_both_family_blocks(
 
     anthropic = providers["gateway-anthropic"]
     assert anthropic["npm"] == "@ai-sdk/anthropic"
-    assert anthropic["options"]["baseURL"] == "https://ws.example.com/ai-gateway/anthropic"
+    # @ai-sdk/anthropic posts to {baseURL}/messages, so the base is normalized to
+    # carry the /v1 the gateway's Anthropic surface expects.
+    assert anthropic["options"]["baseURL"] == "https://ws.example.com/ai-gateway/anthropic/v1"
     assert anthropic["models"] == {
         "eng_dev.ai_gateway.omni-claude": {"name": "eng_dev.ai_gateway.omni-claude"}
     }
@@ -923,6 +941,171 @@ providers:
     }
     # The pinned default is still the family default, not a tier.
     assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high"
+
+
+def _fake_model_service(model_id: str, *, responses: bool = False) -> types.SimpleNamespace:
+    """A minimal stand-in for a discovered ``ModelEntry`` (id + wire_apis only)."""
+    from omnigent.models.model_metadata import ModelWireAPI
+
+    wire_apis = frozenset({ModelWireAPI.OPENAI_RESPONSES}) if responses else frozenset()
+    return types.SimpleNamespace(id=model_id, metadata=types.SimpleNamespace(wire_apis=wire_apis))
+
+
+# A config whose static openai tiers include GLM/Grok (which the workspace no
+# longer grants EXECUTE on); discovery must drop them.
+_GATEWAY_CONFIG_WITH_REVOKED_YAML = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude-high
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: eng_dev.ai_gateway.omni-gpt-high
+        glm: eng_dev.ai_gateway.glm-4-7
+        grok: eng_dev.ai_gateway.grok-4-6
+"""
+
+
+def test_config_gateway_prefers_live_discovery_over_static_tiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discovery replaces the static tiers, so revoked GLM/Grok drop out.
+
+    The static config still lists ``glm-4-7`` / ``grok-4-6``, but the workspace
+    model-services listing (permission-filtered) returns only Claude + GPT, so
+    the picker shows exactly what the gateway serves.
+    """
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_WITH_REVOKED_YAML)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+        assert host == "https://ws.example.com"
+        assert model_services_parent == "schemas/eng_dev.ai_gateway"
+        return (
+            _fake_model_service("eng_dev.ai_gateway.omni-claude-high"),
+            _fake_model_service("eng_dev.ai_gateway.omni-claude-med"),
+            _fake_model_service("eng_dev.ai_gateway.omni-gpt-high", responses=True),
+            _fake_model_service("eng_dev.ai_gateway.omni-gpt-med", responses=True),
+        )
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries", _fake_fetch
+    )
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    providers = resolution.config["provider"]
+    assert set(providers["gateway-anthropic"]["models"]) == {
+        "eng_dev.ai_gateway.omni-claude-high",
+        "eng_dev.ai_gateway.omni-claude-med",
+    }
+    openai_models = set(providers["gateway-openai"]["models"])
+    assert openai_models == {
+        "eng_dev.ai_gateway.omni-gpt-high",
+        "eng_dev.ai_gateway.omni-gpt-med",
+    }
+    # The revoked models are gone even though config.yaml still lists them.
+    assert "eng_dev.ai_gateway.glm-4-7" not in openai_models
+    assert "eng_dev.ai_gateway.grok-4-6" not in openai_models
+
+
+def test_config_gateway_falls_back_to_static_when_discovery_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no discovery token, the resolver keeps the static config tiers."""
+    # The autouse fixture already stubs the token mint to None.
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_WITH_REVOKED_YAML)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    openai_models = set(resolution.config["provider"]["gateway-openai"]["models"])
+    # Static fallback keeps whatever config declares, GLM/Grok included.
+    assert "eng_dev.ai_gateway.glm-4-7" in openai_models
+    assert "eng_dev.ai_gateway.grok-4-6" in openai_models
+
+
+def test_discovery_falls_back_to_static_when_listing_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model-services API error is swallowed and the static tiers are used."""
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_WITH_REVOKED_YAML)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _boom(host: str, token: str, *, model_services_parent: str | None = None):
+        raise RuntimeError("listing denied")
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries", _boom
+    )
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    openai_models = set(resolution.config["provider"]["gateway-openai"]["models"])
+    assert "eng_dev.ai_gateway.glm-4-7" in openai_models
+
+
+def test_gateway_model_family_classification() -> None:
+    """Discovered model-services route to opencode's driveable families like pi."""
+    from omnigent.harnesses.opencode_native.provider import _gateway_model_family
+
+    # Claude → anthropic.
+    assert (
+        _gateway_model_family(_fake_model_service("eng_dev.ai_gateway.omni-claude-high"))
+        == "anthropic"
+    )
+    # GPT (Responses-wire), GLM, and Grok all → the OpenAI-compatible chat family.
+    assert (
+        _gateway_model_family(
+            _fake_model_service("eng_dev.ai_gateway.omni-gpt-high", responses=True)
+        )
+        == "openai"
+    )
+    assert _gateway_model_family(_fake_model_service("eng_dev.ai_gateway.glm-4-7")) == "openai"
+    assert _gateway_model_family(_fake_model_service("eng_dev.ai_gateway.grok-4-6")) == "openai"
+    # Gemini/Llama system.ai ids (mlflow-only) and pi-unsupported ids → dropped.
+    assert _gateway_model_family(_fake_model_service("system.ai.gemini-2-5-flash")) is None
+    assert _gateway_model_family(_fake_model_service("system.ai.llama-4")) is None
+
+
+def test_derive_model_services_parent_and_host() -> None:
+    """The UC parent and workspace origin are derived from config, no new fields."""
+    from omnigent.harnesses.opencode_native.provider import (
+        _derive_model_services_parent,
+        _gateway_host_from_base_url,
+    )
+
+    families = [
+        (
+            "openai",
+            "@ai-sdk/openai-compatible",
+            types.SimpleNamespace(
+                models={"default": "eng_dev.ai_gateway.omni-gpt-high"},
+                base_url="https://ws.example.com/ai-gateway/openai/v1",
+            ),
+        )
+    ]
+    assert _derive_model_services_parent(families) == "schemas/eng_dev.ai_gateway"
+    assert _gateway_host_from_base_url(families[0][2].base_url) == "https://ws.example.com"
+    # A bare (non-three-part) model id disables discovery.
+    bare = [("openai", "npm", types.SimpleNamespace(models={"default": "gpt-4"}, base_url="x"))]
+    assert _derive_model_services_parent(bare) is None
 
 
 def test_config_gateway_auth_command_writes_placeholder_key_only(

@@ -35,6 +35,7 @@ from omnigent.models import model_catalog
 if TYPE_CHECKING:
     from databricks.sdk.core import Config
 
+    from omnigent.onboarding.provider_config import FamilyConfig
     from omnigent.spec.types import MCPServerConfig
 
 _logger = logging.getLogger(__name__)
@@ -192,6 +193,155 @@ def _append_unique_model(model_ids: list[str], model_id: str) -> None:
         model_ids.append(stripped)
 
 
+def _gateway_host_from_base_url(base_url: str) -> str | None:
+    """Extract the bare workspace origin (``scheme://host``) from a family base URL.
+
+    The gateway family base URLs carry a surface path
+    (``https://<ws>.databricks.com/ai-gateway/anthropic``); the Unity Catalog
+    model-services API is rooted at the workspace origin, so strip the path.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(base_url)
+    except Exception:  # noqa: BLE001 - a malformed base URL just disables discovery.
+        return None
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return None
+
+
+def _derive_model_services_parent(families: list[tuple[str, str, FamilyConfig]]) -> str | None:
+    """Derive the Unity Catalog parent (``schemas/<catalog>.<schema>``) from config.
+
+    The gateway families list fully-qualified model-service ids
+    (``eng_dev.ai_gateway.omni-claude-high``); their first two dotted segments
+    are the schema the workspace's gateway model-services live under. Returns
+    ``None`` when no configured id is three-part (e.g. bare endpoint names), which
+    disables discovery so the caller keeps the static config tiers.
+    """
+    for _family_name, _npm, family in families:
+        for model_id in family.models.values():
+            parts = _strip_model_suffix(model_id).split(".")
+            if len(parts) >= 3 and parts[0] and parts[1]:
+                return f"schemas/{parts[0]}.{parts[1]}"
+    return None
+
+
+def _mint_gateway_discovery_token(families: list[tuple[str, str, FamilyConfig]]) -> str | None:
+    """Mint a bearer for the one-shot discovery API call from a family's auth.
+
+    Runs the family ``auth_command`` (the same command the per-request
+    gateway-auth plugin runs) or uses a resolved static ``api_key``. Best-effort
+    and timeout-bounded; ``None`` disables discovery so the caller keeps the
+    static config tiers rather than hanging or failing launch.
+    """
+    for _family_name, _npm, family in families:
+        if family.auth_command:
+            try:
+                completed = subprocess.run(
+                    family.auth_command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=True,
+                )
+            except Exception:  # noqa: BLE001 - try the next family, else fall back to static.
+                _logger.info("opencode gateway discovery: token mint failed.", exc_info=True)
+                continue
+            token = completed.stdout.strip()
+            if token:
+                return token
+        elif family.api_key:
+            return family.api_key
+    return None
+
+
+def _gateway_model_family(model: model_catalog.ModelEntry) -> str | None:
+    """Classify a discovered model-service into an opencode-driveable family.
+
+    Mirrors pi's ``_fetch_pi_model_lists`` routing so both harnesses show the
+    same set: Claude → the Anthropic family; Gemini/Llama ``system.ai.*``
+    (mlflow-only) and pi-unsupported models → dropped (opencode drives only the
+    Anthropic + OpenAI-chat surfaces); everything else (GPT/Responses plus
+    GLM/Grok/completions) → the OpenAI-compatible family.
+    """
+    from omnigent.models.model_metadata import ModelWireAPI
+    from omnigent.models.pi_model_compatibility import (
+        SYSTEM_AI_RESPONSES_KEYWORDS,
+        unsupported_in_pi,
+    )
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+
+    name_lower = model.id.lower()
+    if "claude" in name_lower:
+        return ANTHROPIC_FAMILY
+    if unsupported_in_pi(name_lower):
+        return None
+    is_system_ai = name_lower.startswith("system.ai.")
+    is_non_system_glm = "glm-" in name_lower and not is_system_ai
+    needs_responses = not is_non_system_glm and (
+        ModelWireAPI.OPENAI_RESPONSES in model.metadata.wire_apis
+        or (
+            is_system_ai and any(keyword in name_lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS)
+        )
+    )
+    if needs_responses:
+        return OPENAI_FAMILY
+    if is_system_ai:
+        # Gemini/Llama system.ai ids serve only through the mlflow gateway,
+        # which opencode has no family for; pi routes them to a separate surface.
+        return None
+    return OPENAI_FAMILY
+
+
+def _discover_gateway_models(
+    families: list[tuple[str, str, FamilyConfig]],
+) -> dict[str, list[str]]:
+    """Live Unity Catalog model-service discovery for the gateway families.
+
+    Returns ``{family_name: [model_id, ...]}`` for the model-services the
+    workspace actually serves (EXECUTE-permission-filtered by the caller's
+    token), classified into the opencode-driveable ``anthropic`` / ``openai``
+    families exactly as pi's ``_fetch_pi_model_lists`` classifies them. This is
+    the parity path with pi's ``_databricks_pi_provider``: the picker reflects
+    what the gateway serves and respects gateway permissions, rather than a
+    hand-maintained config list.
+
+    Best-effort: any failure (no parent derivable, no token, HTTP/auth error,
+    empty result) returns ``{}`` and the caller keeps the static config tiers,
+    so an offline launch or a config without a discoverable schema still works.
+    """
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+
+    if not families:
+        return {}
+    parent = _derive_model_services_parent(families)
+    host = _gateway_host_from_base_url(families[0][2].base_url)
+    if not parent or not host:
+        return {}
+    token = _mint_gateway_discovery_token(families)
+    if not token:
+        return {}
+    try:
+        entries = model_catalog.fetch_databricks_model_service_entries(
+            host, token, model_services_parent=parent
+        )
+    except Exception:  # noqa: BLE001 - discovery failure falls back to static tiers.
+        _logger.info(
+            "opencode gateway discovery: model-service listing failed; using config tiers.",
+            exc_info=True,
+        )
+        return {}
+    buckets: dict[str, list[str]] = {ANTHROPIC_FAMILY: [], OPENAI_FAMILY: []}
+    for model in entries:
+        family_name = _gateway_model_family(model)
+        if family_name in buckets:
+            _append_unique_model(buckets[family_name], model.id)
+    return {family_name: ids for family_name, ids in buckets.items() if ids}
+
+
 def resolve_config_gateway_providers(
     model_override: str | None = None,
 ) -> ConfigGatewayResolution | None:
@@ -220,7 +370,6 @@ def resolve_config_gateway_providers(
         KEY_KIND,
         LOCAL_KIND,
         OPENAI_FAMILY,
-        FamilyConfig,
         default_provider_for_harness,
         load_config,
     )
@@ -262,8 +411,19 @@ def resolve_config_gateway_providers(
             continue
         families.append((family_name, npm, family))
 
+    # Prefer the live Unity Catalog model-services the workspace serves
+    # (permission-filtered) over the static config tiers, matching pi. Empty
+    # when discovery is unavailable — the loop then keeps the configured tiers.
+    # Resolved before override routing so an override that only the live catalog
+    # lists still pins to the family whose wire protocol serves it.
+    discovered = _discover_gateway_models(families)
+
     def _lists_override(family_name: str, family: FamilyConfig) -> bool:
-        candidates = (entry.family_default_model(family_name), *family.models.values())
+        candidates = (
+            entry.family_default_model(family_name),
+            *family.models.values(),
+            *discovered.get(family_name, ()),
+        )
         return any(c and _strip_model_suffix(c) == override for c in candidates)
 
     # The override pins on the family that lists it (default or any tier);
@@ -293,14 +453,24 @@ def resolve_config_gateway_providers(
             _append_unique_model(model_ids, default_model)
             if pinned is None and override_family is None:
                 pinned = f"{provider_id}/{_strip_model_suffix(default_model)}"
-        # Enumerate every configured tier (high/med/low/…) so opencode's picker
-        # lists them all; de-duped against the default/override.
-        for tier_model in family.models.values():
+        # Enumerate the family's models so opencode's picker lists them all,
+        # de-duped against the default/override. Prefer the live-discovered
+        # model-services (current + permission-filtered) and fall back to the
+        # configured tiers when discovery is unavailable.
+        for tier_model in discovered.get(family_name) or family.models.values():
             _append_unique_model(model_ids, tier_model)
         if not model_ids:
             continue
 
-        options: dict[str, object] = {"baseURL": family.base_url}
+        # ``@ai-sdk/anthropic`` posts to ``{baseURL}/messages``, so its base must
+        # carry the ``/v1`` the gateway's Anthropic surface expects
+        # (``/ai-gateway/anthropic/v1/messages``); the openai-compatible base
+        # already carries ``/v1`` in config. Append it when absent so a config
+        # base of ``.../ai-gateway/anthropic`` still resolves.
+        base_url = family.base_url
+        if npm == _AI_SDK_ANTHROPIC and not base_url.rstrip("/").endswith("/v1"):
+            base_url = base_url.rstrip("/") + "/v1"
+        options: dict[str, object] = {"baseURL": base_url}
         # A static key (or $VAR / keychain, resolved by ``entry.family``) is
         # written inline; a dynamic ``auth_command`` is NOT — the gateway-auth
         # plugin injects a fresh Bearer per request instead (no stale token).
