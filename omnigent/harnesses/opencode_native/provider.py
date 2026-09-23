@@ -81,6 +81,44 @@ class OpenCodeGatewayResolution:
         return f"{self.provider_id}/{self.model_id}"
 
 
+def resolve_bound_opencode_gateway(
+    *, model: str | None = None, auth: object = None
+) -> OpenCodeGatewayResolution | None:
+    """Resolve an explicit session binding without consulting Connect fallbacks."""
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+        resolve_bound_provider,
+    )
+    from omnigent.onboarding.provider_config import OPENAI_FAMILY
+
+    config = load_runtime_inference_config()
+    entry = resolve_bound_provider(config, "opencode-native", auth)
+    if entry is None:
+        return None
+    family = entry.family(OPENAI_FAMILY)
+    selected = resolve_bound_model(config, "opencode-native", model)
+    if family is None or not selected:
+        raise ValueError("OpenCode requires an OpenAI-compatible provider and a default model.")
+    if family.wire_api == "responses":
+        raise ValueError("OpenCode's configured gateway must support the chat wire API.")
+    token = model_catalog._resolve_bearer_token(
+        model_catalog.ResolvedModelProvider(
+            kind=entry.kind, api_key=family.api_key, auth_command=family.auth_command
+        )
+    )
+    binding = binding_for_harness(config, "opencode-native")
+    return OpenCodeGatewayResolution(
+        base_url=family.base_url,
+        api_key=token,
+        model_id=selected,
+        model_ids=binding.model_allowlist or () if binding is not None else (),
+        provider_id="omnigent",
+        provider_name=entry.name,
+    )
+
+
 def build_opencode_model_default_config(model: str) -> dict[str, object]:
     """
     Build a minimal ``opencode.json`` that only pins the default model.
@@ -99,25 +137,12 @@ def build_opencode_model_default_config(model: str) -> dict[str, object]:
     return {"$schema": "https://opencode.ai/config.json", "model": model}
 
 
-# opencode auto-loads its own free "Zen" provider (models like
-# ``opencode/big-pickle``). omnigent routes only through the configured gateway,
-# so hide that auto-loaded free tier from the model picker via opencode's
-# ``disabled_providers`` config key (part of opencode's ``config.json`` schema).
+# Hide OpenCode's built-in free tier when Omnigent supplies a provider.
 _OPENCODE_AUTOLOADED_FREE_PROVIDERS = ("opencode",)
 
 
 def disable_autoloaded_free_providers(config: dict[str, object]) -> dict[str, object]:
-    """Hide opencode's auto-loaded free providers (Zen / ``big-pickle``) from the picker.
-
-    Sets opencode's ``disabled_providers`` key so the built-in free tier opencode
-    loads automatically does not appear alongside the synthesized gateway
-    providers. A no-op on an empty config (nothing is written, so opencode falls
-    back to its global config, which this per-session file cannot override).
-    Mutates *config* in place and is idempotent.
-
-    :param config: The opencode config dict about to be written.
-    :returns: The same dict, for chaining.
-    """
+    """Hide opencode's auto-loaded free providers (Zen / ``big-pickle``) from the picker."""
     if config:
         config.setdefault("$schema", "https://opencode.ai/config.json")
         config["disabled_providers"] = list(_OPENCODE_AUTOLOADED_FREE_PROVIDERS)
@@ -149,49 +174,19 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
     }
 
 
-# Anthropic Messages surface → the AI SDK Anthropic factory. It defaults to an
-# ``x-api-key`` header, but a per-provider ``options.headers.Authorization``
-# overrides it (proven by ucode's shipping Databricks gateway config); the
-# gateway-auth plugin (Step 2) refreshes that Bearer per provider load.
 _AI_SDK_ANTHROPIC = "@ai-sdk/anthropic"
-# OpenAI Chat-Completions-compatible surface (e.g. the gateway's
-# ``/ai-gateway/openai/v1``) → the OpenAI-compatible factory.
 _AI_SDK_OPENAI_COMPATIBLE = "@ai-sdk/openai-compatible"
-# OpenAI *Responses* surface: the real OpenAI factory drives ``{baseURL}/responses``
-# and carries ``reasoning_effort`` — the only OpenAI surface where gateway
-# reasoning takes effect (chat/completions ignores it and 400s with tools). Used
-# for the effort-capable model group.
+# Reasoning effort requires the Responses-capable OpenAI factory.
 _AI_SDK_OPENAI = "@ai-sdk/openai"
-# Factory-satisfying stand-in written for ``auth_command`` families, never sent
-# as a real credential; the gateway-auth plugin's per-request Bearer wins.
+# The SDK requires a key before the auth plugin can replace it.
 _AUTH_PLUGIN_PLACEHOLDER_KEY = "omnigent-gateway-auth-plugin"
-# Discovery-only provider group for effort-capable models routed over the OpenAI
-# Responses surface (GPT, Kimi). Kept distinct from the chat-completions
-# ``openai`` group so reasoning actually applies; GLM aliases stay on chat (the
-# catalog advertises Responses for them but the gateway 400s — see
-# :func:`_gateway_model_family`).
+# Keep Responses models separate from chat-only aliases such as GLM.
 _OPENAI_RESPONSES_GROUP = "openai-responses"
 
 
 @dataclass(frozen=True)
 class ConfigGatewayResolution:
-    """A resolved ``config.yaml`` gateway provider for the opencode harness.
-
-    Built by :func:`resolve_config_gateway_providers` from the ``providers:``
-    block in ``~/.omnigent/config.yaml`` — the config-driven parity path with
-    pi's ``_inline_family_pi_provider``. Carries the synthesized opencode
-    provider blocks (already including the pinned ``model``) plus, for any
-    family that authenticates with a dynamic ``auth_command``, the command the
-    per-request bearer-refresh plugin runs.
-
-    :param config: The synthesized ``opencode.json`` fragment — a ``provider``
-        map plus a top-level ``model`` (``"<provider_id>/<model_id>"``).
-    :param auth_commands: Map of synthesized provider id → the family's
-        ``auth_command`` (only for families that use one). Empty when every
-        family carries a static key. Stamped as ``OMNIGENT_OPENCODE_AUTH_COMMAND``
-        (JSON) so the gateway-auth plugin can mint a fresh Bearer per request.
-    :param model: The pinned default model id (``"<provider_id>/<model_id>"``).
-    """
+    """A resolved ``config.yaml`` gateway provider for the opencode harness."""
 
     config: dict[str, object]
     auth_commands: dict[str, str]
@@ -199,43 +194,25 @@ class ConfigGatewayResolution:
 
 
 def _config_gateway_provider_id(entry_name: str, family: str) -> str:
-    """Build a stable, JSON/id-safe opencode provider id for a family block.
-
-    :param entry_name: The ``providers:`` entry name, e.g. ``"gateway"``.
-    :param family: ``"anthropic"`` or ``"openai"``.
-    :returns: e.g. ``"gateway-anthropic"``.
-    """
+    """Build a stable, JSON/id-safe opencode provider id for a family block."""
     slug = re.sub(r"[^A-Za-z0-9_-]", "-", entry_name).strip("-") or "gateway"
     return f"{slug}-{family}"
 
 
 def _strip_model_suffix(model_id: str) -> str:
-    """Strip a trailing ``[...]`` suffix (e.g. ``[1m]``) from a model id.
-
-    The direct Anthropic API accepts the bracket suffix, but the Databricks AI
-    Gateway rejects it — mirrors ``pi_native/credentials.py`` model handling.
-    """
+    """Strip a trailing ``[...]`` suffix (e.g. ``[1m]``) from a model id."""
     return re.sub(r"\[.*?\]$", "", model_id)
 
 
 def _append_unique_model(model_ids: list[str], model_id: str) -> None:
-    """Append *model_id* (suffix-stripped) to *model_ids* if not already present.
-
-    :param model_ids: The accumulating list of model ids.
-    :param model_id: A raw model id, possibly with a trailing ``[...]`` suffix.
-    """
+    """Append *model_id* (suffix-stripped) to *model_ids* if not already present."""
     stripped = _strip_model_suffix(model_id)
     if stripped and stripped not in model_ids:
         model_ids.append(stripped)
 
 
 def _gateway_host_from_base_url(base_url: str) -> str | None:
-    """Extract the bare workspace origin (``scheme://host``) from a family base URL.
-
-    The gateway family base URLs carry a surface path
-    (``https://<ws>.databricks.com/ai-gateway/anthropic``); the Unity Catalog
-    model-services API is rooted at the workspace origin, so strip the path.
-    """
+    """Extract the bare workspace origin (``scheme://host``) from a family base URL."""
     from urllib.parse import urlparse
 
     try:
@@ -248,14 +225,7 @@ def _gateway_host_from_base_url(base_url: str) -> str | None:
 
 
 def _derive_model_services_parent(families: list[tuple[str, str, FamilyConfig]]) -> str | None:
-    """Derive the Unity Catalog parent (``schemas/<catalog>.<schema>``) from config.
-
-    The gateway families list fully-qualified model-service ids
-    (``eng_dev.ai_gateway.omni-claude-high``); their first two dotted segments
-    are the schema the workspace's gateway model-services live under. Returns
-    ``None`` when no configured id is three-part (e.g. bare endpoint names), which
-    disables discovery so the caller keeps the static config tiers.
-    """
+    """Derive the Unity Catalog parent (``schemas/<catalog>.<schema>``) from config."""
     for _family_name, _npm, family in families:
         for model_id in family.models.values():
             parts = _strip_model_suffix(model_id).split(".")
@@ -265,13 +235,7 @@ def _derive_model_services_parent(families: list[tuple[str, str, FamilyConfig]])
 
 
 def _mint_gateway_discovery_token(families: list[tuple[str, str, FamilyConfig]]) -> str | None:
-    """Mint a bearer for the one-shot discovery API call from a family's auth.
-
-    Runs the family ``auth_command`` (the same command the per-request
-    gateway-auth plugin runs) or uses a resolved static ``api_key``. Best-effort
-    and timeout-bounded; ``None`` disables discovery so the caller keeps the
-    static config tiers rather than hanging or failing launch.
-    """
+    """Mint a bearer for the one-shot discovery API call from a family's auth."""
     for _family_name, _npm, family in families:
         if family.auth_command:
             try:
@@ -295,25 +259,7 @@ def _mint_gateway_discovery_token(families: list[tuple[str, str, FamilyConfig]])
 
 
 def _gateway_model_family(model: model_catalog.ModelEntry) -> str | None:
-    """Classify a discovered model-service into an opencode provider group.
-
-    Groups mirror pi's ``_fetch_pi_model_lists`` routing so both harnesses agree:
-
-    * Claude → the Anthropic group.
-    * Effort-capable OpenAI-Responses model (GPT, Kimi) → the reasoning group
-      (:data:`_OPENAI_RESPONSES_GROUP`), driven via ``@ai-sdk/openai`` where
-      ``reasoning_effort`` takes effect.
-    * Everything else chat-capable (e.g. non-``system.ai`` GLM aliases) → the
-      OpenAI chat group.
-    * Gemini/Llama ``system.ai.*`` (mlflow-only) and pi-unsupported models →
-      dropped (opencode has no surface for them).
-
-    The Responses grouping uses pi's ``needs_responses`` rule, which excludes
-    non-``system.ai`` GLM aliases on purpose: the catalog advertises
-    ``openai/v1/responses`` for ``eng_dev.ai_gateway.glm-*`` but the gateway 400s
-    on it ("does not support the '/openai/v1/responses' API"), so those must stay
-    on chat completions.
-    """
+    """Classify a discovered model-service into an opencode provider group."""
     from omnigent.models.model_metadata import ModelWireAPI
     from omnigent.models.pi_model_compatibility import (
         SYSTEM_AI_RESPONSES_KEYWORDS,
@@ -337,26 +283,16 @@ def _gateway_model_family(model: model_catalog.ModelEntry) -> str | None:
     if needs_responses:
         return _OPENAI_RESPONSES_GROUP
     if is_system_ai:
-        # Gemini/Llama system.ai ids serve only through the mlflow gateway,
-        # which opencode has no family for; pi routes them to a separate surface.
+        # OpenCode has no provider for the system.ai MLflow surface.
         return None
     return OPENAI_FAMILY
 
 
-# Canonical reasoning-effort ladder (ascending), for clamping a requested effort
-# to a model's advertised ceiling.
 _EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
 
 def _clamp_effort(requested: str, allowed: tuple[str, ...]) -> str | None:
-    """Clamp a requested canonical effort to a model's advertised ladder.
-
-    :param requested: A canonical effort (e.g. ``"max"``).
-    :param allowed: The model's advertised efforts (from discovery), any order.
-    :returns: ``requested`` when the model advertises it; else the highest
-        advertised level not exceeding it; else the lowest advertised level;
-        ``None`` when the model advertises no efforts.
-    """
+    """Clamp a requested canonical effort to a model's advertised ladder."""
     allowed_set = {effort for effort in allowed if effort in _EFFORT_ORDER}
     if not allowed_set:
         return None
@@ -376,25 +312,7 @@ def _clamp_effort(requested: str, allowed: tuple[str, ...]) -> str | None:
 def _discover_gateway_models(
     families: list[tuple[str, str, FamilyConfig]],
 ) -> tuple[dict[str, list[str]], dict[str, tuple[str, ...]]]:
-    """Live Unity Catalog model-service discovery for the gateway families.
-
-    Returns ``{family_name: [model_id, ...]}`` for the model-services the
-    workspace actually serves (EXECUTE-permission-filtered by the caller's
-    token), classified into the opencode-driveable ``anthropic`` / ``openai``
-    families exactly as pi's ``_fetch_pi_model_lists`` classifies them. This is
-    the parity path with pi's ``_databricks_pi_provider``: the picker reflects
-    what the gateway serves and respects gateway permissions, rather than a
-    hand-maintained config list.
-
-    Best-effort: any failure (no parent derivable, no token, HTTP/auth error,
-    empty result) returns ``({}, {})`` and the caller keeps the static config
-    tiers, so an offline launch or a config without a discoverable schema still
-    works.
-
-    :returns: ``(groups, efforts)`` — the group→model-id map, and, for each
-        Responses-group model, its advertised reasoning-effort ladder (used to
-        clamp a requested effort to the model's ceiling).
-    """
+    """Live Unity Catalog model-service discovery for the gateway families."""
     from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 
     if not families:
@@ -439,29 +357,7 @@ def resolve_config_gateway_providers(
     model_override: str | None = None,
     reasoning_effort: str | None = None,
 ) -> ConfigGatewayResolution | None:
-    """Resolve the ``~/.omnigent/config.yaml`` gateway provider for opencode.
-
-    The config-driven parity path with pi's ``_inline_family_pi_provider``:
-    reads the default provider for the opencode surface and, for a
-    key/gateway/local-kind entry, synthesizes an opencode ``provider`` block per
-    configured ``anthropic`` / ``openai`` family so opencode reaches the AI
-    Gateway's Anthropic surface and its ``/ai-gateway/openai/v1`` OpenAI surface.
-
-    Returns ``None`` for kinds this resolver cannot drive (subscription,
-    databricks, cli-config, bedrock) so the existing ``resolve_databricks_gateway``
-    / ``managed_connect_opencode_config`` / default paths still run.
-
-    :param model_override: A session model override (e.g. an
-        ``eng_dev.ai_gateway.omni-*`` id), passed through **verbatim** (only a
-        trailing ``[...]`` suffix is stripped). ``None`` uses the family default.
-    :param reasoning_effort: The session-level reasoning effort (canonical, e.g.
-        ``"max"``). Applied to the Responses group's models as ``reasoningEffort``
-        (clamped to each model's advertised ceiling), so opencode sends it on the
-        ``/responses`` call. ``None``/``default``/``none`` leaves it unset (the
-        model's own default). Ignored for chat and Anthropic groups.
-    :returns: The resolution (provider blocks + pinned model + any auth
-        commands), or ``None`` when no config-gateway provider applies.
-    """
+    """Resolve the ``~/.omnigent/config.yaml`` gateway provider for opencode."""
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
         CHAT_WIRE_API,
@@ -477,8 +373,6 @@ def resolve_config_gateway_providers(
     effort: str | None = None
     if reasoning_effort:
         candidate = reasoning_effort.strip().lower()
-        # ``none`` disables reasoning, and clear sentinels (default/off/reset)
-        # are not in EFFORT_VALUES — either way, leave reasoningEffort unset.
         if candidate in EFFORT_VALUES and candidate != "none":
             effort = candidate
 
@@ -497,6 +391,9 @@ def resolve_config_gateway_providers(
         return None
 
     override = _strip_model_suffix(model_override) if model_override else None
+    override_provider: str | None = None
+    if override and "/" in override:
+        override_provider, override = override.split("/", 1)
     providers: dict[str, object] = {}
     auth_commands: dict[str, str] = {}
 
@@ -512,26 +409,16 @@ def resolve_config_gateway_providers(
             continue
         if family is None or not family.base_url:
             continue
-        # The OpenAI family is only opencode-driveable over Chat Completions
-        # (``@ai-sdk/openai-compatible``); a Responses-wire family is skipped.
         if family_name == OPENAI_FAMILY and family.wire_api != CHAT_WIRE_API:
             continue
         families.append((family_name, npm, family))
 
     families_by_name = {name: family for name, _npm, family in families}
 
-    # Live Unity Catalog discovery classifies the served models into three
-    # opencode groups (anthropic / openai-chat / openai-responses). Empty when
-    # discovery is unavailable — the openai family then keeps its static chat
-    # tiers and no Responses group is synthesized (per-model wire is unknown
-    # offline). Resolved before override routing so an override that only the
-    # live catalog lists still pins to the group whose surface serves it.
+    # Successful discovery replaces stale static model lists.
     discovered, discovered_efforts = _discover_gateway_models(families)
     discovery_ok = bool(discovered)
 
-    # Group specs: (group_key, provider_id, npm, source config family, reasoning).
-    # The openai config family feeds BOTH the chat block and — when discovery
-    # found effort-capable models — a Responses block on the same base URL.
     group_specs: list[tuple[str, str, str, FamilyConfig, bool]] = []
     if ANTHROPIC_FAMILY in families_by_name:
         group_specs.append(
@@ -565,9 +452,6 @@ def resolve_config_gateway_providers(
                 )
             )
 
-    # Both openai groups source the configured default from the openai family;
-    # each claims it only if it actually serves that id (so an omni-gpt default
-    # lands in the Responses group, not the chat one).
     default_source = {
         ANTHROPIC_FAMILY: ANTHROPIC_FAMILY,
         OPENAI_FAMILY: OPENAI_FAMILY,
@@ -576,19 +460,25 @@ def resolve_config_gateway_providers(
 
     def _group_model_ids(group_key: str, family: FamilyConfig) -> list[str]:
         if discovery_ok:
-            # A missing key means discovery found no models for that group (not a
-            # reason to fall back to stale static tiers).
+            # Successful discovery is authoritative for empty groups too.
             return list(discovered.get(group_key, ()))
-        # Discovery unavailable: the config families keep their static tiers; the
-        # Responses group is discovery-only so it never reaches this fallback.
         if group_key in (ANTHROPIC_FAMILY, OPENAI_FAMILY):
             return list(family.models.values())
         return []
 
-    # Which group an override pins to (the surface whose wire serves it); an
-    # unlisted override falls back to the first present group.
     override_group: str | None = None
-    if override and group_specs:
+    if override_provider is not None:
+        override_group = next(
+            (
+                group_key
+                for group_key, provider_id, *_rest in group_specs
+                if provider_id == override_provider
+            ),
+            None,
+        )
+        if override_group is None:
+            return None
+    elif override and group_specs:
         for group_key, _pid, _npm, family, _reasoning in group_specs:
             candidates = (
                 entry.family_default_model(default_source[group_key]),
@@ -612,8 +502,6 @@ def resolve_config_gateway_providers(
         if override and group_key == override_group:
             _append_unique_model(model_ids, override)
             override_pin = f"{provider_id}/{override}"
-        # Prepend the config default only to the group that serves it, so the
-        # default selection is the configured default, not a tier.
         if default_model:
             stripped_default = _strip_model_suffix(default_model)
             served = {_strip_model_suffix(m) for m in group_ids}
@@ -624,28 +512,17 @@ def resolve_config_gateway_providers(
                     anthropic_default_pin = anthropic_default_pin or pin
                 else:
                     openai_default_pin = openai_default_pin or pin
-        # Enumerate the group's models so opencode's picker lists them all,
-        # de-duped against the default/override.
         for tier_model in group_ids:
             _append_unique_model(model_ids, tier_model)
         if not model_ids:
             continue
 
-        # ``@ai-sdk/anthropic`` posts to ``{baseURL}/messages``, so its base must
-        # carry the ``/v1`` the gateway's Anthropic surface expects
-        # (``/ai-gateway/anthropic/v1/messages``); the openai bases already carry
-        # ``/v1`` in config (``@ai-sdk/openai`` then posts to ``.../v1/responses``,
-        # ``@ai-sdk/openai-compatible`` to ``.../v1/chat/completions``).
+        # The Anthropic SDK appends /messages and expects /v1 in the base URL.
         base_url = family.base_url
         if npm == _AI_SDK_ANTHROPIC and not base_url.rstrip("/").endswith("/v1"):
             base_url = base_url.rstrip("/") + "/v1"
         options: dict[str, object] = {"baseURL": base_url}
-        # A static key (or $VAR / keychain, resolved by ``entry.family``) is
-        # written inline; a dynamic ``auth_command`` is NOT — the gateway-auth
-        # plugin injects a fresh Bearer per request instead (no stale token).
-        # The placeholder apiKey only satisfies the AI SDK factory, which
-        # refuses to construct without one; the gateway authenticates the
-        # injected Authorization header.
+        # Dynamic credentials use a placeholder that the auth plugin replaces.
         if family.auth_command:
             auth_commands[provider_id] = family.auth_command
             options["apiKey"] = _AUTH_PLUGIN_PLACEHOLDER_KEY
@@ -655,14 +532,8 @@ def resolve_config_gateway_providers(
         for mid in model_ids:
             model_entry: dict[str, object] = {"name": mid}
             if reasoning:
-                # Mark the model reasoning-capable so opencode exposes its
-                # reasoning-effort control; it is served over the Responses
-                # surface (``@ai-sdk/openai``) where reasoning_effort applies.
                 model_entry["reasoning"] = True
                 if effort is not None:
-                    # Clamp the session effort to the model's advertised ceiling
-                    # (gpt→max, kimi→high) and pass it through opencode's model
-                    # ``options`` to @ai-sdk/openai's ``/responses`` call.
                     clamped = _clamp_effort(
                         effort, discovered_efforts.get(_strip_model_suffix(mid), ())
                     )
@@ -675,9 +546,7 @@ def resolve_config_gateway_providers(
 
     if not providers:
         return None
-    # Pin preference: an override wins; else the Anthropic default (opencode/pi
-    # both prefer the Anthropic surface); else the openai default; else the first
-    # synthesized model.
+    # Prefer an override, then family defaults, then the first model.
     pinned = override_pin or anthropic_default_pin or openai_default_pin or first_model_pin
     if pinned is None:
         return None

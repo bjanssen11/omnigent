@@ -1,22 +1,4 @@
-"""E2E repro: opencode-native ignores ``~/.omnigent/config.yaml`` gateway providers.
-
-A default ``gateway`` provider in ``~/.omnigent/config.yaml`` exposes the AI
-Gateway's Anthropic surface (``…/ai-gateway/anthropic``) and OpenAI surface
-(``…/ai-gateway/openai/v1``) with ``eng_dev.ai_gateway.omni-*`` model ids. An
-opencode-native session must route its model traffic through that configured
-gateway (as pi does); instead the launch never consults the config, so the turn
-never reaches the gateway on either surface and the non-``databricks-*`` model
-id is dropped.
-
-Journey per test: write the provider config into an isolated ``$HOME`` →
-connect a host daemon under that HOME → create a host-bound opencode-native
-session → send a chat message → the configured gateway must receive the model
-request (the in-test gateway records every request it serves and answers both
-surfaces' wire protocols, so a correctly routed turn can complete).
-
-Needs a working ``opencode`` binary on PATH (the supported native-harness
-range); skipped otherwise. No real LLM or credentials are used.
-"""
+"""Exercise config-gateway routing through a real OpenCode-native session."""
 
 from __future__ import annotations
 
@@ -50,8 +32,6 @@ _REPLY_TEXT = "GATEWAY-OK"
 _HOST_ONLINE_TIMEOUT_S = 60.0
 _TERMINAL_TIMEOUT_S = 120.0
 _GATEWAY_HIT_TIMEOUT_S = 120.0
-# Once the assistant reply landed, any gateway traffic the turn was going to
-# produce has already been sent; a short grace catches stragglers.
 _POST_REPLY_GRACE_S = 5.0
 
 
@@ -97,11 +77,7 @@ class _RequestLog:
             return [r for r in self.requests if r.path.startswith(prefix)]
 
     def model_calls(self, prefix: str) -> list[_GatewayRequest]:
-        """POSTs to a model endpoint under *prefix* — the turn's actual LLM call.
-
-        Excludes discovery traffic (e.g. a host model-options ``GET …/models``
-        probe), which must not satisfy the routing assertion.
-        """
+        """POSTs to a model endpoint under *prefix* — the turn's actual LLM call."""
         return [
             r
             for r in self.under(prefix)
@@ -331,8 +307,6 @@ def _spawn_host_daemon(*, tmp_path: Path, live_server: str, home: Path) -> subpr
     """Spawn an ``omnigent host`` daemon whose ``$HOME`` carries the provider config."""
     repo_root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
-    # Absolute sdk paths: the runner the daemon spawns runs from the session
-    # workspace, where relative PYTHONPATH entries stop resolving omnigent_client.
     env["PYTHONPATH"] = os.pathsep.join(
         [
             str(repo_root),
@@ -342,11 +316,7 @@ def _spawn_host_daemon(*, tmp_path: Path, live_server: str, home: Path) -> subpr
         ]
     )
     env["HOME"] = str(home)
-    # Keep the daemon's + its runners' logs under the test tmp dir, where they
-    # survive the suite's OMNIGENT_DATA_DIR cleanup and are inspectable on failure.
     env["OMNIGENT_DATA_DIR"] = str(tmp_path / "omnigent-data")
-    # The config under $HOME must be the only provider source: drop ambient
-    # provider credentials/config the CI or developer environment carries.
     for var in (
         "OMNIGENT_CONFIG_HOME",
         "XDG_CONFIG_HOME",
@@ -544,12 +514,7 @@ def test_opencode_native_routes_via_config_gateway_anthropic_surface(
     tmp_path: Path,
     live_server: str,
 ) -> None:
-    """A config.yaml gateway's Anthropic surface must serve the opencode turn.
-
-    The user pins the gateway's ``eng_dev.ai_gateway.omni-*`` (non-
-    ``databricks-*``) Anthropic model, so the launch must adopt the config
-    provider and the turn's model call must reach ``…/ai-gateway/anthropic``.
-    """
+    """A config.yaml gateway's Anthropic surface must serve the opencode turn."""
     hits, gateway, session_id = _run_gateway_journey(
         http_client,
         tmp_path=tmp_path,
@@ -584,12 +549,7 @@ def test_opencode_native_routes_via_config_gateway_openai_surface(
     tmp_path: Path,
     live_server: str,
 ) -> None:
-    """A config.yaml gateway's OpenAI surface must serve the opencode turn.
-
-    No per-session model is pinned, so the launch must adopt the config
-    provider's default ``eng_dev.ai_gateway.omni-*`` model and the turn's model
-    call must reach ``…/ai-gateway/openai/v1``.
-    """
+    """A config.yaml gateway's OpenAI surface must serve the opencode turn."""
     hits, gateway, session_id = _run_gateway_journey(
         http_client,
         tmp_path=tmp_path,
@@ -625,13 +585,7 @@ def test_opencode_native_config_gateway_auth_command_mints_bearer(
     tmp_path: Path,
     live_server: str,
 ) -> None:
-    """A family with a dynamic ``auth_command`` must authenticate the turn.
-
-    No static ``api_key`` is configured, so no token can be baked into the
-    synthesized ``opencode.json``; the gateway-auth plugin must run the family's
-    command and send the minted ``Authorization: Bearer`` on the turn's model
-    call to the configured surface.
-    """
+    """A family with a dynamic ``auth_command`` must authenticate the turn."""
     hits, gateway, session_id = _run_gateway_journey(
         http_client,
         tmp_path=tmp_path,

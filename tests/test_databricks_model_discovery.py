@@ -426,7 +426,6 @@ def test_claude_discovery_forwards_model_services_parent_override(
     )
 
     assert _listing_request(requests).url.params["parent"] == "schemas/eng_dev.ai_gateway"
-    # The override alone drives the parent — no env var was set.
     assert catalog.families == {"opus": "system.ai.claude-opus-5"}
 
 

@@ -745,9 +745,7 @@ def _build_models_json(
     )
     # Databricks Codex URLs only accept Responses; Chat uses the workspace.
     if raw_openai_base_url and is_databricks_openai_gateway:
-        # The workspace serving-endpoints route is not an OpenAI-compatible
-        # chat endpoint. GLM and other chat-wire model services must use the
-        # AI Gateway OpenAI surface; otherwise Pi receives a body-less 404.
+        # Chat-wire model services require the AI Gateway OpenAI surface.
         openai_base_url = openai_gateway_url
     else:
         openai_base_url = raw_openai_base_url or serving_endpoints_url
@@ -891,8 +889,7 @@ def _build_models_json(
 # parser only consumes that channel when the model entry declares
 # ``reasoning: true``; without it the stream carries no ``content`` and the
 # turn dies with "Stream ended without finish_reason".
-# Note: GLM, kimi, and inkling route via Responses only for system.ai.* ids;
-# non-system GLM aliases use the Chat Completions surface.
+# Only system.ai aliases route through Responses.
 def _pi_needs_responses_api(
     model: str,
     wire_apis: frozenset[ModelWireAPI] | None = None,
@@ -905,10 +902,7 @@ def _pi_needs_responses_api(
     which is the forward-compatible tool-capable surface.
     """
     lower = model.lower()
-    # Databricks serving-endpoint aliases such as databricks-glm-* and
-    # eng_dev.ai_gateway.glm-* are Chat Completions models. Keep this explicit
-    # override ahead of catalog metadata because the same backing model may
-    # advertise both wires while the alias is only routable on /chat/completions.
+    # Non-system GLM aliases are routable only through Chat Completions.
     if "glm-" in lower and not lower.startswith("system.ai."):
         return False
     if lower.startswith("system.ai.") and any(
@@ -1739,6 +1733,7 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        preserve_model_ids: bool = False,
     ) -> None:
         """Create a PiExecutor.
 
@@ -1747,6 +1742,7 @@ class PiExecutor(Executor):
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
         :param model: Override the model name, e.g. ``"gateway-model-id"``.
+        :param preserve_model_ids: Keep exact IDs from a saved inference profile.
         :param pi_path: Absolute path to a ``pi`` CLI binary.  When ``None``
             the executor searches ``PATH``.
         :param gateway: When ``True``, write a ``models.json`` pointing Pi
@@ -1807,6 +1803,7 @@ class PiExecutor(Executor):
         self._cwd = cwd
         self._os_env_spec = os_env
         self._model_override = model
+        self._preserve_model_ids = preserve_model_ids
         self._gateway = gateway
         self._databricks_profile = databricks_profile
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
@@ -2035,7 +2032,7 @@ class PiExecutor(Executor):
             return model_id
         # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
         # by the direct Anthropic API but not by the Databricks AI Gateway.
-        if model and self._gateway:
+        if model and self._gateway and not self._preserve_model_ids:
             model = re.sub(r"\[.*?\]$", "", model)
         return model
 

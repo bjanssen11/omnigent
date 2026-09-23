@@ -28,13 +28,7 @@ _HTTP_TIMEOUT_S = 10.0
 
 
 def resolve_model_services_parent(override: str | None = None) -> str:
-    """Unity Catalog parent to list Databricks model-services under.
-
-    Priority: an explicit ``override`` (from provider config), then the
-    ``OMNIGENT_DATABRICKS_MODEL_SERVICES_PARENT`` env var, then the default
-    ``schemas/system.ai``. A workspace whose gateway model-services live in a
-    non-``system.ai`` schema opts in without changing stock behaviour.
-    """
+    """Unity Catalog parent to list Databricks model-services under."""
     if override and override.strip():
         return override.strip()
     env = os.environ.get(_MODEL_SERVICES_PARENT_ENV_VAR, "").strip()

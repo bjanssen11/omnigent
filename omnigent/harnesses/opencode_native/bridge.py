@@ -193,14 +193,7 @@ export const OmnigentPolicyPlugin = async () => ({
 # Filename of the opencode plugin that refreshes gateway bearer tokens.
 _GATEWAY_AUTH_PLUGIN_FILE = "omnigent-gateway-auth.js"
 
-# Per-request bearer refresh for config-gateway providers whose family
-# authenticates with an ``auth_command``. Uses the ``chat.headers`` hook from
-# ``@opencode-ai/plugin`` (the ``server`` export API) to inject a fresh
-# ``Authorization: Bearer`` on every request for providers whose id appears in
-# ``OMNIGENT_OPENCODE_AUTH_COMMAND``. The per-provider commands arrive as that
-# env var (JSON map of provider id → shell command) stamped on the opencode
-# serve process. The ``chat.headers`` hook handles all providers in one plugin
-# and overrides whatever the AI SDK factory would otherwise send.
+# Refresh auth_command credentials for each gateway request.
 _GATEWAY_AUTH_PLUGIN = r"""
 // Omnigent gateway bearer refresh for opencode-native (generated; do not edit).
 // Uses the @opencode-ai/plugin chat.headers hook to inject a fresh
@@ -238,26 +231,12 @@ export const server = async () => ({
 
 
 def build_gateway_auth_plugin_js() -> str:
-    """Render the gateway-auth plugin source.
-
-    Provider ids are resolved at runtime from ``OMNIGENT_OPENCODE_AUTH_COMMAND``.
-
-    :returns: JS module source using the ``@opencode-ai/plugin`` server API.
-    """
+    """Render the gateway-auth plugin source."""
     return _GATEWAY_AUTH_PLUGIN
 
 
 def write_opencode_gateway_auth_plugin(bridge_dir: Path) -> Path:
-    """Write the gateway-auth refresh plugin into *bridge_dir*; return its path.
-
-    The runner registers the returned path in the synthesized ``opencode.json``
-    ``plugin`` field and stamps ``OMNIGENT_OPENCODE_AUTH_COMMAND`` on the
-    ``opencode serve`` process. Overwritten each launch so a code update ships
-    without stale plugin files.
-
-    :param bridge_dir: OpenCode-native bridge directory.
-    :returns: The written plugin file path (absolute).
-    """
+    """Write the gateway-auth refresh plugin into *bridge_dir*; return its path."""
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = bridge_dir / _GATEWAY_AUTH_PLUGIN_FILE
     fd, tmp_name = tempfile.mkstemp(prefix=f"{_GATEWAY_AUTH_PLUGIN_FILE}.", dir=str(bridge_dir))
@@ -412,13 +391,14 @@ def prepare_bridge_dir(bridge_id: str) -> Path:
     :returns: Prepared absolute bridge directory.
     """
     bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(bridge_dir, 0o700)
-    xdg_data_home_for_bridge_dir(bridge_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
-    xdg_config_home_for_bridge_dir(bridge_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
-    # Owner-pid marker for the periodic dead-owner prune; refreshed every
-    # turn so it always names the current runner. See native_bridge_common.
-    native_bridge_common.write_owner_pid_marker(bridge_dir)
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(bridge_dir, 0o700)
+        xdg_data_home_for_bridge_dir(bridge_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
+        xdg_config_home_for_bridge_dir(bridge_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Owner-pid marker for the periodic dead-owner prune; refreshed every
+        # turn so it always names the current runner. See native_bridge_common.
+        native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
 
 
@@ -427,7 +407,7 @@ def prune_orphaned_bridge_dirs() -> int:
     Remove opencode-native bridge dirs whose owner process is provably dead.
 
     Delegates to the shared sweep against this harness's bridge root; the
-    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
     at startup to reclaim dirs leaked by a prior runner that died without
     running the explicit delete path.
 

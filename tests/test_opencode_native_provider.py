@@ -43,14 +43,7 @@ def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _no_gateway_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Disable live gateway discovery by default.
-
-    Discovery mints a bearer by running the family ``auth_command`` and calls
-    the workspace model-services API. Tests that don't opt in should neither
-    shell out nor hit the network, so stub the token mint to ``None`` (which
-    makes discovery a no-op and the resolver keeps the static config tiers).
-    Discovery tests re-patch the mint + fetch to exercise the live path.
-    """
+    """Disable live gateway discovery by default."""
     monkeypatch.setattr(
         "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
         lambda families: None,
@@ -852,8 +845,6 @@ def test_managed_connect_opencode_config_rejects_untrusted_base_url(
     assert managed_connect_opencode_config(tmp_path / "session-xdg") is None
 
 
-# --- Config-driven gateway provider synthesis (Bedrock/OpenAI+Anthropic parity) ---
-
 _GATEWAY_CONFIG_YAML = """
 providers:
   gateway:
@@ -892,8 +883,6 @@ def test_config_gateway_synthesizes_both_family_blocks(
 
     anthropic = providers["gateway-anthropic"]
     assert anthropic["npm"] == "@ai-sdk/anthropic"
-    # @ai-sdk/anthropic posts to {baseURL}/messages, so the base is normalized to
-    # carry the /v1 the gateway's Anthropic surface expects.
     assert anthropic["options"]["baseURL"] == "https://ws.example.com/ai-gateway/anthropic/v1"
     assert anthropic["models"] == {
         "eng_dev.ai_gateway.omni-claude": {"name": "eng_dev.ai_gateway.omni-claude"}
@@ -906,7 +895,6 @@ def test_config_gateway_synthesizes_both_family_blocks(
         "eng_dev.ai_gateway.omni-gpt": {"name": "eng_dev.ai_gateway.omni-gpt"}
     }
 
-    # Anthropic is preferred as the pinned default.
     assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude"
 
 
@@ -934,13 +922,11 @@ providers:
 
     assert resolution is not None
     models = resolution.config["provider"]["gateway-anthropic"]["models"]
-    # Every distinct tier id is offered (default == high is not duplicated).
     assert set(models) == {
         "eng_dev.ai_gateway.omni-claude-high",
         "eng_dev.ai_gateway.omni-claude-med",
         "eng_dev.ai_gateway.omni-claude-low",
     }
-    # The pinned default is still the family default, not a tier.
     assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high"
 
 
@@ -958,8 +944,6 @@ def _fake_model_service(
     )
 
 
-# A config whose static openai tiers include GLM/Grok (which the workspace no
-# longer grants EXECUTE on); discovery must drop them.
 _GATEWAY_CONFIG_WITH_REVOKED_YAML = """
 providers:
   gateway:
@@ -984,13 +968,7 @@ providers:
 def test_config_gateway_groups_effort_capable_models_via_discovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Discovery groups effort-capable models into a Responses block, GLM into chat.
-
-    GPT + Kimi advertise the Responses wire → they land in the ``@ai-sdk/openai``
-    Responses block and are marked ``reasoning: true``. A GLM alias advertises
-    Responses too (a catalog bug) but the gateway 400s on it, so pi's rule keeps
-    it on the ``@ai-sdk/openai-compatible`` chat block, un-reasoned.
-    """
+    """Discovery groups effort-capable models into a Responses block, GLM into chat."""
     _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_WITH_REVOKED_YAML)
     monkeypatch.setattr(
         "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
@@ -1005,8 +983,6 @@ def test_config_gateway_groups_effort_capable_models_via_discovery(
             _fake_model_service("eng_dev.ai_gateway.omni-gpt-high", responses=True),
             _fake_model_service("eng_dev.ai_gateway.omni-gpt-med", responses=True),
             _fake_model_service("eng_dev.ai_gateway.kimi-k3", responses=True),
-            # GLM advertises Responses in the catalog, but the gateway rejects it
-            # → must stay on the chat block despite the responses=True flag.
             _fake_model_service("eng_dev.ai_gateway.glm-4-7", responses=True),
         )
 
@@ -1020,7 +996,6 @@ def test_config_gateway_groups_effort_capable_models_via_discovery(
     providers = resolution.config["provider"]
     assert set(providers["gateway-anthropic"]["models"]) == {"eng_dev.ai_gateway.omni-claude-high"}
 
-    # Effort-capable GPT + Kimi → the @ai-sdk/openai Responses block, reasoning on.
     responses = providers["gateway-openai-responses"]
     assert responses["npm"] == "@ai-sdk/openai"
     assert set(responses["models"]) == {
@@ -1029,16 +1004,13 @@ def test_config_gateway_groups_effort_capable_models_via_discovery(
         "eng_dev.ai_gateway.kimi-k3",
     }
     assert all(m.get("reasoning") is True for m in responses["models"].values())
-    # Its auth_command is registered so the plugin mints a Bearer for it too.
     assert "gateway-openai-responses" in resolution.auth_commands
 
-    # GLM stays on the chat block (no Responses), and is not marked reasoning.
     chat = providers["gateway-openai"]
     assert chat["npm"] == "@ai-sdk/openai-compatible"
     assert set(chat["models"]) == {"eng_dev.ai_gateway.glm-4-7"}
     assert "reasoning" not in chat["models"]["eng_dev.ai_gateway.glm-4-7"]
 
-    # The revoked grok never appears (discovery didn't return it).
     all_ids = set().union(*(set(p["models"]) for p in providers.values()))
     assert "eng_dev.ai_gateway.grok-4-6" not in all_ids
 
@@ -1075,7 +1047,6 @@ def test_config_gateway_applies_and_clamps_reasoning_effort(
 
     assert resolution is not None
     models = resolution.config["provider"]["gateway-openai-responses"]["models"]
-    # GPT advertises max → gets max; Kimi tops out at high → clamped.
     assert models["eng_dev.ai_gateway.omni-gpt-high"]["options"]["reasoningEffort"] == "max"
     assert models["eng_dev.ai_gateway.kimi-k3"]["options"]["reasoningEffort"] == "high"
 
@@ -1107,7 +1078,6 @@ def test_config_gateway_omits_reasoning_effort_when_unset(
         model = resolution.config["provider"]["gateway-openai-responses"]["models"][
             "eng_dev.ai_gateway.omni-gpt-high"
         ]
-        # Still reasoning-capable, but no explicit effort forced.
         assert model["reasoning"] is True
         assert "options" not in model
 
@@ -1129,14 +1099,12 @@ def test_config_gateway_falls_back_to_static_when_discovery_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With no discovery token, the resolver keeps the static config tiers."""
-    # The autouse fixture already stubs the token mint to None.
     _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_WITH_REVOKED_YAML)
 
     resolution = resolve_config_gateway_providers()
 
     assert resolution is not None
     openai_models = set(resolution.config["provider"]["gateway-openai"]["models"])
-    # Static fallback keeps whatever config declares, GLM/Grok included.
     assert "eng_dev.ai_gateway.glm-4-7" in openai_models
     assert "eng_dev.ai_gateway.grok-4-6" in openai_models
 
@@ -1172,17 +1140,11 @@ def test_gateway_model_family_classification() -> None:
     def fam(model_id: str, *, responses: bool = False) -> str | None:
         return _gateway_model_family(_fake_model_service(model_id, responses=responses))
 
-    # Claude → anthropic group.
     assert fam("eng_dev.ai_gateway.omni-claude-high") == "anthropic"
-    # Effort-capable GPT + Kimi (Responses-wire) → the reasoning group.
     assert fam("eng_dev.ai_gateway.omni-gpt-high", responses=True) == "openai-responses"
     assert fam("eng_dev.ai_gateway.kimi-k3", responses=True) == "openai-responses"
-    # GLM aliases → the chat group even when the catalog (wrongly) advertises
-    # Responses, because the gateway 400s on GLM over /responses.
     assert fam("eng_dev.ai_gateway.glm-4-7", responses=True) == "openai"
-    # A non-reasoning, chat-only model → the chat group.
     assert fam("eng_dev.ai_gateway.grok-4-6") == "openai"
-    # Gemini/Llama system.ai ids (mlflow-only) and pi-unsupported ids → dropped.
     assert fam("system.ai.gemini-2-5-flash") is None
     assert fam("system.ai.llama-4") is None
 
@@ -1206,7 +1168,6 @@ def test_derive_model_services_parent_and_host() -> None:
     ]
     assert _derive_model_services_parent(families) == "schemas/eng_dev.ai_gateway"
     assert _gateway_host_from_base_url(families[0][2].base_url) == "https://ws.example.com"
-    # A bare (non-three-part) model id disables discovery.
     bare = [("openai", "npm", types.SimpleNamespace(models={"default": "gpt-4"}, base_url="x"))]
     assert _derive_model_services_parent(bare) is None
 
@@ -1220,7 +1181,6 @@ def test_disable_autoloaded_free_providers_hides_opencode_zen() -> None:
     }
     disable_autoloaded_free_providers(config)
     assert config["disabled_providers"] == ["opencode"]
-    # It leaves the synthesized providers/model untouched.
     assert "gateway-anthropic" in config["provider"]
     assert config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high"
 
@@ -1247,12 +1207,7 @@ def test_disable_autoloaded_free_providers_survives_writer(tmp_path: Path) -> No
 def test_config_gateway_auth_command_writes_placeholder_key_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An auth_command family gets only the factory placeholder, never a minted token.
-
-    The AI SDK factories refuse to construct without an apiKey, so a fixed
-    placeholder is written; the real bearer is injected per request by the
-    gateway-auth plugin.
-    """
+    """An auth_command family gets only the factory placeholder, never a minted token."""
     _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
 
     resolution = resolve_config_gateway_providers()
@@ -1260,7 +1215,6 @@ def test_config_gateway_auth_command_writes_placeholder_key_only(
     assert resolution is not None
     for block in resolution.config["provider"].values():
         assert block["options"]["apiKey"] == "omnigent-gateway-auth-plugin"
-    # Both families' commands are surfaced for the refresh plugin.
     assert resolution.auth_commands == {
         "gateway-anthropic": "databricks-token --host ws.example.com",
         "gateway-openai": "databricks-token --host ws.example.com",
@@ -1319,9 +1273,30 @@ def test_config_gateway_override_pins_the_family_that_lists_it(
     assert resolution is not None
     assert resolution.config["model"] == "gateway-openai/eng_dev.ai_gateway.omni-gpt"
     providers = resolution.config["provider"]
-    # The GPT id must not leak into the Anthropic Messages surface's models.
     assert "eng_dev.ai_gateway.omni-gpt" not in providers["gateway-anthropic"]["models"]
     assert "eng_dev.ai_gateway.omni-claude" in providers["gateway-anthropic"]["models"]
+
+
+@pytest.mark.parametrize("provider", ["gateway-anthropic", "gateway-openai"])
+def test_config_gateway_qualified_override_is_not_prefixed_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
+) -> None:
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
+    model = "eng_dev.ai_gateway.selected-model"
+
+    resolution = resolve_config_gateway_providers(model_override=f"{provider}/{model}[1m]")
+
+    assert resolution is not None
+    assert resolution.config["model"] == f"{provider}/{model}"
+    assert model in resolution.config["provider"][provider]["models"]
+
+
+def test_config_gateway_preserves_override_for_another_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
+
+    assert resolve_config_gateway_providers(model_override="anthropic/claude-sonnet-4-6") is None
 
 
 def test_config_gateway_unlisted_override_falls_back_to_first_family(
@@ -1387,13 +1362,9 @@ def test_gateway_auth_plugin_injects_bearer_per_request() -> None:
     """The generated plugin hooks chat.headers and reads the provider id it carries."""
     js = build_gateway_auth_plugin_js()
 
-    # Reads the per-provider command map from the stamped env.
     assert "OMNIGENT_OPENCODE_AUTH_COMMAND" in js
-    # Injects the minted Bearer on every request via the chat.headers hook.
     assert '"chat.headers"' in js
     assert 'output.headers["Authorization"] = "Bearer " + token' in js
-    # The hook input's provider record exposes id directly; reading only a
-    # nested .info.id silently skips every provider (no bearer ever injected).
     assert "input?.provider?.id" in js
 
 

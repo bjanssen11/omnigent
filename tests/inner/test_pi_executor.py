@@ -561,7 +561,6 @@ class TestBuildModelsJson(unittest.TestCase):
         )
         p = result["providers"]
         # The ucode ``openai`` value is the Codex Responses gateway; GPT and the
-        # catch-all use the OpenAI-compatible gateway surface, claude keeps its gateway.
         self.assertEqual(
             p["databricks"]["baseUrl"],
             "https://host.example.com/ai-gateway/openai/v1",
