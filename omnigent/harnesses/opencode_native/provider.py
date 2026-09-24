@@ -283,7 +283,10 @@ def _gateway_model_family(model: model_catalog.ModelEntry) -> str | None:
     from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 
     name_lower = model.id.lower()
-    if "claude" in name_lower:
+    # Wire API is authoritative; name inference is a fallback for services
+    # whose catalog metadata is incomplete (e.g. omni-sonnet-high has no
+    # "claude" in the alias but its wire_apis carry ANTHROPIC_MESSAGES).
+    if ModelWireAPI.ANTHROPIC_MESSAGES in model.metadata.wire_apis or "claude" in name_lower:
         return ANTHROPIC_FAMILY
     if unsupported_in_pi(name_lower):
         return None

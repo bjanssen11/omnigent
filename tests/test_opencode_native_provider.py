@@ -1401,6 +1401,8 @@ providers:
 
 def test_gateway_model_family_classification() -> None:
     """Discovered model-services route to opencode's three groups like pi."""
+    from omnigent.models.model_metadata import ModelWireAPI
+
     from omnigent.harnesses.opencode_native.provider import _gateway_model_family
 
     def fam(model_id: str, *, responses: bool = False) -> str | None:
@@ -1413,6 +1415,16 @@ def test_gateway_model_family_classification() -> None:
     assert fam("eng_dev.ai_gateway.grok-4-6") == "openai"
     assert fam("system.ai.gemini-2-5-flash") is None
     assert fam("system.ai.llama-4") is None
+    # An alias with no "claude" in the name but ANTHROPIC_MESSAGES in wire_apis
+    # must route to the anthropic group (wire_api takes precedence over name).
+    anthropic_by_wire = types.SimpleNamespace(
+        id="eng_dev.ai_gateway.omni-sonnet-high",
+        metadata=types.SimpleNamespace(
+            wire_apis=frozenset({ModelWireAPI.ANTHROPIC_MESSAGES}),
+            reasoning=None,
+        ),
+    )
+    assert _gateway_model_family(anthropic_by_wire) == "anthropic"
 
 
 def test_derive_model_services_parent_and_host() -> None:
@@ -1436,6 +1448,63 @@ def test_derive_model_services_parent_and_host() -> None:
     assert _gateway_host_from_base_url(families[0][2].base_url) == "https://ws.example.com"
     bare = [("openai", "npm", types.SimpleNamespace(models={"default": "gpt-4"}, base_url="x"))]
     assert _derive_model_services_parent(bare) is None
+
+
+_GATEWAY_CONFIG_TWO_SCHEMAS_YAML = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.anth_gw.omni-claude-high
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: eng_dev.openai_gw.omni-gpt-high
+"""
+
+
+def test_discover_gateway_models_per_schema_partitions_family_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each family discovers from its own Unity-Catalog schema so models in one
+    family's schema are not missed when both families share a workspace host.
+
+    Regression: previously a single (host, parent) pair was derived from all
+    families, so if Anthropic's schema was used for the entire listing the
+    OpenAI family's models (in a different schema) were never fetched.
+    """
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_TWO_SCHEMAS_YAML)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _fetch_by_schema(host: str, token: str, *, model_services_parent: str | None = None):
+        # Each schema contains only that family's models; verify separate calls.
+        if model_services_parent == "schemas/eng_dev.anth_gw":
+            return (_fake_model_service("eng_dev.anth_gw.omni-claude-high"),)
+        if model_services_parent == "schemas/eng_dev.openai_gw":
+            return (_fake_model_service("eng_dev.openai_gw.omni-gpt-high", responses=True),)
+        return ()
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
+        _fetch_by_schema,
+    )
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    providers = resolution.config["provider"]
+    # Both schemas reached: Anthropic models from anth_gw, GPT from openai_gw.
+    assert "eng_dev.anth_gw.omni-claude-high" in providers["gateway-anthropic"]["models"]
+    assert "eng_dev.openai_gw.omni-gpt-high" in providers["gateway-openai-responses"]["models"]
 
 
 def test_disable_autoloaded_free_providers_hides_opencode_zen() -> None:
