@@ -1299,18 +1299,73 @@ def test_config_gateway_preserves_override_for_another_provider(
     assert resolve_config_gateway_providers(model_override="anthropic/claude-sonnet-4-6") is None
 
 
-def test_config_gateway_unlisted_override_falls_back_to_first_family(
+def test_config_gateway_unlisted_override_declines_when_ambiguous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An override no family lists pins the first family (anthropic preferred)."""
+    """With several families, an override no family lists is declined, not guessed.
+
+    Pinning it to the first family could route (say) an Anthropic id onto the
+    OpenAI endpoint, so the resolver returns ``None`` and lets the
+    databricks/managed paths resolve it.
+    """
     _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
+
+    assert resolve_config_gateway_providers(model_override="an-id-no-family-lists") is None
+
+
+def test_config_gateway_unlisted_override_pins_the_sole_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a single family the target is unambiguous, so an override still pins."""
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
 
     resolution = resolve_config_gateway_providers(model_override="an-id-no-family-lists")
 
     assert resolution is not None
     assert resolution.config["model"] == "gateway-anthropic/an-id-no-family-lists"
-    anthropic_models = resolution.config["provider"]["gateway-anthropic"]["models"]
-    assert "an-id-no-family-lists" in anthropic_models
+    assert "an-id-no-family-lists" in resolution.config["provider"]["gateway-anthropic"]["models"]
+
+
+def test_config_gateway_slash_model_id_kept_whole_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slash-bearing model id (e.g. ``zai-org/GLM-4.7``) is not split on ``/``.
+
+    Only a synthesized gateway provider id (``gateway-openai``) qualifies an
+    override; any other slash belongs to the model id itself, so the whole
+    string is matched against the family and routed through the gateway rather
+    than bypassing it.
+    """
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: zai-org/GLM-4.7
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers(model_override="zai-org/GLM-4.7")
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gateway-openai/zai-org/GLM-4.7"
+    assert "zai-org/GLM-4.7" in resolution.config["provider"]["gateway-openai"]["models"]
 
 
 def test_config_gateway_skips_openai_responses_wire(
@@ -1356,6 +1411,46 @@ def test_config_gateway_returns_none_without_config(
     """No config.yaml at all → None."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     assert resolve_config_gateway_providers() is None
+
+
+def test_gateway_discovery_binds_token_to_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Discovery mints its token only from families sharing the discovery origin.
+
+    The discovery host comes from the first family; a later family on a different
+    origin must never have its credential sent to the first family's host, so the
+    minter only ever sees same-origin families.
+    """
+    from omnigent.harnesses.opencode_native import provider as prov
+    from omnigent.onboarding.provider_config import FamilyConfig
+
+    first = FamilyConfig(
+        base_url="https://ws-a.example.com/ai-gateway/anthropic",
+        auth_command="mint-a",
+        models={"default": "eng_dev.ai_gateway.omni-claude"},
+    )
+    other_origin = FamilyConfig(
+        base_url="https://ws-b.example.com/ai-gateway/openai/v1",
+        auth_command="mint-b",
+        wire_api="chat",
+        models={"default": "eng_dev.ai_gateway.omni-gpt"},
+    )
+    families = [
+        ("anthropic", "@ai-sdk/anthropic", first),
+        ("openai", "@ai-sdk/openai-compatible", other_origin),
+    ]
+
+    seen_hosts: list[str | None] = []
+
+    def _capture(fams: list) -> None:
+        seen_hosts.extend(prov._gateway_host_from_base_url(f[2].base_url) for f in fams)
+        return
+
+    monkeypatch.setattr(prov, "_mint_gateway_discovery_token", _capture)
+
+    prov._discover_gateway_models(families)
+
+    # host = first family = ws-a; the ws-b credential never reaches the minter.
+    assert seen_hosts == ["https://ws-a.example.com"]
 
 
 def test_gateway_auth_plugin_injects_bearer_per_request() -> None:

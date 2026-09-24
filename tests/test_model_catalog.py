@@ -2101,6 +2101,78 @@ def test_gateway_model_service_inherits_limits_from_routing_target(
     assert entries[0].metadata.max_output_tokens == 128_000
 
 
+def test_gateway_model_service_omits_limits_when_route_partly_uncatalogued(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A weighted route with an uncatalogued destination advertises no limits.
+
+    A single unknown destination could hide a smaller ceiling, so each limit is
+    left unset rather than inheriting the one catalogued destination's maximum.
+    """
+    known = "us.anthropic.claude-opus-4-8"
+    monkeypatch.setattr(
+        model_catalog,
+        "catalog_model_entries",
+        lambda provider: (
+            (
+                ModelEntry(
+                    id=known,
+                    family="claude",
+                    metadata=ModelMetadata(context_window=1_000_000, max_output_tokens=128_000),
+                ),
+            )
+            if provider == "bedrock"
+            else ()
+        ),
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={
+                    "model_services": [
+                        {"name": "model-services/eng_dev.ai_gateway.omni-claude-mix"}
+                    ]
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "supported_api_types": ["anthropic/v1/messages"],
+                "config": {
+                    "routing": {
+                        "destinations": [
+                            {
+                                "external_model_config": {"target": {"model": known}},
+                                "traffic_percentage": 50,
+                            },
+                            {
+                                "external_model_config": {
+                                    "target": {"model": "us.anthropic.uncatalogued-model"}
+                                },
+                                "traffic_percentage": 50,
+                            },
+                        ]
+                    }
+                },
+            },
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert len(entries) == 1
+    assert entries[0].metadata.context_window is None
+    assert entries[0].metadata.max_output_tokens is None
+
+
 # ── Generic ACP curation (acp_curated_models) ───────────────────────────────
 
 

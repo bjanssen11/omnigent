@@ -321,7 +321,14 @@ def _discover_gateway_models(
     host = _gateway_host_from_base_url(families[0][2].base_url)
     if not parent or not host:
         return {}, {}
-    token = _mint_gateway_discovery_token(families)
+    # Mint the discovery token only from families sharing the discovery origin,
+    # so one workspace's credential is never sent to a different host.
+    same_origin = [
+        family_spec
+        for family_spec in families
+        if _gateway_host_from_base_url(family_spec[2].base_url) == host
+    ]
+    token = _mint_gateway_discovery_token(same_origin)
     if not token:
         return {}, {}
     try:
@@ -390,10 +397,11 @@ def resolve_config_gateway_providers(
         # subscription / databricks / cli-config / bedrock: not driveable here.
         return None
 
+    # A gateway-qualified selection (``<provider>/<model>``) is split only once
+    # the synthesized provider ids are known (below); a bare id keeps any slash
+    # it carries (e.g. ``zai-org/GLM-4.7``).
     override = _strip_model_suffix(model_override) if model_override else None
     override_provider: str | None = None
-    if override and "/" in override:
-        override_provider, override = override.split("/", 1)
     providers: dict[str, object] = {}
     auth_commands: dict[str, str] = {}
 
@@ -466,6 +474,21 @@ def resolve_config_gateway_providers(
             return list(family.models.values())
         return []
 
+    # Interpret a slash in the override:
+    #  * ``<gateway-provider>/<model>`` (a synthesized id) → route within that
+    #    provider (e.g. a saved qualified ``opencode_model``);
+    #  * ``<native-provider>/<model>`` (``anthropic`` / ``openai``) → an explicit
+    #    native selection that is not ours to reroute — decline;
+    #  * anything else (``zai-org/GLM-4.7``) → the slash is part of the model id,
+    #    so keep the whole string as a bare id.
+    known_provider_ids = {provider_id for _gk, provider_id, *_rest in group_specs}
+    if override and "/" in override:
+        maybe_provider, maybe_model = override.split("/", 1)
+        if maybe_provider in known_provider_ids:
+            override_provider, override = maybe_provider, maybe_model
+        elif maybe_provider in (ANTHROPIC_FAMILY, OPENAI_FAMILY):
+            return None
+
     override_group: str | None = None
     if override_provider is not None:
         override_group = next(
@@ -488,7 +511,23 @@ def resolve_config_gateway_providers(
                 override_group = group_key
                 break
         if override_group is None:
-            override_group = group_specs[0][0]
+            # The override matches no family's served/default model. Route it by
+            # the family its name implies (a Claude id to anthropic, a GPT/GLM id
+            # to openai); with a single family the target is unambiguous. When the
+            # name gives no signal and several families exist, guessing risks
+            # routing it to the wrong surface (e.g. an Anthropic id onto the
+            # OpenAI endpoint), so decline and let the databricks/managed paths
+            # resolve it.
+            available = {group_key for group_key, *_rest in group_specs}
+            name = override.lower()
+            if "claude" in name and ANTHROPIC_FAMILY in available:
+                override_group = ANTHROPIC_FAMILY
+            elif ("gpt" in name or "glm" in name) and OPENAI_FAMILY in available:
+                override_group = OPENAI_FAMILY
+            elif len(group_specs) == 1:
+                override_group = group_specs[0][0]
+            else:
+                return None
 
     override_pin: str | None = None
     anthropic_default_pin: str | None = None

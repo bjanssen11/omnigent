@@ -1655,23 +1655,24 @@ def fetch_databricks_model_service_entries(
                     "could not load Bedrock metadata for model-service routes", exc_info=True
                 )
                 bedrock_metadata = {}
-        matched = [
-            bedrock_metadata[target.lower()]
-            for target in targets
-            if target.lower() in bedrock_metadata
-        ]
+        # A weighted route is only as large as its smallest destination, so a
+        # limit is trustworthy only when every destination supplies it. A single
+        # uncatalogued (or limit-less) destination could hide a smaller ceiling,
+        # so leave that limit unset rather than advertise an unverified maximum.
+        metadatas = [bedrock_metadata.get(target.lower()) for target in targets]
         context_windows = [
-            metadata.context_window for metadata in matched if metadata.context_window
+            m.context_window for m in metadatas if m is not None and m.context_window
         ]
         output_limits = [
-            metadata.max_output_tokens for metadata in matched if metadata.max_output_tokens
+            m.max_output_tokens for m in metadatas if m is not None and m.max_output_tokens
         ]
-        if not context_windows and not output_limits:
+        context_window = min(context_windows) if len(context_windows) == len(targets) else None
+        max_output_tokens = min(output_limits) if len(output_limits) == len(targets) else None
+        if context_window is None and max_output_tokens is None:
             return None
-        # Weighted routes advertise limits shared by every destination.
         return ModelMetadata(
-            context_window=min(context_windows) if context_windows else None,
-            max_output_tokens=min(output_limits) if output_limits else None,
+            context_window=context_window,
+            max_output_tokens=max_output_tokens,
         )
 
     models: list[ModelEntry] = []

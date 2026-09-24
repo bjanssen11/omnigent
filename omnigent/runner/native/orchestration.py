@@ -1525,10 +1525,14 @@ async def _auto_create_opencode_terminal(
         auth=opencode_spec.executor.auth if opencode_spec is not None else None,
     )
 
-    # Session binding precedes the configured and managed fallbacks.
+    # Session binding precedes the configured and managed fallbacks. The
+    # resolver does synchronous model-service discovery (HTTP) and can shell out
+    # to an auth command, so offload it like the neighboring gateway resolver to
+    # keep the runner's event loop responsive.
     config_gateway = None
     if gateway is None:
-        config_gateway = resolve_config_gateway_providers(
+        config_gateway = await asyncio.to_thread(
+            resolve_config_gateway_providers,
             model_override=model_override,
             reasoning_effort=launch_config.reasoning_effort,
         )
