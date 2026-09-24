@@ -343,38 +343,11 @@ def _discover_gateway_models(
     if not families:
         return {}, {}, set()
 
-    # Fetch each distinct origin's catalog once, minting only from same-origin
-    # families so one workspace's credential never reaches another host.
-    origin_catalogs: dict[str, list[model_catalog.ModelEntry]] = {}
-    for _name, _npm, family in families:
-        host = _gateway_host_from_base_url(family.base_url)
-        if not host or host in origin_catalogs:
-            continue
-        same_origin = [
-            spec for spec in families if _gateway_host_from_base_url(spec[2].base_url) == host
-        ]
-        parent = _derive_model_services_parent(same_origin)
-        if not parent:
-            continue
-        token = _mint_gateway_discovery_token(same_origin)
-        if not token:
-            continue
-        try:
-            entries = model_catalog.fetch_databricks_model_service_entries(
-                host, token, model_services_parent=parent
-            )
-        except Exception:  # noqa: BLE001 - discovery failure falls back to static tiers.
-            _logger.info(
-                "opencode gateway discovery: model-service listing failed for %s; "
-                "using config tiers for its families.",
-                host,
-                exc_info=True,
-            )
-            continue
-        origin_catalogs[host] = list(entries)
-
-    # Attribute each origin's catalog only to the families on that origin: a
-    # group is authoritative only when its own family's origin was fetched.
+    # Discover each family from its OWN (origin, Unity-Catalog schema): two
+    # families can share a workspace host but list under different parents, so a
+    # single derived schema would attribute one family's catalog to the other.
+    # Cache per (origin, parent) so families that do share both fetch once, and
+    # mint only from same-origin families so no credential crosses hosts.
     buckets: dict[str, list[str]] = {
         ANTHROPIC_FAMILY: [],
         OPENAI_FAMILY: [],
@@ -382,17 +355,42 @@ def _discover_gateway_models(
     }
     efforts: dict[str, tuple[str, ...]] = {}
     discovered_groups: set[str] = set()
-    for name, _npm, family in families:
+    catalogs: dict[tuple[str, str], list[model_catalog.ModelEntry]] = {}
+    for name, npm, family in families:
         host = _gateway_host_from_base_url(family.base_url)
-        if host is None or host not in origin_catalogs:
+        parent = _derive_model_services_parent([(name, npm, family)])
+        if not host or not parent:
             continue
+        key = (host, parent)
+        if key not in catalogs:
+            same_origin = [
+                spec for spec in families if _gateway_host_from_base_url(spec[2].base_url) == host
+            ]
+            token = _mint_gateway_discovery_token(same_origin)
+            if not token:
+                continue
+            try:
+                entries = model_catalog.fetch_databricks_model_service_entries(
+                    host, token, model_services_parent=parent
+                )
+            except Exception:  # noqa: BLE001 - discovery failure falls back to static tiers.
+                _logger.info(
+                    "opencode gateway discovery: model-service listing failed for %s (%s); "
+                    "using config tiers for its family.",
+                    host,
+                    parent,
+                    exc_info=True,
+                )
+                continue
+            catalogs[key] = list(entries)
+        # This family's own schema was reached, so its groups are authoritative.
         allowed = (
             {ANTHROPIC_FAMILY}
             if name == ANTHROPIC_FAMILY
             else {OPENAI_FAMILY, _OPENAI_RESPONSES_GROUP}
         )
         discovered_groups |= allowed
-        for model in origin_catalogs[host]:
+        for model in catalogs[key]:
             group = _gateway_model_family(model)
             if group not in buckets or group not in allowed:
                 continue
@@ -576,16 +574,27 @@ def resolve_config_gateway_providers(
         if override_group is None:
             return None
     elif override and group_specs:
-        # 1) Exact match against a family's default/served models — this claims a
-        #    legitimate slash-bearing gateway id such as ``zai-org/GLM-4.7``.
+        # 1) Prefer a group whose DISCOVERED catalog lists the override: discovery
+        #    knows each model's real wire API, so an explicitly selected Responses
+        #    model lands on the Responses provider (with its reasoning effort),
+        #    not the chat group that merely carries it as a configured default.
         for group_key, _pid, _npm, family, _reasoning in group_specs:
-            candidates = (
-                entry.family_default_model(default_source[group_key]),
-                *_group_model_ids(group_key, family),
-            )
-            if any(c and _strip_model_suffix(c) == override for c in candidates):
+            if group_key in discovered_groups and any(
+                _strip_model_suffix(m) == override for m in _group_model_ids(group_key, family)
+            ):
                 override_group = group_key
                 break
+        # 2) Otherwise exact-match a family's default/served models — this claims a
+        #    legitimate slash-bearing gateway id such as ``zai-org/GLM-4.7``.
+        if override_group is None:
+            for group_key, _pid, _npm, family, _reasoning in group_specs:
+                candidates = (
+                    entry.family_default_model(default_source[group_key]),
+                    *_group_model_ids(group_key, family),
+                )
+                if any(c and _strip_model_suffix(c) == override for c in candidates):
+                    override_group = group_key
+                    break
         if override_group is None:
             override_group = _match_override_family(override, group_specs)
             if override_group is None:
@@ -650,8 +659,14 @@ def resolve_config_gateway_providers(
 
     if not providers:
         return None
-    # Prefer an override, then family defaults, then the first model.
-    pinned = override_pin or anthropic_default_pin or openai_default_pin or first_model_pin
+    # Prefer an override; otherwise pin the family the config marks this provider
+    # the default FOR (an ``default: openai`` entry launches its GPT default, not
+    # Claude); then the other family's default, then the first model.
+    if OPENAI_FAMILY in entry.default_families and ANTHROPIC_FAMILY not in entry.default_families:
+        family_default_pin = openai_default_pin or anthropic_default_pin
+    else:
+        family_default_pin = anthropic_default_pin or openai_default_pin
+    pinned = override_pin or family_default_pin or first_model_pin
     if pinned is None:
         return None
 

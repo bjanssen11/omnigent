@@ -1133,6 +1133,133 @@ def test_discovery_falls_back_to_static_when_listing_errors(
     assert "eng_dev.ai_gateway.glm-4-7" in openai_models
 
 
+def test_config_gateway_explicit_responses_default_routes_to_responses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicitly selecting a discovered Responses model uses the Responses provider.
+
+    Discovery knows the model's wire API, so the explicit selection must land on
+    the Responses provider (keeping its reasoning effort), not the chat group that
+    merely carries it as the configured default — and not be duplicated there.
+    """
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_WITH_REVOKED_YAML)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+        return (
+            _fake_model_service(
+                "eng_dev.ai_gateway.omni-gpt-high", responses=True, efforts=("low", "high", "max")
+            ),
+            _fake_model_service("eng_dev.ai_gateway.glm-4-7", responses=True),  # GLM → chat
+        )
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries", _fake_fetch
+    )
+
+    resolution = resolve_config_gateway_providers(
+        model_override="eng_dev.ai_gateway.omni-gpt-high", reasoning_effort="high"
+    )
+
+    assert resolution is not None
+    assert (
+        resolution.config["model"] == "gateway-openai-responses/eng_dev.ai_gateway.omni-gpt-high"
+    )
+    providers = resolution.config["provider"]
+    responses = providers["gateway-openai-responses"]["models"]
+    assert responses["eng_dev.ai_gateway.omni-gpt-high"]["options"]["reasoningEffort"] == "high"
+    # The Responses model is not duplicated into the chat provider.
+    assert "eng_dev.ai_gateway.omni-gpt-high" not in providers["gateway-openai"]["models"]
+
+
+def test_config_gateway_discovers_each_family_schema_on_shared_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two families sharing a host but different UC schemas each keep their models.
+
+    A successful listing of one schema must not replace the other family's
+    configured/served tiers with an empty discovered list.
+    """
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: team_a.gateway.omni-claude
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: team_b.gateway.house-gpt
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+        if model_services_parent == "schemas/team_a.gateway":
+            return (_fake_model_service("team_a.gateway.omni-claude"),)
+        if model_services_parent == "schemas/team_b.gateway":
+            return (
+                _fake_model_service("team_b.gateway.house-gpt"),
+                _fake_model_service("team_b.gateway.house-gpt-pro"),
+            )
+        raise AssertionError(f"unexpected schema {model_services_parent!r}")
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries", _fake_fetch
+    )
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    providers = resolution.config["provider"]
+    assert set(providers["gateway-anthropic"]["models"]) == {"team_a.gateway.omni-claude"}
+    # OpenAI keeps its OWN schema's models (incl. the non-default tier), not A's.
+    openai_models = set(providers["gateway-openai"]["models"])
+    assert openai_models == {"team_b.gateway.house-gpt", "team_b.gateway.house-gpt-pro"}
+    assert "team_a.gateway.omni-claude" not in openai_models
+
+
+def test_config_gateway_openai_scoped_default_pins_openai(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider whose config default is ``openai`` launches its GPT default, not Claude."""
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: openai
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: eng_dev.ai_gateway.omni-gpt
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gateway-openai/eng_dev.ai_gateway.omni-gpt"
+
+
 def test_gateway_model_family_classification() -> None:
     """Discovered model-services route to opencode's three groups like pi."""
     from omnigent.harnesses.opencode_native.provider import _gateway_model_family
