@@ -1260,6 +1260,54 @@ providers:
     assert resolution.config["model"] == "gateway-openai/eng_dev.ai_gateway.omni-gpt"
 
 
+@pytest.mark.parametrize(
+    "models_block",
+    [
+        # A direct alias: default -> pro -> concrete endpoint.
+        """
+      models:
+        default: pro
+        pro: eng_dev.ai_gateway.deepseek-v4-pro
+""",
+        # An alias chain: default -> fast -> pro -> concrete endpoint.
+        """
+      models:
+        default: fast
+        fast: pro
+        pro: eng_dev.ai_gateway.deepseek-v4-pro
+""",
+    ],
+)
+def test_config_gateway_fallback_resolves_alias_tiers_to_endpoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, models_block: str
+) -> None:
+    """With discovery unavailable, configured tiers resolve to concrete endpoints.
+
+    The advertised models and the pinned default must be the concrete endpoint id
+    the gateway accepts, never an intermediate ``models:`` alias.
+    """
+    body = f"""
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+{models_block}
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gateway-openai/eng_dev.ai_gateway.deepseek-v4-pro"
+    models = set(resolution.config["provider"]["gateway-openai"]["models"])
+    assert models == {"eng_dev.ai_gateway.deepseek-v4-pro"}
+    assert "pro" not in models and "fast" not in models
+
+
 def test_gateway_model_family_classification() -> None:
     """Discovered model-services route to opencode's three groups like pi."""
     from omnigent.harnesses.opencode_native.provider import _gateway_model_family

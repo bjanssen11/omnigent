@@ -1525,10 +1525,20 @@ async def _auto_create_opencode_terminal(
         auth=opencode_spec.executor.auth if opencode_spec is not None else None,
     )
 
-    # Session binding precedes the configured and managed fallbacks. The
-    # resolver does synchronous model-service discovery (HTTP) and can shell out
-    # to an auth command, so offload it like the neighboring gateway resolver to
-    # keep the runner's event loop responsive.
+    # Resolution precedence (parity with the explicit-profile contract): session
+    # binding → explicit spec profile → configured default → ambient/managed
+    # fallback. Each resolver does synchronous discovery/auth work, so offload it
+    # to keep the runner's event loop responsive.
+    #
+    # An explicit ``executor.config.profile`` beats the global config gateway: the
+    # session owner named that workspace deliberately, so it must not be silently
+    # replaced by a differently-configured default.
+    explicit_profile = _opencode_native_explicit_profile(agent_spec)
+    if gateway is None and explicit_profile:
+        gateway = await asyncio.to_thread(
+            resolve_databricks_gateway, explicit_profile, model_id=model_override
+        )
+
     config_gateway = None
     if gateway is None:
         config_gateway = await asyncio.to_thread(
@@ -1547,6 +1557,7 @@ async def _auto_create_opencode_terminal(
                 [*existing_plugins] if isinstance(existing_plugins, list) else []
             ) + [str(auth_plugin)]
     elif gateway is None:
+        # Ambient (host-linked) Databricks profile, below the configured default.
         gateway = resolve_databricks_gateway(
             _opencode_native_profile_from_spec(agent_spec), model_id=model_override
         )
@@ -2073,6 +2084,29 @@ def _opencode_native_profile_from_spec(
         return str(profile) if profile else env_profile
     except Exception:  # noqa: BLE001 - profile resolution is best effort.
         return env_profile
+
+
+def _opencode_native_explicit_profile(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+) -> str | None:
+    """Resolve ONLY an explicitly-declared spec Databricks profile.
+
+    Unlike :func:`_opencode_native_profile_from_spec`, this ignores the ambient
+    ``DATABRICKS_CONFIG_PROFILE`` env: an explicit ``executor.config.profile``
+    takes precedence over the configured default, whereas the ambient profile is
+    a fallback below it.
+
+    :param agent_spec: Optional resolved agent spec.
+    :returns: The spec's ``executor.config.profile`` when set, else ``None``.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    try:
+        profile = spec.executor.config.get("profile")
+        return str(profile) if profile else None
+    except Exception:  # noqa: BLE001 - profile resolution is best effort.
+        return None
 
 
 def _opencode_native_mcp_servers_from_spec(

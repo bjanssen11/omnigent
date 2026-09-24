@@ -546,8 +546,13 @@ def resolve_config_gateway_providers(
             # Discovery reached this group's origin: authoritative (empty too).
             return list(discovered.get(group_key, ()))
         if group_key in (ANTHROPIC_FAMILY, OPENAI_FAMILY):
-            # This group's origin was not discovered; keep its configured tiers.
-            return list(family.models.values())
+            # This group's origin was not discovered; keep its configured tiers,
+            # resolving alias chains (``default: pro`` → ``pro: <endpoint>``) to
+            # the concrete endpoint ids the gateway actually accepts.
+            resolved: list[str] = []
+            for value in family.models.values():
+                _append_unique_model(resolved, family.resolve_model_tier(value))
+            return resolved
         return []
 
     # Split a gateway-qualified override (``<gateway-provider>/<model>``, a
@@ -588,8 +593,9 @@ def resolve_config_gateway_providers(
         #    legitimate slash-bearing gateway id such as ``zai-org/GLM-4.7``.
         if override_group is None:
             for group_key, _pid, _npm, family, _reasoning in group_specs:
+                raw_default = entry.family_default_model(default_source[group_key])
                 candidates = (
-                    entry.family_default_model(default_source[group_key]),
+                    family.resolve_model_tier(raw_default) if raw_default else None,
                     *_group_model_ids(group_key, family),
                 )
                 if any(c and _strip_model_suffix(c) == override for c in candidates):
@@ -609,7 +615,9 @@ def resolve_config_gateway_providers(
     first_model_pin: str | None = None
 
     for group_key, provider_id, npm, family, reasoning in group_specs:
-        default_model = entry.family_default_model(default_source[group_key])
+        raw_default = entry.family_default_model(default_source[group_key])
+        # Resolve an alias default (``default: pro``) to its concrete endpoint id.
+        default_model = family.resolve_model_tier(raw_default) if raw_default else None
         group_ids = _group_model_ids(group_key, family)
         model_ids: list[str] = []
         if override and group_key == override_group:
