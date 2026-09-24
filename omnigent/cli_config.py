@@ -3370,6 +3370,46 @@ def _run_opencode_auth_list() -> None:
         subprocess.run([spec.binary, "auth", "list"], check=False)
 
 
+def _list_config_gateway_opencode_models() -> list[str]:
+    """Return synthesized ``provider/model`` ids from the config.yaml gateway for opencode.
+
+    Reads family model tiers from config.yaml directly — no subprocess, no
+    network discovery — so the model picker is fast even when the gateway's
+    auth_command is slow. Returns ``[]`` when no driveable gateway is set.
+    """
+    try:
+        from omnigent.onboarding.provider_config import (
+            ANTHROPIC_FAMILY,
+            GATEWAY_KIND,
+            KEY_KIND,
+            LOCAL_KIND,
+            OPENAI_FAMILY,
+            default_provider_for_harness,
+            load_config,
+        )
+        from omnigent.harnesses.opencode_native.provider import _config_gateway_provider_id
+
+        config = load_config()
+        entry = default_provider_for_harness(config, "opencode")
+        if entry is None or entry.kind not in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+            return []
+        models: list[str] = []
+        for family_name in (ANTHROPIC_FAMILY, OPENAI_FAMILY):
+            try:
+                family = entry.family(family_name)
+            except Exception:  # noqa: BLE001 - unresolved $VAR in unused family
+                continue
+            if family is None:
+                continue
+            provider_id = _config_gateway_provider_id(entry.name, family_name)
+            for raw_model in family.models.values():
+                model_id = raw_model.split("[")[0].strip()
+                models.append(f"{provider_id}/{model_id}")
+        return models
+    except Exception:  # noqa: BLE001 - never break the picker on a config error
+        return []
+
+
 def _list_opencode_models() -> list[str]:
     """Return the ``provider/model`` ids OpenCode can launch (``opencode models``).
 
@@ -3407,9 +3447,12 @@ def _set_opencode_default_model(current: str | None) -> str | None:
     from omnigent.onboarding.interactive import console, select
     from omnigent.onboarding.opencode_auth import reachable_provider_ids
 
+    # Gateway models from config.yaml (no subprocess/discovery — fast). These
+    # are prepended so they appear at the top of the picker: a user with a
+    # gateway configured should reach their models without scrolling past the
+    # opencode.ai catalog.
+    gateway_models = _list_config_gateway_opencode_models()
     models = _list_opencode_models()
-    if not models:
-        return "✗ no models — sign in to a provider first (opencode auth login)"
     # `opencode models` can list hundreds of `provider/model` ids across every
     # provider on models.dev — too long for the picker (it overflows the
     # viewport and flickers). Narrow to the providers the user can actually
@@ -3419,6 +3462,13 @@ def _set_opencode_default_model(current: str | None) -> str | None:
     if reachable:
         scoped = [m for m in models if m.split("/", 1)[0] in reachable]
         models = scoped or models
+    # Merge: gateway models first (they are always usable when configured),
+    # then whatever opencode's own CLI reports (deduped).
+    seen = set(gateway_models)
+    merged = list(gateway_models) + [m for m in models if m not in seen]
+    models = merged
+    if not models:
+        return "✗ no models — add a gateway provider or sign in (opencode auth login)"
     options = list(models)
     clear_index = -1
     if current is not None:
@@ -3455,11 +3505,11 @@ def _print_opencode_auth_help() -> None:
 
     console.print(
         "  OpenCode resolves a model from the provider its agent uses:\n"
-        "    • [bold]opencode auth login[/bold] — sign in to a provider (OpenAI, Anthropic, …);\n"
+        "    • [bold]Manage gateway providers[/bold] — add/remove a Databricks AI Gateway\n"
+        "      or API-key provider; Omnigent synthesizes opencode's per-session config from it.\n"
+        "    • [bold]opencode auth login[/bold] — sign in to OpenAI, Anthropic, etc. directly;\n"
         "      stored in ~/.local/share/opencode/auth.json.\n"
-        "    • Provider env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY / …) are auto-detected.\n"
-        "    • Databricks gateway: set an agent ``profile`` (configured under Claude / Codex);\n"
-        "      Omnigent synthesizes opencode's per-session provider config from it.\n"
+        "    • Provider env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY / …) are also auto-detected.\n"
         "  Omnigent stores no OpenCode credential of its own.\n"
         f"  [dim]Tip:[/dim] 'Set default model' picks which model "
         f"`{cli_invocation(name='omni')} opencode` launches on\n"
@@ -3544,6 +3594,7 @@ def _manage_opencode_harness() -> None:
             else "Set default model"
         )
         rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Manage gateway providers", action="gateway"),
             _HarnessMenuRow("Run opencode auth login", action="login"),
             _HarnessMenuRow(model_label, action="model"),
             _HarnessMenuRow("List providers & credentials", action="list"),
@@ -3556,7 +3607,10 @@ def _manage_opencode_harness() -> None:
         action = rows[idx].action
         if action == "back":
             return
-        if action == "login":
+        if action == "gateway":
+            _manage_harness_providers("opencode")
+            status = None
+        elif action == "login":
             status = _launch_opencode_auth_login()
         elif action == "model":
             status = _set_opencode_default_model(default_model)

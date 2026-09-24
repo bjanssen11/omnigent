@@ -11,6 +11,7 @@ from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     GEMINI_FAMILY,
     OPENAI_FAMILY,
+    OPENCODE_SURFACE,
     PI_SURFACE,
     FamilyConfig,
     default_provider_for_harness,
@@ -428,7 +429,7 @@ def test_databricks_does_not_serve_gemini_surface() -> None:
     """
     config = {"providers": {"dbx": {"kind": "databricks", "profile": "ws", "default": True}}}
     entry = load_providers(config)["dbx"]
-    assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
+    assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OPENCODE_SURFACE})
     assert GEMINI_FAMILY not in provider_families(entry)
     # A default databricks profile does NOT become the gemini-surface default.
     assert default_provider_for_harness(config, "antigravity-native") is None
@@ -458,8 +459,8 @@ def test_gateway_local_does_not_serve_gemini_surface(kind: str) -> None:
     entry = load_providers({"providers": {"gw": raw}})["gw"]
     served = provider_families(entry)
     assert GEMINI_FAMILY not in served
-    # The real (anthropic) surface — and its pi capability — are untouched.
-    assert served == frozenset({ANTHROPIC_FAMILY, PI_SURFACE})
+    # The real (anthropic) surface — and its pi/opencode capability — are untouched.
+    assert served == frozenset({ANTHROPIC_FAMILY, PI_SURFACE, OPENCODE_SURFACE})
     # And it can never become the gemini-surface default…
     cfg = {"providers": {"gw": {**raw, "default": True}}}
     assert default_provider_for_harness(cfg, "antigravity-native") is None
@@ -538,7 +539,7 @@ def test_key_with_gemini_block_still_serves_gemini() -> None:
         "gemini": {"base_url": "https://y/v1beta", "api_key_ref": "env:G"},
     }
     multi_entry = load_providers({"providers": {"multi": multi}})["multi"]
-    assert provider_families(multi_entry) == frozenset({OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
+    assert provider_families(multi_entry) == frozenset({OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE, OPENCODE_SURFACE})
 
 
 def test_subscription_cannot_claim_pi_scope() -> None:
