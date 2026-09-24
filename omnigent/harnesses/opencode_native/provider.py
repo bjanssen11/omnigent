@@ -142,10 +142,25 @@ _OPENCODE_AUTOLOADED_FREE_PROVIDERS = ("opencode",)
 
 
 def disable_autoloaded_free_providers(config: dict[str, object]) -> dict[str, object]:
-    """Hide opencode's auto-loaded free providers (Zen / ``big-pickle``) from the picker."""
-    if config:
-        config.setdefault("$schema", "https://opencode.ai/config.json")
-        config["disabled_providers"] = list(_OPENCODE_AUTOLOADED_FREE_PROVIDERS)
+    """Hide opencode's auto-loaded free providers (Zen / ``big-pickle``) from the picker.
+
+    Only hides the free tier when Omnigent actually supplies a replacement — a
+    synthesized ``provider`` block or a pinned non-free model. A config that
+    carries only MCP/plugin wiring (no provider, no model) leaves the free tier
+    usable, and an explicitly selected ``opencode/...`` model is preserved.
+    """
+    if not config:
+        return config
+    model = config.get("model")
+    model_provider = model.split("/", 1)[0] if isinstance(model, str) and model else None
+    if model_provider in _OPENCODE_AUTOLOADED_FREE_PROVIDERS:
+        # The user pinned the free tier itself; keep it available.
+        return config
+    supplies_replacement = bool(config.get("provider")) or bool(model_provider)
+    if not supplies_replacement:
+        return config
+    config.setdefault("$schema", "https://opencode.ai/config.json")
+    config["disabled_providers"] = list(_OPENCODE_AUTOLOADED_FREE_PROVIDERS)
     return config
 
 
@@ -311,53 +326,83 @@ def _clamp_effort(requested: str, allowed: tuple[str, ...]) -> str | None:
 
 def _discover_gateway_models(
     families: list[tuple[str, str, FamilyConfig]],
-) -> tuple[dict[str, list[str]], dict[str, tuple[str, ...]]]:
-    """Live Unity Catalog model-service discovery for the gateway families."""
+) -> tuple[dict[str, list[str]], dict[str, tuple[str, ...]], set[str]]:
+    """Live Unity Catalog model-service discovery, partitioned by workspace origin.
+
+    Each family's catalog is fetched from its OWN origin (minting only same-origin
+    credentials), so a model discovered on one workspace is never attributed to a
+    provider on another.
+
+    :returns: ``(groups, efforts, discovered_groups)`` — the discovered model ids
+        per group, the reasoning efforts per Responses model, and the set of
+        groups whose origin discovery succeeded. Those groups are authoritative;
+        every other group keeps its configured tiers.
+    """
     from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 
     if not families:
-        return {}, {}
-    parent = _derive_model_services_parent(families)
-    host = _gateway_host_from_base_url(families[0][2].base_url)
-    if not parent or not host:
-        return {}, {}
-    # Mint the discovery token only from families sharing the discovery origin,
-    # so one workspace's credential is never sent to a different host.
-    same_origin = [
-        family_spec
-        for family_spec in families
-        if _gateway_host_from_base_url(family_spec[2].base_url) == host
-    ]
-    token = _mint_gateway_discovery_token(same_origin)
-    if not token:
-        return {}, {}
-    try:
-        entries = model_catalog.fetch_databricks_model_service_entries(
-            host, token, model_services_parent=parent
-        )
-    except Exception:  # noqa: BLE001 - discovery failure falls back to static tiers.
-        _logger.info(
-            "opencode gateway discovery: model-service listing failed; using config tiers.",
-            exc_info=True,
-        )
-        return {}, {}
+        return {}, {}, set()
+
+    # Fetch each distinct origin's catalog once, minting only from same-origin
+    # families so one workspace's credential never reaches another host.
+    origin_catalogs: dict[str, list[model_catalog.ModelEntry]] = {}
+    for _name, _npm, family in families:
+        host = _gateway_host_from_base_url(family.base_url)
+        if not host or host in origin_catalogs:
+            continue
+        same_origin = [
+            spec for spec in families if _gateway_host_from_base_url(spec[2].base_url) == host
+        ]
+        parent = _derive_model_services_parent(same_origin)
+        if not parent:
+            continue
+        token = _mint_gateway_discovery_token(same_origin)
+        if not token:
+            continue
+        try:
+            entries = model_catalog.fetch_databricks_model_service_entries(
+                host, token, model_services_parent=parent
+            )
+        except Exception:  # noqa: BLE001 - discovery failure falls back to static tiers.
+            _logger.info(
+                "opencode gateway discovery: model-service listing failed for %s; "
+                "using config tiers for its families.",
+                host,
+                exc_info=True,
+            )
+            continue
+        origin_catalogs[host] = list(entries)
+
+    # Attribute each origin's catalog only to the families on that origin: a
+    # group is authoritative only when its own family's origin was fetched.
     buckets: dict[str, list[str]] = {
         ANTHROPIC_FAMILY: [],
         OPENAI_FAMILY: [],
         _OPENAI_RESPONSES_GROUP: [],
     }
     efforts: dict[str, tuple[str, ...]] = {}
-    for model in entries:
-        group = _gateway_model_family(model)
-        if group not in buckets:
+    discovered_groups: set[str] = set()
+    for name, _npm, family in families:
+        host = _gateway_host_from_base_url(family.base_url)
+        if host is None or host not in origin_catalogs:
             continue
-        _append_unique_model(buckets[group], model.id)
-        if group == _OPENAI_RESPONSES_GROUP:
-            reasoning = model.metadata.reasoning
-            if reasoning is not None and reasoning.efforts:
-                efforts[_strip_model_suffix(model.id)] = tuple(reasoning.efforts)
+        allowed = (
+            {ANTHROPIC_FAMILY}
+            if name == ANTHROPIC_FAMILY
+            else {OPENAI_FAMILY, _OPENAI_RESPONSES_GROUP}
+        )
+        discovered_groups |= allowed
+        for model in origin_catalogs[host]:
+            group = _gateway_model_family(model)
+            if group not in buckets or group not in allowed:
+                continue
+            _append_unique_model(buckets[group], model.id)
+            if group == _OPENAI_RESPONSES_GROUP:
+                reasoning = model.metadata.reasoning
+                if reasoning is not None and reasoning.efforts:
+                    efforts[_strip_model_suffix(model.id)] = tuple(reasoning.efforts)
     groups = {group: ids for group, ids in buckets.items() if ids}
-    return groups, efforts
+    return groups, efforts, discovered_groups
 
 
 def resolve_config_gateway_providers(
@@ -423,9 +468,9 @@ def resolve_config_gateway_providers(
 
     families_by_name = {name: family for name, _npm, family in families}
 
-    # Successful discovery replaces stale static model lists.
-    discovered, discovered_efforts = _discover_gateway_models(families)
-    discovery_ok = bool(discovered)
+    # Successful discovery replaces stale static model lists, but only for the
+    # groups whose own workspace origin was reached.
+    discovered, discovered_efforts, discovered_groups = _discover_gateway_models(families)
 
     group_specs: list[tuple[str, str, str, FamilyConfig, bool]] = []
     if ANTHROPIC_FAMILY in families_by_name:
@@ -467,10 +512,11 @@ def resolve_config_gateway_providers(
     }
 
     def _group_model_ids(group_key: str, family: FamilyConfig) -> list[str]:
-        if discovery_ok:
-            # Successful discovery is authoritative for empty groups too.
+        if group_key in discovered_groups:
+            # Discovery reached this group's origin: authoritative (empty too).
             return list(discovered.get(group_key, ()))
         if group_key in (ANTHROPIC_FAMILY, OPENAI_FAMILY):
+            # This group's origin was not discovered; keep its configured tiers.
             return list(family.models.values())
         return []
 

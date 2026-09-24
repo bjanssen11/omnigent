@@ -1413,44 +1413,156 @@ def test_config_gateway_returns_none_without_config(
     assert resolve_config_gateway_providers() is None
 
 
-def test_gateway_discovery_binds_token_to_origin(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Discovery mints its token only from families sharing the discovery origin.
+def test_gateway_discovery_mints_per_origin_without_mixing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each origin's discovery token is minted only from that origin's families.
 
-    The discovery host comes from the first family; a later family on a different
-    origin must never have its credential sent to the first family's host, so the
-    minter only ever sees same-origin families.
+    Families on different workspaces must never share a credential: every mint
+    call sees families of exactly one origin, and each origin is minted from its
+    own family.
     """
     from omnigent.harnesses.opencode_native import provider as prov
     from omnigent.onboarding.provider_config import FamilyConfig
 
-    first = FamilyConfig(
+    anthropic = FamilyConfig(
         base_url="https://ws-a.example.com/ai-gateway/anthropic",
         auth_command="mint-a",
         models={"default": "eng_dev.ai_gateway.omni-claude"},
     )
-    other_origin = FamilyConfig(
+    openai = FamilyConfig(
         base_url="https://ws-b.example.com/ai-gateway/openai/v1",
         auth_command="mint-b",
         wire_api="chat",
         models={"default": "eng_dev.ai_gateway.omni-gpt"},
     )
     families = [
-        ("anthropic", "@ai-sdk/anthropic", first),
-        ("openai", "@ai-sdk/openai-compatible", other_origin),
+        ("anthropic", "@ai-sdk/anthropic", anthropic),
+        ("openai", "@ai-sdk/openai-compatible", openai),
     ]
 
-    seen_hosts: list[str | None] = []
+    mint_calls: list[list[str | None]] = []
 
     def _capture(fams: list) -> None:
-        seen_hosts.extend(prov._gateway_host_from_base_url(f[2].base_url) for f in fams)
+        mint_calls.append([prov._gateway_host_from_base_url(f[2].base_url) for f in fams])
         return
 
     monkeypatch.setattr(prov, "_mint_gateway_discovery_token", _capture)
 
     prov._discover_gateway_models(families)
 
-    # host = first family = ws-a; the ws-b credential never reaches the minter.
-    assert seen_hosts == ["https://ws-a.example.com"]
+    assert mint_calls, "discovery should attempt a mint per origin"
+    # No mint call ever mixes origins ...
+    for hosts in mint_calls:
+        assert len(set(hosts)) == 1
+    # ... and each origin is minted from its own family.
+    assert {hosts[0] for hosts in mint_calls} == {
+        "https://ws-a.example.com",
+        "https://ws-b.example.com",
+    }
+
+
+def test_config_gateway_keeps_configured_models_for_undiscovered_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A catalog from one workspace is never assigned to another workspace's family.
+
+    Anthropic lives on workspace A, OpenAI on workspace B. Discovery succeeds only
+    for A; the OpenAI (B) provider must keep its configured models and must not
+    advertise A's discovered ids.
+    """
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    anthropic:
+      base_url: https://ws-a.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude
+    openai:
+      base_url: https://ws-b.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: acme.gw.house-gpt
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+        # Only workspace A answers; workspace B's listing fails.
+        if host == "https://ws-a.example.com":
+            return (_fake_model_service("eng_dev.ai_gateway.omni-claude"),)
+        raise RuntimeError("workspace B listing denied")
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries", _fake_fetch
+    )
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    providers = resolution.config["provider"]
+    # A's discovered id populates only the anthropic (A) provider.
+    assert set(providers["gateway-anthropic"]["models"]) == {"eng_dev.ai_gateway.omni-claude"}
+    # B keeps its configured model and never inherits A's discovered id.
+    openai_models = set(providers["gateway-openai"]["models"])
+    assert openai_models == {"acme.gw.house-gpt"}
+    assert "eng_dev.ai_gateway.omni-claude" not in openai_models
+
+
+def test_config_gateway_skips_undriveable_openai_default_for_anthropic_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OpenAI subscription default must not hide a usable Anthropic gateway."""
+    body = """
+providers:
+  my-openai:
+    kind: subscription
+    default: openai
+    cli: codex
+  gw:
+    kind: gateway
+    default: anthropic
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers(model_override="eng_dev.ai_gateway.omni-claude")
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gw-anthropic/eng_dev.ai_gateway.omni-claude"
+    assert "gw-anthropic" in resolution.config["provider"]
+
+
+def test_disable_autoloaded_free_providers_keeps_free_tier_without_replacement() -> None:
+    """A config with only MCP/plugin wiring keeps the free tier usable."""
+    config: dict[str, object] = {
+        "$schema": "https://opencode.ai/config.json",
+        "mcp": {"omnigent": {"type": "local"}},
+        "permission": "ask",
+    }
+    disable_autoloaded_free_providers(config)
+    assert "disabled_providers" not in config
+
+
+def test_disable_autoloaded_free_providers_preserves_explicit_free_model() -> None:
+    """An explicitly selected ``opencode/...`` model is not disabled out from under."""
+    config: dict[str, object] = {
+        "$schema": "https://opencode.ai/config.json",
+        "model": "opencode/big-pickle",
+    }
+    disable_autoloaded_free_providers(config)
+    assert "disabled_providers" not in config
 
 
 def test_gateway_auth_plugin_injects_bearer_per_request() -> None:
