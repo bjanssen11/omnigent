@@ -492,7 +492,15 @@ def resolve_config_gateway_providers(
             continue
         if family is None or not family.base_url:
             continue
-        if family_name == OPENAI_FAMILY and family.wire_api != CHAT_WIRE_API:
+        # An OpenAI family drives the chat-completions surface. Exclude it only
+        # when it EXPLICITLY declares a non-chat wire (e.g. ``responses``); an
+        # omitted ``wire_api`` means "harness default", which here is chat, so the
+        # family is kept rather than silently dropped.
+        if (
+            family_name == OPENAI_FAMILY
+            and family.wire_api is not None
+            and family.wire_api != CHAT_WIRE_API
+        ):
             continue
         families.append((family_name, npm, family))
 

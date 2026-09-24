@@ -1709,6 +1709,61 @@ providers:
     assert resolve_config_gateway_providers() is None
 
 
+def test_config_gateway_omitted_wire_api_keeps_openai_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OpenAI family with no ``wire_api`` is driven as chat, not discarded."""
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-gpt
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gateway-openai/eng_dev.ai_gateway.omni-gpt"
+    block = resolution.config["provider"]["gateway-openai"]
+    assert block["npm"] == "@ai-sdk/openai-compatible"
+    assert "eng_dev.ai_gateway.omni-gpt" in block["models"]
+
+
+def test_config_gateway_omitted_wire_api_openai_default_pins_gpt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With both families and ``default: openai`` but no ``wire_api``, GPT still wins."""
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: openai
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-gpt
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gateway-openai/eng_dev.ai_gateway.omni-gpt"
+    assert "gateway-openai" in resolution.config["provider"]
+
+
 def test_config_gateway_returns_none_for_subscription(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
