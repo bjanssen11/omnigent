@@ -1308,6 +1308,97 @@ providers:
     assert "pro" not in models and "fast" not in models
 
 
+def test_config_gateway_default_selects_responses_when_catalog_is_responses_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unset model pins the Responses provider when discovery classes the default there.
+
+    With a Responses-only catalog the chat group is authoritatively empty, so the
+    configured default must not be claimed by chat; it pins the Responses provider
+    and keeps its reasoning effort.
+    """
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: eng_dev.ai_gateway.omni-gpt-high
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+        return (
+            _fake_model_service(
+                "eng_dev.ai_gateway.omni-gpt-high", responses=True, efforts=("low", "high", "max")
+            ),
+        )
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries", _fake_fetch
+    )
+
+    resolution = resolve_config_gateway_providers(reasoning_effort="high")
+
+    assert resolution is not None
+    assert (
+        resolution.config["model"] == "gateway-openai-responses/eng_dev.ai_gateway.omni-gpt-high"
+    )
+    providers = resolution.config["provider"]
+    responses = providers["gateway-openai-responses"]["models"]
+    assert responses["eng_dev.ai_gateway.omni-gpt-high"]["options"]["reasoningEffort"] == "high"
+    # The chat provider must not claim the Responses-only default.
+    assert (
+        "gateway-openai" not in providers
+        or "eng_dev.ai_gateway.omni-gpt-high" not in providers["gateway-openai"]["models"]
+    )
+
+
+def test_config_gateway_reconstructs_saved_responses_selection_during_outage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved ``<responses>/<model>`` selection survives a discovery outage.
+
+    The Responses provider is not discovered while the workspace is unreachable,
+    but an explicit saved selection must still be recognized and its provider
+    reconstructed — never silently switched to another provider's default.
+    """
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: eng_dev.ai_gateway.omni-gpt-high
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+    # Discovery is unavailable (autouse _no_gateway_discovery stubs the token).
+
+    resolution = resolve_config_gateway_providers(
+        model_override="gateway-openai-responses/eng_dev.ai_gateway.omni-gpt-high"
+    )
+
+    assert resolution is not None
+    assert (
+        resolution.config["model"] == "gateway-openai-responses/eng_dev.ai_gateway.omni-gpt-high"
+    )
+    responses = resolution.config["provider"]["gateway-openai-responses"]
+    assert responses["npm"] == "@ai-sdk/openai"
+    assert "eng_dev.ai_gateway.omni-gpt-high" in responses["models"]
+
+
 def test_gateway_model_family_classification() -> None:
     """Discovered model-services route to opencode's three groups like pi."""
     from omnigent.harnesses.opencode_native.provider import _gateway_model_family

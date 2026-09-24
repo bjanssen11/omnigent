@@ -524,11 +524,18 @@ def resolve_config_gateway_providers(
                 False,
             )
         )
-        if discovered.get(_OPENAI_RESPONSES_GROUP):
+        # Build the Responses provider when discovery advertises Responses models,
+        # OR when the session explicitly selected it (a saved
+        # ``<responses>/<model>``). Its identity must survive a discovery outage:
+        # a saved Responses selection is reconstructed here rather than going
+        # unrecognized and falling through to another provider's default.
+        responses_pid = _config_gateway_provider_id(entry.name, _OPENAI_RESPONSES_GROUP)
+        override_wants_responses = bool(override) and override.split("/", 1)[0] == responses_pid
+        if discovered.get(_OPENAI_RESPONSES_GROUP) or override_wants_responses:
             group_specs.append(
                 (
                     _OPENAI_RESPONSES_GROUP,
-                    _config_gateway_provider_id(entry.name, _OPENAI_RESPONSES_GROUP),
+                    responses_pid,
                     _AI_SDK_OPENAI,
                     openai_family,
                     True,
@@ -626,7 +633,17 @@ def resolve_config_gateway_providers(
         if default_model:
             stripped_default = _strip_model_suffix(default_model)
             served = {_strip_model_suffix(m) for m in group_ids}
-            if stripped_default in served or not group_ids:
+            # Add the configured default here only when this group actually serves
+            # it. A discovered group is authoritative — an empty one must not claim
+            # the default (so a Responses-only catalog pins Responses, not chat) —
+            # and the Responses group borrows the OpenAI default only when discovery
+            # confirms it is a Responses model, never as a blind fallback.
+            base_fallback = (
+                group_key in (ANTHROPIC_FAMILY, OPENAI_FAMILY)
+                and group_key not in discovered_groups
+                and not group_ids
+            )
+            if stripped_default in served or base_fallback:
                 _append_unique_model(model_ids, default_model)
                 pin = f"{provider_id}/{stripped_default}"
                 if group_key == ANTHROPIC_FAMILY:
