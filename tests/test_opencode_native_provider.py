@@ -1291,12 +1291,66 @@ def test_config_gateway_qualified_override_is_not_prefixed_twice(
     assert model in resolution.config["provider"][provider]["models"]
 
 
-def test_config_gateway_preserves_override_for_another_provider(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "override",
+    [
+        "anthropic/claude-sonnet-4-6",  # unlisted native anthropic selection
+        "openai/gpt-5.5",  # unlisted native openai selection
+        "google/gemini-2.5-pro",  # a provider this gateway has no family for
+        "opencode/big-pickle",  # the built-in free tier
+    ],
+)
+def test_config_gateway_preserves_explicit_native_provider_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: str
 ) -> None:
+    """A qualified selection for a non-gateway provider is declined, never rerouted."""
     _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
 
-    assert resolve_config_gateway_providers(model_override="anthropic/claude-sonnet-4-6") is None
+    assert resolve_config_gateway_providers(model_override=override) is None
+
+
+@pytest.mark.parametrize(
+    ("family", "family_base_url", "wire", "override"),
+    [
+        # Anthropic-only gateway, an unlisted GPT id → recognized as openai, which
+        # is unavailable here → decline (do not pin onto the anthropic surface).
+        ("anthropic", "https://ws.example.com/ai-gateway/anthropic", None, "some-gpt-5"),
+        # OpenAI-only gateway, an unlisted Claude id → recognized as anthropic,
+        # which is unavailable here → decline.
+        ("openai", "https://ws.example.com/ai-gateway/openai/v1", "chat", "some-claude-x"),
+        # A single-family gateway must not swallow another provider's selection.
+        (
+            "anthropic",
+            "https://ws.example.com/ai-gateway/anthropic",
+            None,
+            "google/gemini-2.5-pro",
+        ),
+    ],
+)
+def test_config_gateway_single_family_declines_cross_family_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    family: str,
+    family_base_url: str,
+    wire: str | None,
+    override: str,
+) -> None:
+    """A lone family declines an override whose recognized family it cannot serve."""
+    wire_line = f"      wire_api: {wire}\n" if wire else ""
+    body = f"""
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    {family}:
+      base_url: {family_base_url}
+      auth_command: databricks-token
+{wire_line}      models:
+        default: eng_dev.ai_gateway.house-default
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    assert resolve_config_gateway_providers(model_override=override) is None
 
 
 def test_config_gateway_unlisted_override_declines_when_ambiguous(

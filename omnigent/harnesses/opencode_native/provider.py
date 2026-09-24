@@ -405,6 +405,38 @@ def _discover_gateway_models(
     return groups, efforts, discovered_groups
 
 
+def _match_override_family(
+    override: str, group_specs: list[tuple[str, str, str, FamilyConfig, bool]]
+) -> str | None:
+    """Family group for an override that no served/default model matched exactly.
+
+    :returns: The group key to route the override to, or ``None`` to decline.
+
+    A slash-qualified override that reaches here names a non-gateway provider
+    (a synthesized-id prefix is split off before, and a legitimate slash-bearing
+    gateway id like ``zai-org/GLM-4.7`` is matched exactly before): an explicit
+    ``google/...`` / ``opencode/...`` / unlisted ``anthropic/...`` selection is
+    not ours to reroute, so it is declined. A bare id is routed by the family its
+    name implies (Claude → anthropic, GPT/GLM → openai) when that family is
+    configured; a recognized family that is NOT configured here is declined
+    rather than sent to the wrong surface. An unsignalled bare id pins to a lone
+    configured family (unambiguous) and is declined when several could claim it.
+    """
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+
+    if "/" in override:
+        return None
+    available = {group_key for group_key, *_rest in group_specs}
+    name = override.lower()
+    if "claude" in name:
+        return ANTHROPIC_FAMILY if ANTHROPIC_FAMILY in available else None
+    if "gpt" in name or "glm" in name:
+        return OPENAI_FAMILY if OPENAI_FAMILY in available else None
+    if len(group_specs) == 1:
+        return group_specs[0][0]
+    return None
+
+
 def resolve_config_gateway_providers(
     model_override: str | None = None,
     reasoning_effort: str | None = None,
@@ -520,20 +552,16 @@ def resolve_config_gateway_providers(
             return list(family.models.values())
         return []
 
-    # Interpret a slash in the override:
-    #  * ``<gateway-provider>/<model>`` (a synthesized id) → route within that
-    #    provider (e.g. a saved qualified ``opencode_model``);
-    #  * ``<native-provider>/<model>`` (``anthropic`` / ``openai``) → an explicit
-    #    native selection that is not ours to reroute — decline;
-    #  * anything else (``zai-org/GLM-4.7``) → the slash is part of the model id,
-    #    so keep the whole string as a bare id.
+    # Split a gateway-qualified override (``<gateway-provider>/<model>``, a
+    # synthesized id — e.g. a saved qualified ``opencode_model``). Any other
+    # slash is left intact: it is either part of a gateway model id
+    # (``zai-org/GLM-4.7``, matched below) or an explicit non-gateway selection
+    # (``google/...``, ``opencode/...``), which the matcher declines.
     known_provider_ids = {provider_id for _gk, provider_id, *_rest in group_specs}
     if override and "/" in override:
         maybe_provider, maybe_model = override.split("/", 1)
         if maybe_provider in known_provider_ids:
             override_provider, override = maybe_provider, maybe_model
-        elif maybe_provider in (ANTHROPIC_FAMILY, OPENAI_FAMILY):
-            return None
 
     override_group: str | None = None
     if override_provider is not None:
@@ -548,6 +576,8 @@ def resolve_config_gateway_providers(
         if override_group is None:
             return None
     elif override and group_specs:
+        # 1) Exact match against a family's default/served models — this claims a
+        #    legitimate slash-bearing gateway id such as ``zai-org/GLM-4.7``.
         for group_key, _pid, _npm, family, _reasoning in group_specs:
             candidates = (
                 entry.family_default_model(default_source[group_key]),
@@ -557,22 +587,11 @@ def resolve_config_gateway_providers(
                 override_group = group_key
                 break
         if override_group is None:
-            # The override matches no family's served/default model. Route it by
-            # the family its name implies (a Claude id to anthropic, a GPT/GLM id
-            # to openai); with a single family the target is unambiguous. When the
-            # name gives no signal and several families exist, guessing risks
-            # routing it to the wrong surface (e.g. an Anthropic id onto the
-            # OpenAI endpoint), so decline and let the databricks/managed paths
-            # resolve it.
-            available = {group_key for group_key, *_rest in group_specs}
-            name = override.lower()
-            if "claude" in name and ANTHROPIC_FAMILY in available:
-                override_group = ANTHROPIC_FAMILY
-            elif ("gpt" in name or "glm" in name) and OPENAI_FAMILY in available:
-                override_group = OPENAI_FAMILY
-            elif len(group_specs) == 1:
-                override_group = group_specs[0][0]
-            else:
+            override_group = _match_override_family(override, group_specs)
+            if override_group is None:
+                # An explicit non-gateway selection, or a recognized family that
+                # isn't configured here — not ours to reroute. Decline and let the
+                # databricks/managed/native paths resolve it.
                 return None
 
     override_pin: str | None = None
