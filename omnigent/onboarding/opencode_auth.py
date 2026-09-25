@@ -112,7 +112,7 @@ def _config_gateway_provider_name() -> str | None:
         entry = default_provider_for_harness(config, "opencode")
         if entry is not None and entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
             return entry.name
-    except Exception:  # noqa: BLE001 - never block setup display on a config error.
+    except Exception:
         pass
     return None
 
