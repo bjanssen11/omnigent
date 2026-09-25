@@ -2173,6 +2173,25 @@ def test_gateway_model_service_omits_limits_when_route_partly_uncatalogued(
     assert entries[0].metadata.max_output_tokens is None
 
 
+def test_responses_reasoning_efforts_intersect_across_destinations() -> None:
+    """A weighted Responses route advertises only efforts every destination supports.
+
+    Mixing an OpenAI destination (accepts ``max``) with an xAI one (does not) must
+    drop ``max`` regardless of destination order, while a single destination keeps
+    its full ladder.
+    """
+    from omnigent.models.model_catalog import _responses_reasoning_efforts
+
+    mixed = ["us.openai.gpt-5", "us.xai.grok-4"]
+    efforts = _responses_reasoning_efforts(mixed)
+    assert "max" not in efforts
+    assert "high" in efforts and "xhigh" in efforts
+    # Order of destinations must not change the advertised ladder.
+    assert _responses_reasoning_efforts(list(reversed(mixed))) == efforts
+    # A single OpenAI destination keeps ``max``.
+    assert "max" in _responses_reasoning_efforts(["us.openai.gpt-5"])
+
+
 def test_fetch_model_services_strict_details_raises_on_detail_failure() -> None:
     """``strict_details`` surfaces an incomplete listing instead of dropping services.
 

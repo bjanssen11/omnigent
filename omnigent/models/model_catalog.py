@@ -1556,14 +1556,27 @@ _XAI_RESPONSES_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
 _DEFAULT_RESPONSES_EFFORTS = frozenset({"low", "medium", "high"})
 
 
-def _responses_reasoning_efforts(targets: list[str]) -> frozenset[str]:
-    """Return the reasoning efforts a Responses model accepts, by target family."""
-    target = targets[0].lower() if targets else ""
-    if "openai" in target or "gpt" in target:
+def _responses_efforts_for_target(target: str) -> frozenset[str]:
+    """Return the reasoning efforts a single routing target's family accepts."""
+    lowered = target.lower()
+    if "openai" in lowered or "gpt" in lowered:
         return _GPT_RESPONSES_EFFORTS
-    if "xai" in target or "grok" in target:
+    if "xai" in lowered or "grok" in lowered:
         return _XAI_RESPONSES_EFFORTS
     return _DEFAULT_RESPONSES_EFFORTS
+
+
+def _responses_reasoning_efforts(targets: list[str]) -> frozenset[str]:
+    """Return the efforts a weighted Responses route accepts across all destinations.
+
+    A weighted route only truly accepts the efforts EVERY active destination
+    supports, so intersect the per-destination ladders rather than trusting the
+    first (whose order in the destination list is not significant).
+    """
+    if not targets:
+        return _DEFAULT_RESPONSES_EFFORTS
+    ladders = [_responses_efforts_for_target(target) for target in targets]
+    return frozenset(ladders[0]).intersection(*ladders[1:])
 
 
 def fetch_databricks_model_service_entries(

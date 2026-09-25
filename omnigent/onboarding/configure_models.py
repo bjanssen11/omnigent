@@ -560,8 +560,15 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     :returns: The surfaces this option can configure — a subset of
         ``{"anthropic", "openai", "gemini", "pi"}``.
     """
-    if opt.kind == GATEWAY_KIND or opt.kind == DATABRICKS_KIND:
+    if opt.kind == GATEWAY_KIND:
         return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OPENCODE_SURFACE})
+    if opt.kind == DATABRICKS_KIND:
+        # OpenCode launch consumes config gateway/key/local providers and explicit
+        # profiles / managed hosts, not a saved config ``databricks``-kind default
+        # (the resolver excludes that kind), so offering it here would let setup
+        # save an OpenCode default that launch silently ignores. Pi/Claude/Codex
+        # still drive Databricks.
+        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
     if opt.kind == BEDROCK_KIND:
         # Bedrock mode drives only the native Claude terminal (anthropic
         # family); codex/pi reject it, so it never serves their surfaces.
