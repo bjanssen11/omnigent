@@ -1057,8 +1057,24 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.provider_config import (
         provider_families,
+        provider_serves_opencode,
         surface_default_provider,
     )
+
+    # An OpenCode-scoped add must produce a provider OpenCode can actually launch:
+    # an Anthropic gateway, or a Chat-Completions OpenAI gateway. A Responses-only
+    # OpenAI gateway is unusable there (readiness/picker/launch all decline it), so
+    # refuse it before persisting rather than saving a dead-end the user's chosen
+    # harness can never use.
+    if family == OPENCODE_SURFACE:
+        candidate = load_providers({"providers": {name: entry}})[name]
+        if not provider_serves_opencode(candidate):
+            console.print(
+                "[red]OpenCode can't use this provider: it needs an Anthropic gateway or a "
+                "Chat-Completions OpenAI gateway, not a Responses-only one. Nothing was saved — "
+                "re-add it with an anthropic family or wire_api: chat.[/red]"
+            )
+            return None
 
     # Persist the entry (deep-merge — doesn't disturb sibling entries).
     _save_global_config(
