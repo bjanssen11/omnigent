@@ -503,6 +503,95 @@ def test_gemini_auth_command_rejected_at_parse() -> None:
         load_providers({"providers": {"google": raw}})
 
 
+@pytest.mark.parametrize("kind", ["gateway", "local"])
+def test_openai_responses_gateway_does_not_serve_opencode_surface(kind: str) -> None:
+    """An openai-only gateway with ``wire_api: responses`` must NOT claim the OpenCode surface.
+
+    OpenCode requires Chat Completions (opencode_native/provider.py raises on
+    ``wire_api == "responses"`` at launch). Allowing a Responses-only gateway to
+    claim ``OPENCODE_SURFACE`` lets onboarding save a provider that will always
+    fail at runtime — a silent dead-end. The invariant must be enforced at the
+    data-model level so every surface that reads ``provider_families()`` (setup
+    menus, default-resolution, readiness) agrees with what the harness can
+    actually use.
+    """
+    raw = {
+        "kind": kind,
+        "openai": {
+            "base_url": "https://gw/v1",
+            "auth_command": "mint-tok",
+            "wire_api": "responses",
+        },
+    }
+    entry = load_providers({"providers": {"gw": raw}})["gw"]
+    served = provider_families(entry)
+    # Pi can still consume a responses endpoint; opencode cannot.
+    assert OPENCODE_SURFACE not in served
+    assert PI_SURFACE in served
+    # A mixed anthropic+openai-responses gateway keeps opencode via anthropic.
+    mixed_raw = {
+        "kind": kind,
+        "anthropic": {"base_url": "https://gw", "auth_command": "mint-anth"},
+        "openai": {
+            "base_url": "https://gw/v1",
+            "auth_command": "mint-tok",
+            "wire_api": "responses",
+        },
+    }
+    mixed_entry = load_providers({"providers": {"m": mixed_raw}})["m"]
+    assert OPENCODE_SURFACE in provider_families(mixed_entry)
+
+
+def test_default_provider_for_opencode_skips_responses_only_gateway() -> None:
+    """``default_provider_for_harness("opencode")`` skips a responses-only openai gateway.
+
+    An openai-family gateway with ``wire_api: responses`` cannot serve OpenCode
+    (provider.py raises at launch). The resolver must fall through to the next
+    family rather than returning an unusable provider.
+    """
+    config = {
+        "providers": {
+            "responses-gw": {
+                "kind": "gateway",
+                "default": ["openai"],
+                "openai": {
+                    "base_url": "https://gw/v1",
+                    "auth_command": "mint-openai-tok",
+                    "wire_api": "responses",
+                },
+            },
+            "anthropic-gw": {
+                "kind": "gateway",
+                "default": ["anthropic"],
+                "anthropic": {
+                    "base_url": "https://gw",
+                    "auth_command": "mint-anthropic-tok",
+                },
+            },
+        }
+    }
+    resolved = default_provider_for_harness(config, "opencode")
+    # Falls through the responses gateway and picks up the anthropic one.
+    assert resolved is not None
+    assert resolved.name == "anthropic-gw"
+
+    # When there is no fallback, returns None rather than the unusable provider.
+    no_fallback = {
+        "providers": {
+            "responses-gw": {
+                "kind": "gateway",
+                "default": ["openai"],
+                "openai": {
+                    "base_url": "https://gw/v1",
+                    "auth_command": "mint-openai-tok",
+                    "wire_api": "responses",
+                },
+            }
+        }
+    }
+    assert default_provider_for_harness(no_fallback, "opencode") is None
+
+
 def test_auth_command_still_valid_for_non_gemini_families() -> None:
     """``auth_command`` remains valid for anthropic/openai families — no over-restriction.
 
