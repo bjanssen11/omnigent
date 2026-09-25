@@ -601,6 +601,22 @@ def resolve_config_gateway_providers(
         )
         if override_group is None:
             return None
+        # Reconcile a picker-qualified selection with the discovered wire API: the
+        # picker prefixes openai models with the chat provider, but discovery may
+        # classify one as Responses. If the model is discovered in a DIFFERENT
+        # group of the SAME family (chat ↔ Responses), route it there so a picker
+        # entry can't pin a Responses model onto the chat endpoint.
+        for group_key, _pid, _npm, family, _reasoning in group_specs:
+            if (
+                group_key != override_group
+                and group_key in discovered_groups
+                and default_source[group_key] == default_source[override_group]
+                and any(
+                    _strip_model_suffix(m) == override for m in _group_model_ids(group_key, family)
+                )
+            ):
+                override_group = group_key
+                break
     elif override and group_specs:
         # 1) Prefer a group whose DISCOVERED catalog lists the override: discovery
         #    knows each model's real wire API, so an explicitly selected Responses
@@ -645,8 +661,9 @@ def resolve_config_gateway_providers(
         model_ids: list[str] = []
         if override and group_key == override_group:
             # Resolve an alias override (a saved ``<provider>/pro``) to its concrete
-            # endpoint id before pinning, so the launch model is never an alias.
-            resolved_override = family.resolve_model_tier(override)
+            # endpoint id, and strip any ``[...]`` suffix, so the pinned id matches
+            # the registered model exactly (never an alias or a suffixed variant).
+            resolved_override = _strip_model_suffix(family.resolve_model_tier(override))
             _append_unique_model(model_ids, resolved_override)
             override_pin = f"{provider_id}/{resolved_override}"
         if default_model:

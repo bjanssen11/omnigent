@@ -429,8 +429,11 @@ def test_databricks_does_not_serve_gemini_surface() -> None:
     """
     config = {"providers": {"dbx": {"kind": "databricks", "profile": "ws", "default": True}}}
     entry = load_providers(config)["dbx"]
-    assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OPENCODE_SURFACE})
+    # NOT opencode: the opencode launch resolver rejects a config databricks-kind
+    # provider, so it must not be advertised as an OpenCode default.
+    assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
     assert GEMINI_FAMILY not in provider_families(entry)
+    assert OPENCODE_SURFACE not in provider_families(entry)
     # A default databricks profile does NOT become the gemini-surface default.
     assert default_provider_for_harness(config, "antigravity-native") is None
     # And a databricks profile cannot name the gemini scope at parse.
@@ -539,7 +542,9 @@ def test_key_with_gemini_block_still_serves_gemini() -> None:
         "gemini": {"base_url": "https://y/v1beta", "api_key_ref": "env:G"},
     }
     multi_entry = load_providers({"providers": {"multi": multi}})["multi"]
-    assert provider_families(multi_entry) == frozenset({OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE, OPENCODE_SURFACE})
+    assert provider_families(multi_entry) == frozenset(
+        {OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE, OPENCODE_SURFACE}
+    )
 
 
 def test_subscription_cannot_claim_pi_scope() -> None:

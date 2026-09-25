@@ -1371,9 +1371,12 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
             return frozenset({OPENAI_FAMILY})
         return frozenset()
     if entry.kind == DATABRICKS_KIND:
-        # ucode routes anthropic/openai + pi + opencode, never the Gemini
-        # surface (which needs the antigravity SDK + GEMINI_API_KEY).
-        return (frozenset(_VALID_FAMILIES) - {GEMINI_FAMILY}) | {PI_SURFACE, OPENCODE_SURFACE}
+        # ucode routes anthropic/openai + pi, never the Gemini surface (needs the
+        # antigravity SDK + GEMINI_API_KEY). NOT opencode: the opencode launch
+        # resolver rejects a config ``databricks``-kind provider and the profile
+        # fallback ignores the entry's stored profile, so a databricks OpenCode
+        # default would be saved but never used.
+        return (frozenset(_VALID_FAMILIES) - {GEMINI_FAMILY}) | {PI_SURFACE}
     return frozenset()
 
 
@@ -1463,12 +1466,17 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
         return get_default_provider(config, family)
     # An explicit ``default: opencode`` scope wins first (the setup menu saves the
     # OpenCode default there), then the OpenAI and Anthropic family defaults — but
-    # only a default OpenCode can actually drive (key/gateway/local). Skipping an
-    # undriveable default (e.g. a subscription) lets a usable gateway still win.
+    # only a default OpenCode can actually launch. Skipping an ineligible default
+    # (an undriveable kind, or a Responses-only openai family) lets a usable
+    # gateway marked ``default: anthropic`` still win rather than resolving None.
     if harness == "opencode":
         for family_name in (OPENCODE_SURFACE, OPENAI_FAMILY, ANTHROPIC_FAMILY):
             provider = get_default_provider(config, family_name)
-            if provider is not None and provider.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+            if (
+                provider is not None
+                and provider.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND)
+                and provider_serves_opencode(provider)
+            ):
                 return provider
         return None
     # Unmapped (e.g. pi): an explicit pi-scope default is authoritative.

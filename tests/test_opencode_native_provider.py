@@ -1500,6 +1500,122 @@ providers:
     ]
 
 
+def test_config_gateway_responses_only_opencode_default_falls_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Responses-only ``default: opencode`` provider is skipped for a usable one.
+
+    Its scope differs from the ``default: anthropic`` gateway's, so both are legal;
+    the ineligible OpenCode default must not resolve ``None`` when a supported
+    family default exists.
+    """
+    body = """
+providers:
+  gw-openai:
+    kind: gateway
+    default: opencode
+    openai:
+      base_url: https://o.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: responses
+      models:
+        default: eng_dev.ai_gateway.omni-gpt
+  gw-anthropic:
+    kind: gateway
+    default: anthropic
+    anthropic:
+      base_url: https://a.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gw-anthropic-anthropic/eng_dev.ai_gateway.omni-claude"
+
+
+def test_config_gateway_databricks_opencode_default_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hand-written ``databricks`` ``default: opencode`` is not driveable here."""
+    body = """
+providers:
+  dbx:
+    kind: databricks
+    profile: ws
+    default: opencode
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    assert resolve_config_gateway_providers() is None
+
+
+def test_config_gateway_alias_override_with_suffix_pins_stripped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A qualified alias override resolves to a concrete, suffix-stripped id.
+
+    The pinned model must equal the registered model exactly — never a suffixed
+    ``[1m]`` variant that is absent from the generated provider block.
+    """
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude
+        pro: eng_dev.ai_gateway.omni-claude-pro[1m]
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers(model_override="gateway-anthropic/pro")
+
+    assert resolution is not None
+    models = resolution.config["provider"]["gateway-anthropic"]["models"]
+    assert "eng_dev.ai_gateway.omni-claude-pro" in models
+    assert "eng_dev.ai_gateway.omni-claude-pro[1m]" not in models
+    assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-pro"
+
+
+def test_config_gateway_qualified_openai_override_reconciles_to_responses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chat-qualified picker selection routes to Responses when discovery says so.
+
+    The picker prefixes openai models with the chat provider; if discovery
+    classifies the model as Responses, launch must reconcile it to the Responses
+    provider rather than pin it onto the chat endpoint.
+    """
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_WITH_REVOKED_YAML)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _fake_fetch(host: str, token: str, *, model_services_parent=None, strict_details=False):
+        return (_fake_model_service("eng_dev.ai_gateway.omni-gpt-high", responses=True),)
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries", _fake_fetch
+    )
+
+    resolution = resolve_config_gateway_providers(
+        model_override="gateway-openai/eng_dev.ai_gateway.omni-gpt-high"
+    )
+
+    assert resolution is not None
+    assert (
+        resolution.config["model"] == "gateway-openai-responses/eng_dev.ai_gateway.omni-gpt-high"
+    )
+
+
 def test_responses_only_openai_not_advertised_to_opencode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
