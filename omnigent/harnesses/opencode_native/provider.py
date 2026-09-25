@@ -652,6 +652,9 @@ def resolve_config_gateway_providers(
     anthropic_default_pin: str | None = None
     openai_default_pin: str | None = None
     first_model_pin: str | None = None
+    # First model actually synthesized for each family (anthropic / openai), used
+    # to exhaust the config-default family before falling to another.
+    family_first_pin: dict[str, str] = {}
 
     for group_key, provider_id, npm, family, reasoning in group_specs:
         raw_default = entry.family_default_model(default_source[group_key])
@@ -717,16 +720,30 @@ def resolve_config_gateway_providers(
         providers[provider_id] = {"npm": npm, "options": options, "models": models_block}
         if first_model_pin is None:
             first_model_pin = f"{provider_id}/{model_ids[0]}"
+        family_first_pin.setdefault(default_source[group_key], f"{provider_id}/{model_ids[0]}")
 
     if not providers:
         return None
     # Prefer an override; otherwise pin the family the config marks this provider
-    # the default FOR (an ``default: openai`` entry launches its GPT default, not
-    # Claude); then the other family's default, then the first model.
+    # the default FOR (a ``default: openai`` entry launches OpenAI, not Claude).
+    # Exhaust that family fully — its configured default, else its first
+    # discovered/served model — before considering the other family, so a stale
+    # openai default that discovery replaced still launches OpenAI rather than
+    # silently falling to a Claude default.
     if OPENAI_FAMILY in entry.default_families and ANTHROPIC_FAMILY not in entry.default_families:
-        family_default_pin = openai_default_pin or anthropic_default_pin
+        family_default_pin = (
+            openai_default_pin
+            or family_first_pin.get(OPENAI_FAMILY)
+            or anthropic_default_pin
+            or family_first_pin.get(ANTHROPIC_FAMILY)
+        )
     else:
-        family_default_pin = anthropic_default_pin or openai_default_pin
+        family_default_pin = (
+            anthropic_default_pin
+            or family_first_pin.get(ANTHROPIC_FAMILY)
+            or openai_default_pin
+            or family_first_pin.get(OPENAI_FAMILY)
+        )
     pinned = override_pin or family_default_pin or first_model_pin
     if pinned is None:
         return None

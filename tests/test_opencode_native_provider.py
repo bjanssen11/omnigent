@@ -931,16 +931,24 @@ providers:
 
 
 def _fake_model_service(
-    model_id: str, *, responses: bool = False, efforts: tuple[str, ...] = ()
+    model_id: str,
+    *,
+    responses: bool = False,
+    anthropic: bool = False,
+    efforts: tuple[str, ...] = (),
 ) -> types.SimpleNamespace:
     """A minimal stand-in for a discovered ``ModelEntry`` (id + wire_apis + reasoning)."""
     from omnigent.models.model_metadata import ModelWireAPI
 
-    wire_apis = frozenset({ModelWireAPI.OPENAI_RESPONSES}) if responses else frozenset()
+    wire: set[ModelWireAPI] = set()
+    if responses:
+        wire.add(ModelWireAPI.OPENAI_RESPONSES)
+    if anthropic:
+        wire.add(ModelWireAPI.ANTHROPIC_MESSAGES)
     reasoning = types.SimpleNamespace(efforts=tuple(efforts)) if efforts else None
     return types.SimpleNamespace(
         id=model_id,
-        metadata=types.SimpleNamespace(wire_apis=wire_apis, reasoning=reasoning),
+        metadata=types.SimpleNamespace(wire_apis=frozenset(wire), reasoning=reasoning),
     )
 
 
@@ -1498,6 +1506,55 @@ providers:
     assert _list_config_gateway_opencode_models() == [
         "gateway-openai/eng_dev.ai_gateway.deepseek-v4-pro"
     ]
+
+
+def test_config_gateway_openai_default_survives_discovery_replacing_its_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``default: openai`` still launches OpenAI when discovery replaces its model.
+
+    The configured OpenAI default is no longer served, but discovery supplies a
+    replacement; the selected family must be exhausted (pin the replacement)
+    before falling back to the still-valid Anthropic default.
+    """
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: openai
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.claude-current
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: eng_dev.ai_gateway.gpt-old
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+    monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.provider._mint_gateway_discovery_token",
+        lambda families: "tok",
+    )
+
+    def _fake_fetch(host: str, token: str, *, model_services_parent=None, strict_details=False):
+        # gpt-old is gone; discovery returns a replacement plus the anthropic default.
+        return (
+            _fake_model_service("eng_dev.ai_gateway.claude-current", anthropic=True),
+            _fake_model_service("eng_dev.ai_gateway.gpt-replacement"),
+        )
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.fetch_databricks_model_service_entries", _fake_fetch
+    )
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gateway-openai/eng_dev.ai_gateway.gpt-replacement"
 
 
 def test_config_gateway_responses_only_opencode_default_falls_through(
