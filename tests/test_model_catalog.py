@@ -1920,7 +1920,6 @@ def test_responses_wire_marks_reasoning_capability() -> None:
     """Derive reasoning capability from advertised Responses or Messages wires."""
     from omnigent.models import model_catalog
     from omnigent.models.model_metadata import ModelCapability
-    from omnigent.models.pi_model_compatibility import pi_model_json_entry
 
     def _handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1949,11 +1948,9 @@ def test_responses_wire_marks_reasoning_capability() -> None:
 
     gpt = entries["eng_dev.ai_gateway.omni-gpt-med"]
     assert gpt.metadata.supports(ModelCapability.REASONING) is True
-    assert pi_model_json_entry(gpt).get("reasoning") is True
 
     chat_only = entries["eng_dev.ai_gateway.plain-chat"]
     assert chat_only.metadata.supports(ModelCapability.REASONING) is None
-    assert pi_model_json_entry(chat_only).get("reasoning") is None
 
 
 def test_responses_reasoning_effort_ceiling_by_target_family() -> None:
@@ -1967,45 +1964,6 @@ def test_responses_reasoning_effort_ceiling_by_target_family() -> None:
     assert other == frozenset({"low", "medium", "high"})
     for targets in (["us.openai.gpt-5.6-luna"], ["us.xai.grok-4.6"], ["us.z-ai.glm-5"]):
         assert "minimal" not in _responses_reasoning_efforts(targets)
-
-
-def test_pi_thinking_level_map_exposes_and_hides_levels() -> None:
-    """Expose only the thinking levels supported by the catalog."""
-    from omnigent.models.model_metadata import (
-        ModelCapability,
-        ModelMetadata,
-        ModelReasoningMetadata,
-    )
-    from omnigent.models.pi_model_compatibility import pi_model_json_entry
-
-    gpt = model_catalog.ModelEntry(
-        id="eng_dev.ai_gateway.omni-gpt-med",
-        family="gpt",
-        metadata=ModelMetadata(
-            supported_capabilities=frozenset({ModelCapability.REASONING}),
-            reasoning=ModelReasoningMetadata(
-                efforts=frozenset({"low", "medium", "high", "xhigh", "max"})
-            ),
-        ),
-    )
-    level_map = pi_model_json_entry(gpt)["thinkingLevelMap"]
-    assert level_map["max"] == "max"
-    assert level_map["xhigh"] == "xhigh"
-    assert level_map["minimal"] is None
-
-    grok = model_catalog.ModelEntry(
-        id="eng_dev.ai_gateway.grok-4-6",
-        family="grok",
-        metadata=ModelMetadata(
-            supported_capabilities=frozenset({ModelCapability.REASONING}),
-            reasoning=ModelReasoningMetadata(
-                efforts=frozenset({"low", "medium", "high", "xhigh"})
-            ),
-        ),
-    )
-    grok_map = pi_model_json_entry(grok)["thinkingLevelMap"]
-    assert grok_map["xhigh"] == "xhigh"
-    assert grok_map["max"] is None
 
 
 def test_missing_api_types_fetched_per_service() -> None:

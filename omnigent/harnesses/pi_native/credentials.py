@@ -371,8 +371,11 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
-        # Unity Gateway rejects Claude's adaptive-thinking request shape.
-        if self.api == "anthropic-messages" and not _is_databricks_ai_gateway_url(self.base_url):
+        # Claude 4+ / Claude 5 models require thinking.type.adaptive (not
+        # thinking.type.enabled). Pi 0.84.2+ sends adaptive when forceAdaptiveThinking
+        # is set in the compat block; reasoning:true on the model entry enables Pi's
+        # thinking level controls.
+        if self.api == "anthropic-messages":
             provider["compat"] = {"forceAdaptiveThinking": True}
         providers = {self.provider_id: provider}
         providers.update(additional)
@@ -629,17 +632,9 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         credential_warning = _databricks_credential_warning(entry.profile)
     else:
         try:
-            fetch_args = (creds.host, creds.token)
-            if entry.model_services_parent:
-                claude_models, gpt_models, completions_models, gemini_models = (
-                    _fetch_pi_model_lists(
-                        *fetch_args, model_services_parent=entry.model_services_parent
-                    )
-                )
-            else:
-                claude_models, gpt_models, completions_models, gemini_models = (
-                    _fetch_pi_model_lists(*fetch_args)
-                )
+            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
+                creds.host, creds.token
+            )
         except Exception:  # noqa: BLE001 — network failure must not break launch
             _LOGGER.info(
                 "pi-native: could not fetch workspace model list; showing default model only"
@@ -652,10 +647,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         )
     if completions_models:
         additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
-            api_key,
-            f"{host}/ai-gateway/openai/v1",
-            completions_models,
-            api_type="openai-completions",
+            api_key, f"{host}/serving-endpoints", completions_models, api_type="openai-completions"
         )
     if gemini_models:
         additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
@@ -678,7 +670,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         credential_warning=credential_warning,
         databricks_surfaces={
             DatabricksPiSurface.RESPONSES: f"{host}/ai-gateway/codex/v1",
-            DatabricksPiSurface.COMPLETIONS: f"{host}/ai-gateway/openai/v1",
+            DatabricksPiSurface.COMPLETIONS: f"{host}/serving-endpoints",
             DatabricksPiSurface.MLFLOW: f"{host}/ai-gateway/mlflow/v1",
         },
     )
@@ -753,8 +745,8 @@ def _databricks_openai_provider(
     * ``"openai-responses"`` — AI Gateway codex surface
       (``/ai-gateway/codex/v1``). Required for newer GPT models (gpt-5.5,
       gpt-5.6-*) that reject function tool calls via ``/chat/completions``.
-    * ``"openai-completions"`` — Databricks OpenAI-compatible gateway surface.
-      Works for Kimi, Llama, GLM, Gemini, and older GPT models.
+    * ``"openai-completions"`` — workspace serving-endpoints surface. Works
+      for Kimi, Llama, GLM, Gemini, and older GPT models.
 
     ``authHeader`` sends ``Authorization: Bearer {token}`` (Databricks requires
     this; without it the OpenAI SDK uses ``api-key`` which is rejected).
@@ -844,8 +836,6 @@ def _clamp_entries_to_output_caps(
 def _fetch_pi_model_lists(
     workspace_url: str,
     token: str,
-    *,
-    model_services_parent: str | None = None,
 ) -> _PiModelLists:
     """Fetch live model lists from the Unity Catalog model-services API.
 
@@ -871,9 +861,7 @@ def _fetch_pi_model_lists(
         Pi model entry dicts ready to write into ``models.json``.
     """
     try:
-        models = model_catalog.fetch_databricks_model_service_entries(
-            workspace_url, token, model_services_parent=model_services_parent
-        )
+        models = model_catalog.fetch_databricks_model_service_entries(workspace_url, token)
     except Exception:  # noqa: BLE001 — HTTP/network failure → empty
         _LOGGER.warning(
             "pi-native: could not fetch Databricks model list; "
@@ -906,15 +894,8 @@ def _fetch_pi_model_lists(
         name = model.id
         name_lower = name.lower()
         entry: _PiModelEntry = pi_model_json_entry(model)
-        # Only system.ai aliases use the Responses gateway.
-        is_system_ai = name_lower.startswith("system.ai.")
-        is_non_system_glm = "glm-" in name_lower and not is_system_ai
-        needs_responses = not is_non_system_glm and (
-            ModelWireAPI.OPENAI_RESPONSES in model.metadata.wire_apis
-            or (
-                is_system_ai
-                and any(keyword in name_lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS)
-            )
+        needs_responses = ModelWireAPI.OPENAI_RESPONSES in model.metadata.wire_apis or any(
+            keyword in name_lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
         )
         if "claude" in name_lower:
             claude.append(entry)
@@ -1155,7 +1136,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         # Workspace-hosted gateway: build from workspace hostname.
         codex_gateway_url = f"https://{parsed_gateway.hostname}/ai-gateway/codex/v1"
     workspace_completions_url = (
-        real_workspace_url + "/ai-gateway/openai/v1" if real_workspace_url else None
+        real_workspace_url + "/serving-endpoints" if real_workspace_url else None
     )
     workspace_mlflow_url = (
         real_workspace_url + "/ai-gateway/mlflow/v1" if real_workspace_url else None

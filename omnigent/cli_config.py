@@ -3631,11 +3631,13 @@ def _manage_opencode_harness() -> None:
             else "Set default model"
         )
         rows: list[_HarnessMenuRow] = [
-            _HarnessMenuRow("Manage gateway providers", action="gateway"),
             _HarnessMenuRow("Run opencode auth login", action="login"),
             _HarnessMenuRow(model_label, action="model"),
             _HarnessMenuRow("List providers & credentials", action="list"),
             _HarnessMenuRow("Show provider options", action="help"),
+            # Gateway management is the advanced/less-common path, so it sits at
+            # the bottom of the actionable options (just above Back).
+            _HarnessMenuRow("Manage gateway providers", action="gateway"),
             _HarnessMenuRow("← Back", action="back"),
         ]
         idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)

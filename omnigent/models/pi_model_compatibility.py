@@ -7,13 +7,13 @@ from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
-from omnigent.models.model_metadata import ModelCapability, ModelMetadata
+from omnigent.models.model_metadata import ModelMetadata
 
 if TYPE_CHECKING:
     from omnigent.models.model_catalog import ModelEntry
 
 # These system models omit the finish reason Pi requires on Chat Completions.
-# Keyword fallbacks apply only to system.ai aliases.
+# ``glm-`` avoids matching vendor-direct ids without a system.ai alias.
 SYSTEM_AI_RESPONSES_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "glm-")
 
 
@@ -76,7 +76,8 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
 PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
 
 # Claude models support extended thinking; reasoning:true in the model entry
-# Direct Claude providers also support adaptive thinking.
+# enables Pi's thinking level controls. Paired with forceAdaptiveThinking in the
+# provider compat block so Pi sends thinking.type.adaptive (required by claude-4+).
 PI_CLAUDE_THINKING_MODEL_FRAGMENTS: tuple[str, ...] = ("claude",)
 
 
@@ -86,19 +87,10 @@ class PiModelEntry(TypedDict):
     id: str
     input: NotRequired[list[str]]
     reasoning: NotRequired[bool]
-    thinkingLevelMap: NotRequired[dict[str, str | None]]
     # Omitted when the catalog reports no limit; Pi then applies its own
     # defaults (128000 / 16384).
     contextWindow: NotRequired[int]
     maxTokens: NotRequired[int]
-
-
-_PI_EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
-
-
-def _pi_thinking_level_map(efforts: frozenset[str]) -> dict[str, str | None]:
-    """Build Pi's ``thinkingLevelMap`` from a model's supported reasoning efforts."""
-    return {level: (level if level in efforts else None) for level in _PI_EFFORT_LEVELS}
 
 
 def pi_model_is_reasoning(model_id: str) -> bool:
@@ -133,16 +125,10 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["contextWindow"] = model.metadata.context_window
     if model.metadata.max_output_tokens is not None:
         entry["maxTokens"] = model.metadata.max_output_tokens
-    # Fall back to model-name matching when discovery has no capability metadata.
-    if (
-        model.metadata.supports(ModelCapability.REASONING) is True
-        or pi_model_is_reasoning(model.id)
-        or any(fragment in model.id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS)
+    if pi_model_is_reasoning(model.id) or any(
+        fragment in model.id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS
     ):
         entry["reasoning"] = True
-        reasoning_metadata = model.metadata.reasoning
-        if reasoning_metadata is not None and reasoning_metadata.efforts:
-            entry["thinkingLevelMap"] = _pi_thinking_level_map(reasoning_metadata.efforts)
     return entry
 
 

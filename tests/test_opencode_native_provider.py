@@ -1827,24 +1827,42 @@ def test_discover_gateway_models_per_schema_partitions_family_models(
     assert "eng_dev.openai_gw.omni-gpt-high" in providers["gateway-openai-responses"]["models"]
 
 
-def test_disable_autoloaded_free_providers_hides_opencode_zen() -> None:
-    """The helper sets opencode's ``disabled_providers`` to hide the free Zen tier."""
-    config: dict[str, object] = {
-        "$schema": "https://opencode.ai/config.json",
-        "provider": {"gateway-anthropic": {"npm": "@ai-sdk/anthropic"}},
-        "model": "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high",
-    }
+@pytest.mark.parametrize(
+    ("config", "expect_disabled"),
+    [
+        # A replacement provider block → hide the free tier.
+        (
+            {
+                "$schema": "https://opencode.ai/config.json",
+                "provider": {"gateway-anthropic": {"npm": "@ai-sdk/anthropic"}},
+                "model": "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high",
+            },
+            True,
+        ),
+        # Empty config → nothing to disable.
+        ({}, False),
+        # Only MCP/plugin wiring (no provider, no model) → keep the free tier usable.
+        (
+            {
+                "$schema": "https://opencode.ai/config.json",
+                "mcp": {"omnigent": {"type": "local"}},
+                "permission": "ask",
+            },
+            False,
+        ),
+        # An explicitly selected opencode/... model → preserve it.
+        ({"$schema": "https://opencode.ai/config.json", "model": "opencode/big-pickle"}, False),
+    ],
+)
+def test_disable_autoloaded_free_providers(
+    config: dict[str, object], expect_disabled: bool
+) -> None:
+    """Hide opencode's free tier only when a replacement provider/model exists."""
     disable_autoloaded_free_providers(config)
-    assert config["disabled_providers"] == ["opencode"]
-    assert "gateway-anthropic" in config["provider"]
-    assert config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high"
-
-
-def test_disable_autoloaded_free_providers_noop_on_empty() -> None:
-    """An empty config stays empty (nothing is written, so nothing to disable)."""
-    config: dict[str, object] = {}
-    disable_autoloaded_free_providers(config)
-    assert config == {}
+    if expect_disabled:
+        assert config["disabled_providers"] == ["opencode"]
+    else:
+        assert "disabled_providers" not in config
 
 
 def test_disable_autoloaded_free_providers_survives_writer(tmp_path: Path) -> None:
@@ -1901,67 +1919,52 @@ providers:
     assert resolution.auth_commands == {}
 
 
-def test_config_gateway_model_override_verbatim_and_pinned(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A model override is added verbatim (bracket suffix stripped) and pinned."""
-    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
-
-    resolution = resolve_config_gateway_providers(
-        model_override="eng_dev.ai_gateway.omni-claude-opus[1m]"
-    )
-
-    assert resolution is not None
-    anthropic_models = resolution.config["provider"]["gateway-anthropic"]["models"]
-    assert "eng_dev.ai_gateway.omni-claude-opus" in anthropic_models
-    assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-opus"
-
-
-def test_config_gateway_override_pins_the_family_that_lists_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An override the openai family lists pins that family, not anthropic."""
-    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
-
-    resolution = resolve_config_gateway_providers(model_override="eng_dev.ai_gateway.omni-gpt")
-
-    assert resolution is not None
-    assert resolution.config["model"] == "gateway-openai/eng_dev.ai_gateway.omni-gpt"
-    providers = resolution.config["provider"]
-    assert "eng_dev.ai_gateway.omni-gpt" not in providers["gateway-anthropic"]["models"]
-    assert "eng_dev.ai_gateway.omni-claude" in providers["gateway-anthropic"]["models"]
-
-
-@pytest.mark.parametrize("provider", ["gateway-anthropic", "gateway-openai"])
-def test_config_gateway_qualified_override_is_not_prefixed_twice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
-) -> None:
-    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
-    model = "eng_dev.ai_gateway.selected-model"
-
-    resolution = resolve_config_gateway_providers(model_override=f"{provider}/{model}[1m]")
-
-    assert resolution is not None
-    assert resolution.config["model"] == f"{provider}/{model}"
-    assert model in resolution.config["provider"][provider]["models"]
-
-
 @pytest.mark.parametrize(
-    "override",
+    ("override", "expected_model"),
     [
-        "anthropic/claude-sonnet-4-6",  # unlisted native anthropic selection
-        "openai/gpt-5.5",  # unlisted native openai selection
-        "google/gemini-2.5-pro",  # a provider this gateway has no family for
-        "opencode/big-pickle",  # the built-in free tier
+        # A bare id routes to the family that lists/implies it (suffix stripped).
+        (
+            "eng_dev.ai_gateway.omni-claude-opus[1m]",
+            "gateway-anthropic/eng_dev.ai_gateway.omni-claude-opus",
+        ),
+        ("eng_dev.ai_gateway.omni-gpt", "gateway-openai/eng_dev.ai_gateway.omni-gpt"),
+        # A gateway-qualified id keeps its provider (never double-prefixed).
+        (
+            "gateway-anthropic/eng_dev.ai_gateway.selected-model[1m]",
+            "gateway-anthropic/eng_dev.ai_gateway.selected-model",
+        ),
+        (
+            "gateway-openai/eng_dev.ai_gateway.selected-model[1m]",
+            "gateway-openai/eng_dev.ai_gateway.selected-model",
+        ),
+        # A non-gateway provider selection is declined, never rerouted.
+        ("anthropic/claude-sonnet-4-6", None),
+        ("openai/gpt-5.5", None),
+        ("google/gemini-2.5-pro", None),
+        ("opencode/big-pickle", None),
+        # An unlisted id over several families is ambiguous → declined.
+        ("an-id-no-family-lists", None),
     ],
 )
-def test_config_gateway_preserves_explicit_native_provider_selection(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: str
+def test_config_gateway_override_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override: str,
+    expected_model: str | None,
 ) -> None:
-    """A qualified selection for a non-gateway provider is declined, never rerouted."""
+    """Override routing over a both-families gateway: pin the right provider or decline."""
     _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
 
-    assert resolve_config_gateway_providers(model_override=override) is None
+    resolution = resolve_config_gateway_providers(model_override=override)
+
+    if expected_model is None:
+        assert resolution is None
+    else:
+        assert resolution is not None
+        assert resolution.config["model"] == expected_model
+        pinned_model = expected_model.split("/", 1)[1]
+        provider_id = expected_model.split("/", 1)[0]
+        assert pinned_model in resolution.config["provider"][provider_id]["models"]
 
 
 @pytest.mark.parametrize(
@@ -2006,20 +2009,6 @@ providers:
     _write_gateway_config(tmp_path, monkeypatch, body)
 
     assert resolve_config_gateway_providers(model_override=override) is None
-
-
-def test_config_gateway_unlisted_override_declines_when_ambiguous(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With several families, an override no family lists is declined, not guessed.
-
-    Pinning it to the first family could route (say) an Anthropic id onto the
-    OpenAI endpoint, so the resolver returns ``None`` and lets the
-    databricks/managed paths resolve it.
-    """
-    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
-
-    assert resolve_config_gateway_providers(model_override="an-id-no-family-lists") is None
 
 
 def test_config_gateway_unlisted_override_pins_the_sole_family(
@@ -2312,27 +2301,6 @@ providers:
     assert resolution is not None
     assert resolution.config["model"] == "gw-anthropic/eng_dev.ai_gateway.omni-claude"
     assert "gw-anthropic" in resolution.config["provider"]
-
-
-def test_disable_autoloaded_free_providers_keeps_free_tier_without_replacement() -> None:
-    """A config with only MCP/plugin wiring keeps the free tier usable."""
-    config: dict[str, object] = {
-        "$schema": "https://opencode.ai/config.json",
-        "mcp": {"omnigent": {"type": "local"}},
-        "permission": "ask",
-    }
-    disable_autoloaded_free_providers(config)
-    assert "disabled_providers" not in config
-
-
-def test_disable_autoloaded_free_providers_preserves_explicit_free_model() -> None:
-    """An explicitly selected ``opencode/...`` model is not disabled out from under."""
-    config: dict[str, object] = {
-        "$schema": "https://opencode.ai/config.json",
-        "model": "opencode/big-pickle",
-    }
-    disable_autoloaded_free_providers(config)
-    assert "disabled_providers" not in config
 
 
 def test_gateway_auth_plugin_injects_bearer_per_request() -> None:

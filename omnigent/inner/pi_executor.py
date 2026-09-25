@@ -732,7 +732,6 @@ def _build_models_json(
     """
     h = host.rstrip("/")
     serving_endpoints_url = f"{h}/serving-endpoints"
-    openai_gateway_url = f"{h}/ai-gateway/openai/v1"
     codex_gateway_url = f"{h}/ai-gateway/codex/v1"
     mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
@@ -745,8 +744,7 @@ def _build_models_json(
     )
     # Databricks Codex URLs only accept Responses; Chat uses the workspace.
     if raw_openai_base_url and is_databricks_openai_gateway:
-        # Chat-wire model services require the AI Gateway OpenAI surface.
-        openai_base_url = openai_gateway_url
+        openai_base_url = serving_endpoints_url
     else:
         openai_base_url = raw_openai_base_url or serving_endpoints_url
     # For non-Databricks providers (e.g. OpenAI API key, LiteLLM) the
@@ -799,7 +797,7 @@ def _build_models_json(
                 "compat": _openai_responses_compat,
                 "models": provider_models["databricks-openai"],
             },
-            # Older GPT/GLM models → OpenAI Chat Completions at the AI Gateway.
+            # Older GPT models → OpenAI Chat Completions at serving-endpoints.
             "databricks": {
                 "baseUrl": openai_base_url,
                 "apiKey": token,
@@ -889,7 +887,8 @@ def _build_models_json(
 # parser only consumes that channel when the model entry declares
 # ``reasoning: true``; without it the stream carries no ``content`` and the
 # turn dies with "Stream ended without finish_reason".
-# Only system.ai aliases route through Responses.
+# Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
+# so they no longer need this flag.
 def _pi_needs_responses_api(
     model: str,
     wire_apis: frozenset[ModelWireAPI] | None = None,
@@ -902,9 +901,6 @@ def _pi_needs_responses_api(
     which is the forward-compatible tool-capable surface.
     """
     lower = model.lower()
-    # Non-system GLM aliases are routable only through Chat Completions.
-    if "glm-" in lower and not lower.startswith("system.ai."):
-        return False
     if lower.startswith("system.ai.") and any(
         keyword in lower for keyword in SYSTEM_AI_RESPONSES_KEYWORDS
     ):
