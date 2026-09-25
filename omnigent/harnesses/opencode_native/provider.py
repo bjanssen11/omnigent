@@ -374,7 +374,7 @@ def _discover_gateway_models(
                 continue
             try:
                 entries = model_catalog.fetch_databricks_model_service_entries(
-                    host, token, model_services_parent=parent
+                    host, token, model_services_parent=parent, strict_details=True
                 )
             except Exception:  # noqa: BLE001 - discovery failure falls back to static tiers.
                 _logger.info(
@@ -639,8 +639,11 @@ def resolve_config_gateway_providers(
         group_ids = _group_model_ids(group_key, family)
         model_ids: list[str] = []
         if override and group_key == override_group:
-            _append_unique_model(model_ids, override)
-            override_pin = f"{provider_id}/{override}"
+            # Resolve an alias override (a saved ``<provider>/pro``) to its concrete
+            # endpoint id before pinning, so the launch model is never an alias.
+            resolved_override = family.resolve_model_tier(override)
+            _append_unique_model(model_ids, resolved_override)
+            override_pin = f"{provider_id}/{resolved_override}"
         if default_model:
             stripped_default = _strip_model_suffix(default_model)
             served = {_strip_model_suffix(m) for m in group_ids}

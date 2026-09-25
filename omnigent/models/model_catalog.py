@@ -1572,6 +1572,7 @@ def fetch_databricks_model_service_entries(
     *,
     transport: httpx.BaseTransport | None = None,
     model_services_parent: str | None = None,
+    strict_details: bool = False,
 ) -> tuple[ModelEntry, ...]:
     """Fetch normalized Unity Catalog model-service metadata.
 
@@ -1582,6 +1583,11 @@ def fetch_databricks_model_service_entries(
     :param workspace_url: Databricks workspace base URL.
     :param token: Workspace bearer token.
     :param transport: Optional httpx transport override for tests.
+    :param strict_details: When ``True``, a failed per-service detail request
+        raises instead of being swallowed, so a caller that treats a successful
+        listing as authoritative (e.g. opencode gateway discovery) can fall back
+        to configured tiers rather than silently dropping incompletely-classified
+        services. Defaults to ``False`` to preserve the lenient shared behavior.
     :returns: LLM model-service entries with normalized wire metadata.
     :raises httpx.HTTPError: On transport or HTTP failures.
     """
@@ -1703,6 +1709,10 @@ def fetch_databricks_model_service_entries(
                     if isinstance(detail, dict):
                         api_types = detail.get("supported_api_types", api_types)
             except httpx.HTTPError:
+                if strict_details:
+                    # Incomplete listing: let the caller keep its configured tiers
+                    # rather than treat the partial result as authoritative.
+                    raise
                 detail = service
         targets: list[str] = []
         routing = detail.get("config", {}).get("routing", {}) if isinstance(detail, dict) else {}

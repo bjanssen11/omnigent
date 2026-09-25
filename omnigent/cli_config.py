@@ -617,6 +617,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         CLI_CONFIG_KIND,
         DATABRICKS_KIND,
         OPENAI_FAMILY,
+        OPENCODE_SURFACE,
         PI_SURFACE,
         RESPONSES_WIRE_API,
         SUBSCRIPTION_KIND,
@@ -1025,7 +1026,14 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         #    name) and 2. run `ucode configure` against it for model serving —
         #    scoped to the harness the user drilled into (or both when added
         #    from the un-scoped menu), so ucode configures only what's needed.
-        if family is not None:
+        if family == OPENCODE_SURFACE:
+            # OpenCode drives the gateway's Anthropic + OpenAI surfaces and has no
+            # ucode agent of its own, so configure both underlying agents.
+            ucode_agents = [
+                _FAMILY_UCODE_AGENT[ANTHROPIC_FAMILY],
+                _FAMILY_UCODE_AGENT[OPENAI_FAMILY],
+            ]
+        elif family is not None:
             ucode_agents = [_FAMILY_UCODE_AGENT[family]]
         else:
             ucode_agents = sorted(_FAMILY_UCODE_AGENT.values())
@@ -3378,6 +3386,7 @@ def _list_config_gateway_opencode_models() -> list[str]:
     auth_command is slow. Returns ``[]`` when no driveable gateway is set.
     """
     try:
+        from omnigent.harnesses.opencode_native.provider import _config_gateway_provider_id
         from omnigent.onboarding.provider_config import (
             ANTHROPIC_FAMILY,
             GATEWAY_KIND,
@@ -3387,7 +3396,6 @@ def _list_config_gateway_opencode_models() -> list[str]:
             default_provider_for_harness,
             load_config,
         )
-        from omnigent.harnesses.opencode_native.provider import _config_gateway_provider_id
 
         config = load_config()
         entry = default_provider_for_harness(config, "opencode")
@@ -3402,9 +3410,15 @@ def _list_config_gateway_opencode_models() -> list[str]:
             if family is None:
                 continue
             provider_id = _config_gateway_provider_id(entry.name, family_name)
+            seen: set[str] = set()
             for raw_model in family.models.values():
-                model_id = raw_model.split("[")[0].strip()
-                models.append(f"{provider_id}/{model_id}")
+                # Resolve alias tiers (``default: pro`` → ``pro: <endpoint>``) to
+                # the concrete endpoint id, so the picker never offers an alias the
+                # gateway would reject; dedupe collapsed aliases.
+                model_id = family.resolve_model_tier(raw_model).split("[")[0].strip()
+                if model_id and model_id not in seen:
+                    seen.add(model_id)
+                    models.append(f"{provider_id}/{model_id}")
         return models
     except Exception:  # noqa: BLE001 - never break the picker on a config error
         return []
@@ -3509,7 +3523,8 @@ def _print_opencode_auth_help() -> None:
         "      or API-key provider; Omnigent synthesizes opencode's per-session config from it.\n"
         "    • [bold]opencode auth login[/bold] — sign in to OpenAI, Anthropic, etc. directly;\n"
         "      stored in ~/.local/share/opencode/auth.json.\n"
-        "    • Provider env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY / …) are also auto-detected.\n"
+        "    • Provider env vars (OPENAI_API_KEY / ANTHROPIC_API_KEY / …) are also "
+        "auto-detected.\n"
         "  Omnigent stores no OpenCode credential of its own.\n"
         f"  [dim]Tip:[/dim] 'Set default model' picks which model "
         f"`{cli_invocation(name='omni')} opencode` launches on\n"

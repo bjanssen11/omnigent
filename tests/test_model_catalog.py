@@ -2173,6 +2173,47 @@ def test_gateway_model_service_omits_limits_when_route_partly_uncatalogued(
     assert entries[0].metadata.max_output_tokens is None
 
 
+def test_fetch_model_services_strict_details_raises_on_detail_failure() -> None:
+    """``strict_details`` surfaces an incomplete listing instead of dropping services.
+
+    A listing without ``supported_api_types`` triggers a per-service detail
+    request; when that fails, the lenient default silently drops the service
+    (returning an empty catalog), while ``strict_details`` raises so a caller can
+    keep its configured tiers rather than treat the empty result as authoritative.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={"model_services": [{"name": "model-services/eng_dev.ai_gateway.omni-x"}]},
+                request=request,
+            )
+        return httpx.Response(403, json={"message": "forbidden"}, request=request)
+
+    # Lenient default: the undetailed service is dropped, yielding an empty catalog
+    # that a naive caller would wrongly treat as authoritative.
+    assert (
+        model_catalog.fetch_databricks_model_service_entries(
+            "https://ws.example.com",
+            "tok",
+            transport=httpx.MockTransport(_handler),
+            model_services_parent="schemas/eng_dev.ai_gateway",
+        )
+        == ()
+    )
+
+    # Strict: the detail failure is propagated so the caller can fall back.
+    with pytest.raises(httpx.HTTPError):
+        model_catalog.fetch_databricks_model_service_entries(
+            "https://ws.example.com",
+            "tok",
+            transport=httpx.MockTransport(_handler),
+            model_services_parent="schemas/eng_dev.ai_gateway",
+            strict_details=True,
+        )
+
+
 # ── Generic ACP curation (acp_curated_models) ───────────────────────────────
 
 

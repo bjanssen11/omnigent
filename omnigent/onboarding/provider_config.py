@@ -1440,11 +1440,12 @@ def default_provider_for_harness(config: dict[str, object], harness: str) -> Pro
     family = _HARNESS_FAMILY.get(harness)
     if family is not None:
         return get_default_provider(config, family)
-    # Prefer an OpenAI default, then Anthropic — but only a default OpenCode can
-    # actually drive (key/gateway/local). Skipping an undriveable OpenAI default
-    # (e.g. a subscription) lets a usable Anthropic gateway still be selected.
+    # An explicit ``default: opencode`` scope wins first (the setup menu saves the
+    # OpenCode default there), then the OpenAI and Anthropic family defaults — but
+    # only a default OpenCode can actually drive (key/gateway/local). Skipping an
+    # undriveable default (e.g. a subscription) lets a usable gateway still win.
     if harness == "opencode":
-        for family_name in (OPENAI_FAMILY, ANTHROPIC_FAMILY):
+        for family_name in (OPENCODE_SURFACE, OPENAI_FAMILY, ANTHROPIC_FAMILY):
             provider = get_default_provider(config, family_name)
             if provider is not None and provider.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
                 return provider

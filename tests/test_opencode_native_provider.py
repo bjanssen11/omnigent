@@ -975,7 +975,13 @@ def test_config_gateway_groups_effort_capable_models_via_discovery(
         lambda families: "tok",
     )
 
-    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+    def _fake_fetch(
+        host: str,
+        token: str,
+        *,
+        model_services_parent: str | None = None,
+        strict_details: bool = False,
+    ):
         assert host == "https://ws.example.com"
         assert model_services_parent == "schemas/eng_dev.ai_gateway"
         return (
@@ -1025,7 +1031,13 @@ def test_config_gateway_applies_and_clamps_reasoning_effort(
         lambda families: "tok",
     )
 
-    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+    def _fake_fetch(
+        host: str,
+        token: str,
+        *,
+        model_services_parent: str | None = None,
+        strict_details: bool = False,
+    ):
         return (
             _fake_model_service(
                 "eng_dev.ai_gateway.omni-gpt-high",
@@ -1061,7 +1073,13 @@ def test_config_gateway_omits_reasoning_effort_when_unset(
         lambda families: "tok",
     )
 
-    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+    def _fake_fetch(
+        host: str,
+        token: str,
+        *,
+        model_services_parent: str | None = None,
+        strict_details: bool = False,
+    ):
         return (
             _fake_model_service(
                 "eng_dev.ai_gateway.omni-gpt-high", responses=True, efforts=("low", "high", "max")
@@ -1119,7 +1137,13 @@ def test_discovery_falls_back_to_static_when_listing_errors(
         lambda families: "tok",
     )
 
-    def _boom(host: str, token: str, *, model_services_parent: str | None = None):
+    def _boom(
+        host: str,
+        token: str,
+        *,
+        model_services_parent: str | None = None,
+        strict_details: bool = False,
+    ):
         raise RuntimeError("listing denied")
 
     monkeypatch.setattr(
@@ -1148,7 +1172,13 @@ def test_config_gateway_explicit_responses_default_routes_to_responses(
         lambda families: "tok",
     )
 
-    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+    def _fake_fetch(
+        host: str,
+        token: str,
+        *,
+        model_services_parent: str | None = None,
+        strict_details: bool = False,
+    ):
         return (
             _fake_model_service(
                 "eng_dev.ai_gateway.omni-gpt-high", responses=True, efforts=("low", "high", "max")
@@ -1206,7 +1236,13 @@ providers:
         lambda families: "tok",
     )
 
-    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+    def _fake_fetch(
+        host: str,
+        token: str,
+        *,
+        model_services_parent: str | None = None,
+        strict_details: bool = False,
+    ):
         if model_services_parent == "schemas/team_a.gateway":
             return (_fake_model_service("team_a.gateway.omni-claude"),)
         if model_services_parent == "schemas/team_b.gateway":
@@ -1335,7 +1371,13 @@ providers:
         lambda families: "tok",
     )
 
-    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+    def _fake_fetch(
+        host: str,
+        token: str,
+        *,
+        model_services_parent: str | None = None,
+        strict_details: bool = False,
+    ):
         return (
             _fake_model_service(
                 "eng_dev.ai_gateway.omni-gpt-high", responses=True, efforts=("low", "high", "max")
@@ -1399,11 +1441,69 @@ providers:
     assert "eng_dev.ai_gateway.omni-gpt-high" in responses["models"]
 
 
+def test_config_gateway_honors_explicit_opencode_default_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider marked ``default: opencode`` is selected over a bare family default."""
+    body = """
+providers:
+  gw-a:
+    kind: gateway
+    default: anthropic
+    anthropic:
+      base_url: https://a.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude
+  gw-b:
+    kind: gateway
+    default: opencode
+    openai:
+      base_url: https://b.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: eng_dev.ai_gateway.omni-gpt
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    # The opencode-scoped default (gw-b) wins over the anthropic-scoped gw-a.
+    assert resolution.config["model"] == "gw-b-openai/eng_dev.ai_gateway.omni-gpt"
+
+
+def test_list_config_gateway_opencode_models_resolves_alias_tiers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The setup picker offers concrete endpoint ids, never intermediate aliases."""
+    from omnigent.cli_config import _list_config_gateway_opencode_models
+
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: chat
+      models:
+        default: pro
+        pro: eng_dev.ai_gateway.deepseek-v4-pro
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    assert _list_config_gateway_opencode_models() == [
+        "gateway-openai/eng_dev.ai_gateway.deepseek-v4-pro"
+    ]
+
+
 def test_gateway_model_family_classification() -> None:
     """Discovered model-services route to opencode's three groups like pi."""
-    from omnigent.models.model_metadata import ModelWireAPI
-
     from omnigent.harnesses.opencode_native.provider import _gateway_model_family
+    from omnigent.models.model_metadata import ModelWireAPI
 
     def fam(model_id: str, *, responses: bool = False) -> str | None:
         return _gateway_model_family(_fake_model_service(model_id, responses=responses))
@@ -1485,7 +1585,13 @@ def test_discover_gateway_models_per_schema_partitions_family_models(
         lambda families: "tok",
     )
 
-    def _fetch_by_schema(host: str, token: str, *, model_services_parent: str | None = None):
+    def _fetch_by_schema(
+        host: str,
+        token: str,
+        *,
+        model_services_parent: str | None = None,
+        strict_details: bool = False,
+    ):
         # Each schema contains only that family's models; verify separate calls.
         if model_services_parent == "schemas/eng_dev.anth_gw":
             return (_fake_model_service("eng_dev.anth_gw.omni-claude-high"),)
@@ -1938,7 +2044,13 @@ providers:
         lambda families: "tok",
     )
 
-    def _fake_fetch(host: str, token: str, *, model_services_parent: str | None = None):
+    def _fake_fetch(
+        host: str,
+        token: str,
+        *,
+        model_services_parent: str | None = None,
+        strict_details: bool = False,
+    ):
         # Only workspace A answers; workspace B's listing fails.
         if host == "https://ws-a.example.com":
             return (_fake_model_service("eng_dev.ai_gateway.omni-claude"),)
