@@ -1500,6 +1500,47 @@ providers:
     ]
 
 
+def test_responses_only_openai_not_advertised_to_opencode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Responses-only openai gateway is not offered to OpenCode anywhere.
+
+    Launch skips the Responses wire, so readiness (``provider_families``), the
+    picker, and resolution must all agree it is not OpenCode-capable — otherwise
+    setup could save a default and the picker a selection that launch ignores.
+    """
+    from omnigent.cli_config import _list_config_gateway_opencode_models
+    from omnigent.onboarding.provider_config import (
+        OPENAI_FAMILY,
+        OPENCODE_SURFACE,
+        get_default_provider,
+        load_config,
+        provider_families,
+    )
+
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: responses
+      models:
+        default: eng_dev.ai_gateway.omni-gpt
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    entry = get_default_provider(load_config(), OPENAI_FAMILY)
+    assert entry is not None
+    surfaces = provider_families(entry)
+    assert OPENCODE_SURFACE not in surfaces  # readiness/defaults
+    assert OPENAI_FAMILY in surfaces  # still serves codex/pi
+    assert _list_config_gateway_opencode_models() == []  # picker
+    assert resolve_config_gateway_providers() is None  # launch
+
+
 def test_gateway_model_family_classification() -> None:
     """Discovered model-services route to opencode's three groups like pi."""
     from omnigent.harnesses.opencode_native.provider import _gateway_model_family

@@ -3389,6 +3389,7 @@ def _list_config_gateway_opencode_models() -> list[str]:
         from omnigent.harnesses.opencode_native.provider import _config_gateway_provider_id
         from omnigent.onboarding.provider_config import (
             ANTHROPIC_FAMILY,
+            CHAT_WIRE_API,
             GATEWAY_KIND,
             KEY_KIND,
             LOCAL_KIND,
@@ -3408,6 +3409,11 @@ def _list_config_gateway_opencode_models() -> list[str]:
             except Exception:  # noqa: BLE001 - unresolved $VAR in unused family
                 continue
             if family is None:
+                continue
+            # Skip a Responses-only openai family: OpenCode drives only the
+            # chat-completions surface, so its models must not appear in the
+            # picker (launch would refuse them).
+            if family_name == OPENAI_FAMILY and family.wire_api not in (None, CHAT_WIRE_API):
                 continue
             provider_id = _config_gateway_provider_id(entry.name, family_name)
             seen: set[str] = set()

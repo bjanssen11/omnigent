@@ -262,8 +262,13 @@ def _mint_gateway_discovery_token(families: list[tuple[str, str, FamilyConfig]])
                     timeout=15,
                     check=True,
                 )
+            except subprocess.TimeoutExpired:
+                # Never log the exception/command: an inline credential in the
+                # auth_command would leak into logs via the command text.
+                _logger.info("opencode gateway discovery: auth command timed out.")
+                continue
             except Exception:  # noqa: BLE001 - try the next family, else fall back to static.
-                _logger.info("opencode gateway discovery: token mint failed.", exc_info=True)
+                _logger.info("opencode gateway discovery: auth command failed.")
                 continue
             token = completed.stdout.strip()
             if token:

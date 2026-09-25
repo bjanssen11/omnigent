@@ -1273,6 +1273,21 @@ def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
     return cli_config_pi_provider_capable(entry)
 
 
+def provider_serves_opencode(entry: ProviderEntry) -> bool:
+    """Whether OpenCode can actually launch *entry*.
+
+    OpenCode drives an ``anthropic`` family (Messages) or a Chat-Completions
+    ``openai`` family; a Responses-only ``openai`` family with no ``anthropic``
+    family is not launchable there (the launch resolver skips it). The single
+    predicate keeps setup defaults, readiness, the picker, and launch consistent
+    so none advertises a provider the others cannot use.
+    """
+    if ANTHROPIC_FAMILY in entry.families:
+        return True
+    openai = entry.families.get(OPENAI_FAMILY)
+    return openai is not None and openai.wire_api in (None, CHAT_WIRE_API)
+
+
 def provider_families(entry: ProviderEntry) -> frozenset[str]:
     """Return the model families *entry* can serve.
 
@@ -1322,7 +1337,13 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         # break pi launch. A multi-family key keeps pi via its anthropic/openai
         # family.
         if served & frozenset(_PI_FALLBACK_FAMILIES):
-            return served | {PI_SURFACE, OPENCODE_SURFACE}
+            surfaces = served | {PI_SURFACE}
+            # Only claim the OpenCode surface when OpenCode can actually launch it
+            # (a Responses-only openai family cannot), so readiness/defaults don't
+            # advertise a provider launch would skip.
+            if provider_serves_opencode(entry):
+                surfaces = surfaces | {OPENCODE_SURFACE}
+            return surfaces
         return served
     if entry.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND):
         if entry.cli == "claude":
